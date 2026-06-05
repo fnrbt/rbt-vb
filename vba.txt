@@ -1,0 +1,670 @@
+Use a **single VB-family parser** with a **dialect parameter**, and split only where the grammar truly differs. Then run a **VBScript legality pass** over the AST to catch the remaining ?parsed but not allowed in VBS? cases.
+
+The clean mental model is:
+
+1. **Shared lexer**
+2. **Shared core parser**
+3. **Small dialect-specific parse branches**
+4. **Dialect-specific AST validation**
+5. Optionally, **dialect-specific lowering/binding**
+
+## Overall structure
+
+Think in terms of three layers:
+
+### 1. Syntax shared by both
+
+This is most of the language:
+
+* expressions
+* precedence
+* member access
+* calls
+* `If`, `Select Case`
+* `For`, `For Each`, `Do`, `While`
+* assignment
+* class/property/sub/function body statements
+* array indexing syntax
+* comments / line continuation / statement separators
+
+This should live in one parser.
+
+### 2. Syntax that differs by dialect
+
+This is where the parser should branch on `dialect == VBA | VBS`.
+
+Main places:
+
+* variable declarations
+* parameter declarations
+* procedure headers
+* property headers
+* `On Error`
+* top-level/class-member forms enabled at all
+
+### 3. Semantic legality
+
+Even after a successful parse, VBScript still needs a validator to reject constructs that are syntactically representable in a shared AST but not legal in the dialect.
+
+---
+
+# Parser architecture
+
+## Dialect enum
+
+At parse time:
+
+```text
+enum Dialect {
+  VBA,
+  VBScript
+}
+```
+
+Then every relevant parse function can inspect the dialect when needed.
+
+You do **not** want two separate parsers. You want a parser shaped like:
+
+```text
+parseCompilationUnit(dialect)
+  -> parseTopLevelItem(dialect)
+  -> parseStatement(dialect)
+  -> parseExpr()
+```
+
+Most functions ignore the dialect. A few do not.
+
+---
+
+# Concrete parser splits
+
+## 1. Top-level item parsing
+
+Have a shared dispatcher, but a dialect-specific allowlist.
+
+Example:
+
+```text
+parseTopLevelItem(dialect):
+  if next is Class      -> parseClassDecl(dialect)
+  if next is Sub        -> parseSubDecl(dialect)
+  if next is Function   -> parseFunctionDecl(dialect)
+  if next is Property   -> parsePropertyDecl(dialect)
+  if next is Dim/Public/Private -> parseVarDecl(dialect)
+  if dialect == VBA and next is Enum -> parseEnumDecl()
+  if dialect == VBA and next is Type -> parseTypeDecl()
+  if dialect == VBA and next is Declare -> parseDeclareDecl()
+  if dialect == VBA and next is Implements -> parseImplementsDecl()
+  ...
+```
+
+For VBScript mode, either:
+
+* never parse those VBA-only forms, or
+* parse them into AST nodes and immediately emit a syntax-level dialect error
+
+I would usually prefer **not parsing them in VBS mode** unless you specifically want a ?superset tolerant? parser.
+
+---
+
+## 2. Variable declaration parsing
+
+This is one of the most important splits.
+
+### Shared shape
+
+Both dialects have declarations like:
+
+```vb
+Dim x
+Dim a(10)
+Public y
+Private z()
+```
+
+### VBA-only extension
+
+VBA additionally has typed declarators:
+
+```vb
+Dim x As Integer
+Dim a(10) As String
+Dim x, y As Long
+```
+
+### Split
+
+Use one declaration node shape, but parse declarators differently:
+
+```text
+parseVarDecl(dialect):
+  kind = parse one of Dim/Public/Private/Static/...
+  vars = commaSep(parseVarDeclarator(dialect))
+```
+
+Then:
+
+```text
+parseVarDeclarator(dialect):
+  name = parseIdentifier()
+  arraySpec = parseOptionalArraySpec()
+
+  if dialect == VBA and match(As):
+      type = parseTypeRef()
+  else:
+      type = null
+
+  return VarDeclarator(name, arraySpec, type)
+```
+
+For VBScript, `As` is simply not part of the grammar here.
+
+You may also want `Static` only in VBA mode, depending on how strict you want to be.
+
+---
+
+## 3. Parameter parsing
+
+This is the other major split.
+
+### Common core
+
+Both dialects have a parameter list after `(` `)`.
+
+### VBA parameter grammar is richer
+
+May include:
+
+* `Optional`
+* `ByVal`
+* `ByRef`
+* `ParamArray`
+* `As Type`
+* default values
+* object/array typing forms
+
+### VBScript parameter grammar is narrow
+
+Essentially:
+
+* optional `ByVal` / `ByRef`
+* name
+* optional `()`
+
+So do this:
+
+```text
+parseParamList(dialect):
+  parse "("
+  if not ")":
+    params = commaSep(parseParam(dialect))
+  parse ")"
+```
+
+Then:
+
+```text
+parseParam(dialect):
+  if dialect == VBA:
+      return parseVbaParam()
+  else:
+      return parseVbsParam()
+```
+
+### `parseVbsParam`
+
+```text
+parseVbsParam():
+  passing = parseOptional(ByVal | ByRef)
+  name = parseIdentifier()
+  isArray = parseOptionalEmptyParensSuffix()
+  return Param(
+    name,
+    passing,
+    isArray,
+    isOptional = false,
+    isParamArray = false,
+    type = null,
+    defaultValue = null
+  )
+```
+
+### `parseVbaParam`
+
+Parses the full richer form.
+
+This is a real grammar split, not just validation.
+
+---
+
+## 4. Procedure header parsing
+
+Have shared procedures for `Sub`, `Function`, `Property`, but with dialect-specific modifier sets and return-type handling.
+
+## `Sub`
+
+```text
+parseSubDecl(dialect):
+  mods = parseProcModifiers(dialect, kind=Sub)
+  consume(Sub)
+  name = parseIdentifier()
+  params = parseOptionalParamList(dialect)
+  body = parseBlockUntil(End Sub)
+```
+
+## `Function`
+
+```text
+parseFunctionDecl(dialect):
+  mods = parseProcModifiers(dialect, kind=Function)
+  consume(Function)
+  name = parseIdentifier()
+  params = parseOptionalParamList(dialect)
+
+  if dialect == VBA and match(As):
+      returnType = parseTypeRef()
+  else:
+      returnType = null
+
+  body = parseBlockUntil(End Function)
+```
+
+In VBScript, stop at the parameter list. Do not allow `As`.
+
+---
+
+## 5. Property header parsing
+
+Same pattern.
+
+```text
+parsePropertyDecl(dialect):
+  mods = parseProcModifiers(dialect, kind=Property)
+  consume(Property)
+
+  kind = parse one of Get / Let / Set
+  name = parseIdentifier()
+  params = parseOptionalParamList(dialect)
+
+  if kind == Get and dialect == VBA and match(As):
+      returnType = parseTypeRef()
+  else:
+      returnType = null
+```
+
+And for `Let`/`Set`, use the dialect-specific parameter grammar. That matters because VBS property parameters are narrower.
+
+---
+
+## 6. Procedure modifiers parsing
+
+This is a clean dedicated split.
+
+```text
+parseProcModifiers(dialect, kind):
+  allowed = allowedModifiers(dialect, kind)
+  parse repeated modifiers from allowed
+```
+
+Example:
+
+### VBA allowed examples
+
+* `Public`
+* `Private`
+* `Friend`
+* `Static`
+* `Default` in some class/property contexts
+
+### VBS allowed examples
+
+* `Public`
+* `Private`
+* maybe `Default` where class/property grammar allows it
+
+No `Friend`. No VBA-specific extras.
+
+This way the parser produces better errors right at the header.
+
+---
+
+## 7. `On Error` parsing
+
+This should absolutely branch.
+
+### Shared prefix
+
+Both start with `On Error`.
+
+### Split
+
+After that:
+
+```text
+parseOnErrorStmt(dialect):
+  consume(On)
+  consume(Error)
+
+  if match(Resume):
+      consume(Next)
+      return OnErrorResumeNext()
+
+  if match(GoTo):
+      if dialect == VBA:
+          target = parseLabelOrZero()
+          return OnErrorGoTo(target)
+      else:
+          consume(0)   // only GoTo 0 in VBS mode
+          return OnErrorGoToZero()
+
+  error(...)
+```
+
+This is a precise place where parsing should differ, not merely validation.
+
+---
+
+## 8. Class-member inventory
+
+Inside classes, use the same strategy as top-level:
+
+```text
+parseClassMember(dialect):
+  if next is Public/Private/Dim -> parseVarDecl(dialect)
+  if next is Sub -> parseSubDecl(dialect)
+  if next is Function -> parseFunctionDecl(dialect)
+  if next is Property -> parsePropertyDecl(dialect)
+  if dialect == VBA and next is Enum -> parseEnumDecl()
+  ...
+```
+
+VBScript classes are simpler, so keep the member set narrow in VBS mode.
+
+---
+
+# Shared AST design
+
+Use a **superset AST** that can represent both dialects cleanly.
+
+For example:
+
+```text
+VarDeclarator {
+  name: Identifier
+  arraySpec: ArraySpec?
+  type: TypeRef?            // null in VBS
+}
+```
+
+```text
+Param {
+  name: Identifier
+  passing: ByVal | ByRef | None
+  isArray: bool
+  isOptional: bool          // false in VBS
+  isParamArray: bool        // false in VBS
+  type: TypeRef?            // null in VBS
+  defaultValue: Expr?       // null in VBS
+}
+```
+
+```text
+FunctionDecl {
+  modifiers: Modifier[]
+  name: Identifier
+  params: Param[]
+  returnType: TypeRef?      // null in VBS
+  body: Stmt[]
+}
+```
+
+```text
+OnErrorStmt =
+  | ResumeNext
+  | GoToZero
+  | GoToLabel(LabelRef)     // VBA only
+```
+
+This is better than separate ASTs. It keeps later tooling simpler.
+
+---
+
+# What the VBScript validator should do
+
+After parsing in VBS mode, run:
+
+```text
+validateVBScript(ast)
+```
+
+This pass should walk the tree and reject anything that is syntactically representable in the shared AST but illegal in VBScript.
+
+Think of it as enforcing:
+
+* **no explicit typing**
+* **no VBA-only declarations**
+* **no VBA-only modifiers**
+* **no VBA-only parameter features**
+* **no VBA-only error forms**
+* **no VBA-only class/object features**
+
+## Concrete validation rules
+
+## 1. No explicit types anywhere
+
+Reject if any of these are non-null:
+
+* `VarDeclarator.type`
+* `Param.type`
+* `FunctionDecl.returnType`
+* `PropertyDecl.returnType`
+* typed constants if your AST models those
+* typed arrays if represented separately
+
+Example checks:
+
+```text
+visit VarDeclarator:
+  if node.type != null:
+    error("VBScript does not allow typed variable declarations")
+
+visit Param:
+  if node.type != null:
+    error("VBScript does not allow typed parameters")
+```
+
+---
+
+## 2. No VBA-only declaration kinds
+
+Reject these AST node kinds entirely in VBS:
+
+* `EnumDecl`
+* `TypeDecl`
+* `DeclareDecl`
+* `ImplementsDecl`
+* `EventDecl`
+* `WithEventsDecl`
+
+If your parser never builds them in VBS mode, great. But the validator should still defend against them.
+
+---
+
+## 3. Restrict parameter features
+
+In VBScript parameters:
+
+* no `Optional`
+* no `ParamArray`
+* no default values
+* no typed params
+
+Validation:
+
+```text
+visit Param:
+  if node.isOptional:
+    error(...)
+  if node.isParamArray:
+    error(...)
+  if node.defaultValue != null:
+    error(...)
+```
+
+Even if the parser already split this, the validator gives a second line of defense.
+
+---
+
+## 4. Restrict modifiers
+
+Reject modifiers not legal in VBScript, such as:
+
+* `Friend`
+* `Static` where not allowed
+* others depending on how broad your shared AST is
+
+Example:
+
+```text
+visit ProcedureDecl:
+  for m in node.modifiers:
+    if m not in VBS_ALLOWED_MODIFIERS[node.kind]:
+      error(...)
+```
+
+---
+
+## 5. Restrict `On Error`
+
+Reject `OnErrorGoToLabel`.
+
+```text
+visit OnErrorStmt:
+  if node.kind == GoToLabel:
+    error("VBScript does not support On Error GoTo <label>")
+```
+
+---
+
+## 6. Restrict class features
+
+Depending on AST richness, reject:
+
+* interface implementation
+* event members
+* `WithEvents`
+* class constructs present in VBA but absent in VBS
+
+---
+
+## 7. Restrict host-independent built-in forms you chose to model
+
+If your shared AST includes constructs that came from VBA-specific syntax, the validator should reject them here too.
+
+---
+
+# Error strategy
+
+There are two good modes.
+
+## Strict VBS parse mode
+
+The parser itself rejects syntax that is not VBScript grammar.
+
+Use this for:
+
+* good editor diagnostics
+* dialect-specific correctness
+
+## Tolerant parse + VBS validation mode
+
+Parse a broader VB-family superset, then validate.
+
+Use this for:
+
+* migration tools
+* source converters
+* ?parse whatever and tell me what is incompatible?
+
+You can support both with a flag.
+
+---
+
+# Practical split summary
+
+A good concrete split in code is:
+
+## Shared parser files
+
+* lexer
+* expression parser
+* statement parser core
+* block parser
+* shared AST definitions
+
+## Dialect-specific parse hooks
+
+* `parseVarDeclarator(dialect)`
+* `parseParam(dialect)`
+* `parseProcModifiers(dialect, kind)`
+* `parseFunctionHeader(dialect)`
+* `parsePropertyHeader(dialect)`
+* `parseOnErrorStmt(dialect)`
+* `isAllowedTopLevelStartToken(dialect, tok)`
+* `isAllowedClassMemberStartToken(dialect, tok)`
+
+## Validators
+
+* `validateVBA(ast)` maybe light or unnecessary
+* `validateVBScript(ast)` definitely needed
+
+---
+
+# Minimal concrete blueprint
+
+Here is the simplest robust design:
+
+## Parser
+
+* parse a mostly shared VB syntax tree
+* branch in exactly these functions:
+
+  * declarations
+  * params
+  * proc/property headers
+  * `On Error`
+  * member allowlists
+
+## AST
+
+* one superset AST for both dialects
+
+## VBScript validator
+
+Reject:
+
+* typed declarations
+* typed params
+* typed returns
+* `Optional`
+* `ParamArray`
+* default param values
+* `Enum`
+* `Type`
+* `Declare`
+* `Implements`
+* `WithEvents`
+* event declarations
+* `Friend`
+* `On Error GoTo label`
+* any other VBA-only node/modifier your shared parser can still construct
+
+That gives you a parser that is:
+
+* not duplicated
+* cleanly structured
+* precise where grammar really differs
+* still easy to extend later for VB6 or other dialects
+
+If you want, I can turn this into a concrete pseudocode grammar with productions like `VarDeclVBA`, `VarDeclVBS`, `ParamVBA`, `ParamVBS`, and a sample AST schema.
+
