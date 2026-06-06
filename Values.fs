@@ -12,6 +12,7 @@ type Value =
     | VNothing
     | VArray of Value array
     | VObject of VBObject
+    | VHostObject of IHostObject
     | VRef of Value array * int
     | VUndefined
 
@@ -20,3 +21,9 @@ and VBObject = {
     Fields: Dictionary<string, Value>
     ClassIndex: int
 }
+
+and IHostObject =
+    abstract TypeName: string
+    abstract GetMember: string -> Value option
+    abstract SetMember: string -> Value -> bool
+    abstract CallMethod: string -> Value array -> Value option

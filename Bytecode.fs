@@ -52,6 +52,7 @@ type Opcode =
     | GetMember of string     // member name
     | SetMember of string     // member name
     | CallMethod of string * int  // method name, arg count
+    | CallDefault of int      // arg count; host default call or array indexing
     | TypeCheck of string     // class name for TypeOf...Is
     // Control flow
     | CallBuiltin of string * int
@@ -106,6 +107,7 @@ type BytecodeProgram = {
     Code: Instruction array
     Constants: Value array
     Globals: int
+    GlobalNames: string array
     Functions: FunctionDef array
     Classes: ClassDef array
 }

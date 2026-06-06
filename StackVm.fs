@@ -4,6 +4,15 @@ open Bytecode
 open Values
 open System.Collections.Generic
 
+let private equalsIgnoreCase (left: string) (right: string) =
+#if FABLE_COMPILER
+    let l = if isNull (box left) then "" else left.ToLowerInvariant()
+    let r = if isNull (box right) then "" else right.ToLowerInvariant()
+    l = r
+#else
+    System.String.Equals(left, right, System.StringComparison.OrdinalIgnoreCase)
+#endif
+
 type ErrorMode =
     | NoHandler
     | ResumeNextMode
@@ -52,6 +61,7 @@ let valueToString = function
     | VNull -> ""
     | VEmpty -> ""
     | VNothing -> ""
+    | VHostObject _ -> ""
     | _ -> ""
 
 let valueToBool = function
@@ -59,6 +69,7 @@ let valueToBool = function
     | VInteger i -> i <> 0
     | VDouble d -> d <> 0.0
     | VString s -> s <> ""
+    | VHostObject _ -> true
     | _ -> false
 
 let inline numericBinOp intOp floatOp left right =
@@ -393,6 +404,7 @@ let executeOneInstruction (state: VmState) =
             | VNothing, VNothing -> true
             | VNull, VNull -> true
             | VObject l, VObject r -> obj.ReferenceEquals(l.Fields, r.Fields)
+            | VHostObject l, VHostObject r -> obj.ReferenceEquals(l, r)
             | _ -> false
         push state (VBoolean result)
         state.Pc <- state.Pc + 1
@@ -498,6 +510,11 @@ let executeOneInstruction (state: VmState) =
                 | None ->
                     push state VEmpty
                     state.Pc <- state.Pc + 1
+        | VHostObject hostObj ->
+            hostObj.GetMember name
+            |> Option.defaultValue VEmpty
+            |> push state
+            state.Pc <- state.Pc + 1
         | _ ->
             push state VEmpty
             state.Pc <- state.Pc + 1
@@ -522,6 +539,9 @@ let executeOneInstruction (state: VmState) =
                     state.Pc <- funcDef.StartPC
                 | None ->
                     state.Pc <- state.Pc + 1
+        | VHostObject hostObj ->
+            ignore (hostObj.SetMember name value)
+            state.Pc <- state.Pc + 1
         | _ ->
             state.Pc <- state.Pc + 1
 
@@ -546,14 +566,49 @@ let executeOneInstruction (state: VmState) =
                 // Try property getter with args (default property)
                 push state VEmpty
                 state.Pc <- state.Pc + 1
+        | VHostObject hostObj ->
+            hostObj.CallMethod name args
+            |> Option.defaultValue VEmpty
+            |> push state
+            state.Pc <- state.Pc + 1
         | _ ->
             push state VEmpty
             state.Pc <- state.Pc + 1
 
+    | CallDefault argCount ->
+        let args = Array.zeroCreate argCount
+        for i in 0 .. argCount - 1 do
+            args.[i] <- pop state
+        let obj = pop state
+        let arrayFallback () =
+            if argCount = 1 then
+                let index = valueToInt args.[0]
+                match obj with
+                | VArray a when index >= 0 && index < a.Length -> a.[index]
+                | VString s when index >= 0 && index < s.Length -> VString (string s.[index])
+                | _ -> VEmpty
+            else
+                VEmpty
+        match obj with
+        | VHostObject hostObj ->
+            match hostObj.CallMethod "" args with
+            | Some value -> push state value
+            | None ->
+                match hostObj.CallMethod "_Default" args with
+                | Some value -> push state value
+                | None ->
+                    match hostObj.CallMethod "Item" args with
+                    | Some value -> push state value
+                    | None -> push state (arrayFallback ())
+        | _ ->
+            push state (arrayFallback ())
+        state.Pc <- state.Pc + 1
+
     | TypeCheck className ->
         let obj = pop state
         match obj with
-        | VObject vbObj -> push state (VBoolean (System.String.Equals(vbObj.ClassName, className, System.StringComparison.OrdinalIgnoreCase)))
+        | VObject vbObj -> push state (VBoolean (equalsIgnoreCase vbObj.ClassName className))
+        | VHostObject hostObj -> push state (VBoolean (equalsIgnoreCase hostObj.TypeName className))
         | _ -> push state (VBoolean false)
         state.Pc <- state.Pc + 1
 
@@ -688,7 +743,22 @@ let run (state: VmState) =
                 state.LastErrorDescription <- ex.Message
                 state.Pc <- target
 
-let execute (program: BytecodeProgram) : VmState =
+let private setInitialGlobals (state: VmState) (globals: seq<string * Value>) =
+    for name, value in globals do
+        let slot =
+            state.Program.GlobalNames
+            |> Array.tryFindIndex (fun globalName ->
+                equalsIgnoreCase globalName name)
+        match slot with
+        | Some idx when idx >= 0 && idx < state.Globals.Length ->
+            state.Globals.[idx] <- value
+        | _ -> ()
+
+let executeWithGlobals (globals: seq<string * Value>) (program: BytecodeProgram) : VmState =
     let state = emptyState program.Constants program
+    setInitialGlobals state globals
     run state
     state
+
+let execute (program: BytecodeProgram) : VmState =
+    executeWithGlobals Seq.empty program

@@ -26,6 +26,7 @@ let valueToString = function
     | VNull -> ""
     | VEmpty -> ""
     | VNothing -> ""
+    | VHostObject _ -> ""
     | _ -> ""
 
 let valueToBool = function
@@ -33,9 +34,25 @@ let valueToBool = function
     | VInteger i -> i <> 0
     | VDouble d -> d <> 0.0
     | VString s -> s <> ""
+    | VHostObject _ -> true
     | _ -> false
 
 let private rng = Random()
+
+let rec private typeName = function
+    | VInteger _ -> "Integer"
+    | VDouble _ -> "Double"
+    | VString _ -> "String"
+    | VBoolean _ -> "Boolean"
+    | VNull -> "Null"
+    | VEmpty -> "Empty"
+    | VNothing -> "Nothing"
+    | VArray _ -> "Variant()"
+    | VObject o -> o.ClassName
+    | VHostObject o -> o.TypeName
+    | VRef (arr, idx) when idx >= 0 && idx < arr.Length -> typeName arr.[idx]
+    | VRef _ -> "Empty"
+    | VUndefined -> "Undefined"
 
 let callBuiltin (name: string) (args: Value array) : Value =
     let argc = args.Length
@@ -140,22 +157,10 @@ let callBuiltin (name: string) (args: Value array) : Value =
         | VString s -> VBoolean (match Double.TryParse(s) with true, _ -> true | _ -> false)
         | _ -> VBoolean false
     | "isarray" -> VBoolean (match arg 0 with VArray _ -> true | _ -> false)
-    | "isobject" -> VBoolean (match arg 0 with VObject _ | VNothing -> true | _ -> false)
+    | "isobject" -> VBoolean (match arg 0 with VObject _ | VHostObject _ | VNothing -> true | _ -> false)
     | "isdate" -> VBoolean false
     | "typename" ->
-        let name =
-            match arg 0 with
-            | VInteger _ -> "Integer"
-            | VDouble _ -> "Double"
-            | VString _ -> "String"
-            | VBoolean _ -> "Boolean"
-            | VNull -> "Null"
-            | VEmpty -> "Empty"
-            | VNothing -> "Nothing"
-            | VArray _ -> "Variant()"
-            | VObject o -> o.ClassName
-            | VUndefined -> "Undefined"
-        VString name
+        VString (typeName (arg 0))
     | "vartype" ->
         let vt =
             match arg 0 with
@@ -167,6 +172,7 @@ let callBuiltin (name: string) (args: Value array) : Value =
             | VBoolean _ -> 11
             | VArray _ -> 0x2000
             | VObject _ -> 9
+            | VHostObject _ -> 9
             | _ -> 0
         VInteger vt
 
@@ -209,8 +215,12 @@ let callBuiltin (name: string) (args: Value array) : Value =
         VInteger 1
     | "inputbox" ->
         printf "%s" (s 0)
+#if FABLE_COMPILER
+        VString ""
+#else
         let input = Console.ReadLine()
         VString (if input = null then "" else input)
+#endif
     | "now" -> VString (DateTime.Now.ToString())
     | "timer" -> VDouble (float (DateTime.Now.TimeOfDay.TotalSeconds))
     | "formatnumber" ->
