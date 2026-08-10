@@ -12,6 +12,7 @@
     <Compile Include="Values.fs" />
     <Compile Include="Builtins.fs" />
     <Compile Include="Bytecode.fs" />
+    <Compile Include="BytecodeIO.fs" />
     <Compile Include="Compiler.fs" />
     <Compile Include="StackVm.fs" />
     <Compile Include="FsVb.fs" />

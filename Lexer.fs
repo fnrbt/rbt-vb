@@ -2,6 +2,12 @@ module Lexer
 
 open Ast
 
+let private resizeArrayToList (items: ResizeArray<'T>) =
+    let mutable result = []
+    for i = items.Count - 1 downto 0 do
+        result <- items.[i] :: result
+    result
+
 let keywords = set [
     "dim"; "redim"; "if"; "then"; "else"; "elseif"; "end"; "select"; "case"
     "for"; "to"; "step"; "next"; "each"; "while"; "wend"; "do"; "loop"; "until"
@@ -43,124 +49,151 @@ let private peekN (state: LexerState) n =
     then state.Source.[state.Position + n]
     else '\000'
 
-let rec private skipWhitespaceTracking (state: LexerState) (sawNewline: bool) =
-    let c = peek state
-    if c = ' ' || c = '\t' || c = '\r' then
-        skipWhitespaceTracking (advance state) sawNewline
-    elif c = '\n' then
-        skipWhitespaceTracking (advance state) true
-    else
-        (state, sawNewline)
+let private skipWhitespaceTracking (state: LexerState) (sawNewline: bool) =
+    let mutable st = state
+    let mutable foundNewline = sawNewline
+    let mutable scanning = true
+    while scanning do
+        let c = peek st
+        if c = ' ' || c = '\t' || c = '\r' then
+            st <- advance st
+        elif c = '\n' then
+            st <- advance st
+            foundNewline <- true
+        else
+            scanning <- false
+    (st, foundNewline)
 
-let rec private skipLineComment (state: LexerState) =
-    let c = peek state
-    if c <> '\n' && c <> '\000' then
-        skipLineComment (advance state)
-    else
-        state
+let private skipLineComment (state: LexerState) =
+    let mutable st = state
+    while peek st <> '\n' && peek st <> '\000' do
+        st <- advance st
+    st
 
 let private lexNumber (state: LexerState) =
-    let rec loop (acc: char list) (st: LexerState) =
-        let c = peek st
-        if isDigit c || c = '.' then
-            loop (c :: acc) (advance st)
-        else
-            let lexeme = new string (List.rev acc |> List.toArray)
-            let value = if lexeme.Contains "."
-                        then Double (float lexeme)
-                        else Integer (int lexeme)
-            (value, st)
-    loop [] state
+    let mutable st = state
+    while isDigit (peek st) || peek st = '.' do
+        st <- advance st
+    let lexeme = state.Source.Substring(state.Position, st.Position - state.Position)
+    let value =
+        if lexeme.Contains "." then Double (float lexeme)
+        else Integer (int lexeme)
+    (value, st)
 
 let private lexString (state: LexerState) =
     let stateAfterOpenQuote = advance state
     let startLine = stateAfterOpenQuote.Line
     let startCol = stateAfterOpenQuote.Column + 1
-    let rec loop (acc: char list) (st: LexerState) =
+    let chars = System.Text.StringBuilder()
+    let mutable st = stateAfterOpenQuote
+    let mutable closed = false
+    while not closed do
         let c = peek st
         if c = '"' then
             // Check for escaped quote ""
             if peekN st 1 = '"' then
-                loop ('"' :: acc) (advance (advance st))
+                chars.Append('"') |> ignore
+                st <- advance (advance st)
             else
-                (acc, st)
+                closed <- true
         elif c = '\000' then
             failwithf "Unterminated string literal starting at line %d, column %d" startLine startCol
         else
-            loop (c :: acc) (advance st)
-    let (chars, stateAtClosingQuote) = loop [] stateAfterOpenQuote
-    let finalState = advance stateAtClosingQuote
-    let lexeme = new string (List.rev chars |> List.toArray)
+            chars.Append(c) |> ignore
+            st <- advance st
+    let finalState = advance st
+    let lexeme = chars.ToString()
     (String lexeme, finalState)
 
 let private lexIdentifier (state: LexerState) =
-    let rec loop (acc: char list) (st: LexerState) =
-        let c = peek st
-        if isAlphaNumeric c then
-            loop (c :: acc) (advance st)
-        else
-            let lexeme = new string (List.rev acc |> List.toArray)
-            let lower = lexeme.ToLower()
-            let isKeyword = Set.contains lower keywords
-            // Normalize keyword lexemes to lowercase for consistent pattern matching
-            let normalizedLexeme = if isKeyword then lower else lexeme
-            (normalizedLexeme, isKeyword, st)
-    loop [] state
-
-let rec private lex (state: LexerState) (precedingNewline: bool) =
-    let (state, hadNewline) = skipWhitespaceTracking state precedingNewline
-    let nl = hadNewline
-    let c = peek state
-    let line = state.Line
-    let col = state.Column
-    let tok kind lexeme = { Kind = kind; Lexeme = lexeme; Line = line; Column = col; PrecedingNewline = nl }
-
-    match c with
-    | '\000' -> []
-    | '\'' ->
-        let state = skipLineComment (advance state)
-        lex state true  // comment implies newline
-    | '"' ->
-        let (lit, newState) = lexString state
-        let lexeme = match lit with String s -> s | _ -> ""
-        (tok StringLiteral lexeme) :: lex newState false
-    | c when isDigit c ->
-        let (lit, newState) = lexNumber state
-        let lexeme = match lit with Integer i -> string i | Double d -> string d | _ -> ""
-        (tok Number lexeme) :: lex newState false
-    | c when isAlpha c ->
-        let (lexeme, isKeyword, newState) = lexIdentifier state
-        if lexeme = "_" && not isKeyword then
-            lex newState true  // line continuation implies newline consumed
-        else
-        let kind = if isKeyword then Ast.Keyword else Ast.Identifier
-        (tok kind lexeme) :: lex newState false
-    | '(' -> (tok LParen "(") :: lex (advance state) false
-    | ')' -> (tok RParen ")") :: lex (advance state) false
-    | ',' -> (tok Comma ",") :: lex (advance state) false
-    | ':' -> (tok Colon ":") :: lex (advance state) false
-    | ';' -> (tok Semicolon ";") :: lex (advance state) false
-    | '.' -> (tok Dot ".") :: lex (advance state) false
-    | '=' -> (tok Eq "=") :: lex (advance state) false
-    | '+' -> (tok Operator "+") :: lex (advance state) false
-    | '-' -> (tok Operator "-") :: lex (advance state) false
-    | '*' -> (tok Operator "*") :: lex (advance state) false
-    | '/' -> (tok Operator "/") :: lex (advance state) false
-    | '\\' -> (tok Operator "\\") :: lex (advance state) false
-    | '^' -> (tok Operator "^") :: lex (advance state) false
-    | '<' ->
-        let c2 = peekN state 1
-        if c2 = '>' then (tok Operator "<>") :: lex (advance (advance state)) false
-        elif c2 = '=' then (tok Operator "<=") :: lex (advance (advance state)) false
-        else (tok Operator "<") :: lex (advance state) false
-    | '>' ->
-        let c2 = peekN state 1
-        if c2 = '=' then (tok Operator ">=") :: lex (advance (advance state)) false
-        else (tok Operator ">") :: lex (advance state) false
-    | '&' -> (tok Operator "&") :: lex (advance state) false
-    | _ -> (tok Operator (string c)) :: lex (advance state) false
+    let mutable st = state
+    while isAlphaNumeric (peek st) do
+        st <- advance st
+    let lexeme = state.Source.Substring(state.Position, st.Position - state.Position)
+    let lower = lexeme.ToLower()
+    let isKeyword = Set.contains lower keywords
+    // Normalize keyword lexemes to lowercase for consistent pattern matching
+    let normalizedLexeme = if isKeyword then lower else lexeme
+    (normalizedLexeme, isKeyword, st)
 
 let tokenize (source: string) =
     let initialState = { Source = source; Position = 0; Line = 1; Column = 1 }
-    let tokens = lex initialState false
-    tokens @ [{ Kind = EOF; Lexeme = ""; Line = initialState.Line; Column = initialState.Column; PrecedingNewline = false }]
+    let tokens = ResizeArray<Token>()
+    let mutable state = initialState
+    let mutable precedingNewline = false
+    let mutable finished = false
+    while not finished do
+        let (nextState, hadNewline) = skipWhitespaceTracking state precedingNewline
+        state <- nextState
+        let nl = hadNewline
+        let c = peek state
+        let line = state.Line
+        let col = state.Column
+        let add kind lexeme =
+            tokens.Add { Kind = kind; Lexeme = lexeme; Line = line; Column = col; PrecedingNewline = nl }
+
+        match c with
+        | '\000' -> finished <- true
+        | '\'' ->
+            state <- skipLineComment (advance state)
+            precedingNewline <- true  // comment implies newline
+        | '"' ->
+            let (lit, newState) = lexString state
+            let lexeme = match lit with String s -> s | _ -> ""
+            add StringLiteral lexeme
+            state <- newState
+            precedingNewline <- false
+        | c when isDigit c ->
+            let (lit, newState) = lexNumber state
+            let lexeme = match lit with Integer i -> string i | Double d -> string d | _ -> ""
+            add Number lexeme
+            state <- newState
+            precedingNewline <- false
+        | c when isAlpha c ->
+            let (lexeme, isKeyword, newState) = lexIdentifier state
+            if lexeme = "_" && not isKeyword then
+                state <- newState
+                precedingNewline <- true  // line continuation implies newline consumed
+            else
+                let kind = if isKeyword then Ast.Keyword else Ast.Identifier
+                add kind lexeme
+                state <- newState
+                precedingNewline <- false
+        | '(' -> add LParen "("; state <- advance state; precedingNewline <- false
+        | ')' -> add RParen ")"; state <- advance state; precedingNewline <- false
+        | ',' -> add Comma ","; state <- advance state; precedingNewline <- false
+        | ':' -> add Colon ":"; state <- advance state; precedingNewline <- false
+        | ';' -> add Semicolon ";"; state <- advance state; precedingNewline <- false
+        | '.' -> add Dot "."; state <- advance state; precedingNewline <- false
+        | '=' -> add Eq "="; state <- advance state; precedingNewline <- false
+        | '+' -> add Operator "+"; state <- advance state; precedingNewline <- false
+        | '-' -> add Operator "-"; state <- advance state; precedingNewline <- false
+        | '*' -> add Operator "*"; state <- advance state; precedingNewline <- false
+        | '/' -> add Operator "/"; state <- advance state; precedingNewline <- false
+        | '\\' -> add Operator "\\"; state <- advance state; precedingNewline <- false
+        | '^' -> add Operator "^"; state <- advance state; precedingNewline <- false
+        | '<' ->
+            let c2 = peekN state 1
+            if c2 = '>' then
+                add Operator "<>"
+                state <- advance (advance state)
+            elif c2 = '=' then
+                add Operator "<="
+                state <- advance (advance state)
+            else
+                add Operator "<"
+                state <- advance state
+            precedingNewline <- false
+        | '>' ->
+            let c2 = peekN state 1
+            if c2 = '=' then
+                add Operator ">="
+                state <- advance (advance state)
+            else
+                add Operator ">"
+                state <- advance state
+            precedingNewline <- false
+        | '&' -> add Operator "&"; state <- advance state; precedingNewline <- false
+        | _ -> add Operator (string c); state <- advance state; precedingNewline <- false
+    tokens.Add { Kind = EOF; Lexeme = ""; Line = initialState.Line; Column = initialState.Column; PrecedingNewline = false }
+    resizeArrayToList tokens

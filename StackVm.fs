@@ -93,42 +93,71 @@ let inline numericCmp (intOp: int -> int -> bool) (floatOp: float -> float -> bo
     | _ -> VBoolean false
 
 let vbLikeMatch (pattern: string) (text: string) : bool =
-    let rec matchAt pi ti =
-        if pi >= pattern.Length then ti >= text.Length
+    let classContains (chars: string) (ch: char) =
+        let target = System.Char.ToLowerInvariant ch
+        let mutable found = false
+        let mutable i = 0
+        while not found && i < chars.Length do
+            if System.Char.ToLowerInvariant chars.[i] = target then
+                found <- true
+            i <- i + 1
+        found
+
+    let tokenMatches pi ti =
+        if pi >= pattern.Length || ti >= text.Length then
+            ValueNone
         else
             match pattern.[pi] with
-            | '*' ->
-                // Try matching rest of pattern at every position
-                let mutable found = false
-                let mutable k = ti
-                while k <= text.Length && not found do
-                    if matchAt (pi + 1) k then found <- true
-                    k <- k + 1
-                found
-            | '?' ->
-                ti < text.Length && matchAt (pi + 1) (ti + 1)
+            | '*' -> ValueSome pi
+            | '?' -> ValueSome (pi + 1)
             | '#' ->
-                ti < text.Length && System.Char.IsDigit(text.[ti]) && matchAt (pi + 1) (ti + 1)
+                if System.Char.IsDigit(text.[ti]) then ValueSome (pi + 1) else ValueNone
             | '[' ->
-                if ti >= text.Length then false
+                let mutable endBracket = pi + 1
+                while endBracket < pattern.Length && pattern.[endBracket] <> ']' do
+                    endBracket <- endBracket + 1
+                if endBracket >= pattern.Length then
+                    ValueNone
                 else
-                    let mutable endBracket = pi + 1
-                    while endBracket < pattern.Length && pattern.[endBracket] <> ']' do
-                        endBracket <- endBracket + 1
-                    if endBracket >= pattern.Length then false
-                    else
-                        let inner = pattern.[pi+1 .. endBracket-1]
-                        let negate = inner.Length > 0 && inner.[0] = '!'
-                        let chars = if negate then inner.[1..] else inner
-                        let ch = System.Char.ToLowerInvariant(text.[ti])
-                        let found = chars.ToLowerInvariant().Contains(string ch)
-                        let matches = if negate then not found else found
-                        matches && matchAt (endBracket + 1) (ti + 1)
+                    let innerStart = pi + 1
+                    let negate = innerStart < endBracket && pattern.[innerStart] = '!'
+                    let charsStart = if negate then innerStart + 1 else innerStart
+                    let charsLength = endBracket - charsStart
+                    let chars = if charsLength <= 0 then "" else pattern.Substring(charsStart, charsLength)
+                    let found = classContains chars text.[ti]
+                    let matches = if negate then not found else found
+                    if matches then ValueSome (endBracket + 1) else ValueNone
             | c ->
-                ti < text.Length &&
-                System.Char.ToLowerInvariant(c) = System.Char.ToLowerInvariant(text.[ti]) &&
-                matchAt (pi + 1) (ti + 1)
-    matchAt 0 0
+                if System.Char.ToLowerInvariant c = System.Char.ToLowerInvariant text.[ti] then
+                    ValueSome (pi + 1)
+                else
+                    ValueNone
+
+    let mutable pi = 0
+    let mutable ti = 0
+    let mutable starPi = -1
+    let mutable starTextNext = -1
+    let mutable matched = true
+    while matched && ti < text.Length do
+        if pi < pattern.Length && pattern.[pi] = '*' then
+            starPi <- pi
+            pi <- pi + 1
+            starTextNext <- ti
+        else
+            match tokenMatches pi ti with
+            | ValueSome nextPi ->
+                pi <- nextPi
+                ti <- ti + 1
+            | ValueNone ->
+                if starPi >= 0 then
+                    pi <- starPi + 1
+                    starTextNext <- starTextNext + 1
+                    ti <- starTextNext
+                else
+                    matched <- false
+    while matched && pi < pattern.Length && pattern.[pi] = '*' do
+        pi <- pi + 1
+    matched && pi >= pattern.Length
 
 let emptyState (constants: Value array) (program: BytecodeProgram) : VmState =
     let callStack = Array.zeroCreate 4096
@@ -618,7 +647,9 @@ let executeOneInstruction (state: VmState) =
         for i in 0 .. argCount - 1 do
             args.[i] <- pop state
 
-        let result = Builtins.callBuiltin (name.ToLowerInvariant()) args
+        // `name` is already lowercased by the compiler (CallBuiltin emission),
+        // so no per-call ToLowerInvariant allocation here.
+        let result = Builtins.callBuiltin name args
         push state result
         state.Pc <- state.Pc + 1
 

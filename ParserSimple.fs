@@ -146,6 +146,16 @@ let skipColons : Parser<unit> = fun tokens ->
         | _ -> toks
     Success ((), loop tokens)
 
+let private topLevelHeadAfterModifiers tokens =
+    let rec loop remaining =
+        match remaining with
+        | { Kind = Keyword; Lexeme = lexeme } :: tail ->
+            match lexeme.ToLower() with
+            | "public" | "private" | "friend" | "global" | "static" | "default" -> loop tail
+            | _ -> remaining
+        | _ -> remaining
+    loop tokens
+
 // ── Expression parsers (shared, dialect-independent) ──
 
 /// Accept an identifier or a keyword token as a name (for member access like obj.Error, obj.Type)
@@ -167,34 +177,41 @@ let rec pliteral : Parser<Expression> = fun tokens ->
     (true_ <|> false_ <|> null_ <|> empty_ <|> nothing_ <|> str <|> num) tokens
 
 and pprimary : Parser<Expression> = fun tokens ->
-    let lit = pliteral
-    let paren = between (ptoken LParen) (ptoken RParen) pexpression
-
-    let pnew : Parser<Expression> = fun tokens ->
-        match (pkeyword "new" .>>. pidentifier) tokens with
-        | Success ((_, name), remaining) -> Success (NewExpr name, remaining)
-        | Error (msg, token) -> Error (msg, token)
-
-    let pme = pkeyword "me" >>% MeExpr
-
-    let ptypeof : Parser<Expression> = fun tokens ->
-        match (pkeyword "typeof" >>. ppostfix .>> pkeyword "is" .>>. pidentifier) tokens with
-        | Success ((expr, name), remaining) -> Success (TypeOfIs (expr, name), remaining)
-        | Error (msg, token) -> Error (msg, token)
-
-    let ident = pidentifier |>> Identifier
-
-    // Leading dot: .Member inside With block
-    let pwithDot : Parser<Expression> = fun tokens ->
-        match tokens with
-        | { Kind = Dot } :: _ ->
-            match (ptoken Dot >>. pidentifierOrKeyword) tokens with
-            | Success (name, remaining) -> Success (Member(WithDotExpr, name), remaining)
+    match tokens with
+    | { Kind = Keyword; Lexeme = lexeme } :: tail ->
+        match lexeme.ToLower() with
+        | "new" ->
+            match pidentifier tail with
+            | Success (name, remaining) -> Success (NewExpr name, remaining)
             | Error (msg, token) -> Error (msg, token)
-        | head :: _ -> Error ("Expected dot", head)
-        | [] -> Error ("Expected dot", { Kind = Ast.EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
-
-    (pnew <|> ptypeof <|> pme <|> lit <|> ident <|> pwithDot <|> paren) tokens
+        | "typeof" ->
+            match (ppostfix .>> pkeyword "is" .>>. pidentifier) tail with
+            | Success ((expr, name), remaining) -> Success (TypeOfIs (expr, name), remaining)
+            | Error (msg, token) -> Error (msg, token)
+        | "me" -> Success (MeExpr, tail)
+        | "true" -> Success (Literal (Boolean true), tail)
+        | "false" -> Success (Literal (Boolean false), tail)
+        | "null" -> Success (Literal Null, tail)
+        | "empty" -> Success (Literal Empty, tail)
+        | "nothing" -> Success (Literal Nothing, tail)
+        | _ -> Error (sprintf "Expected expression but got keyword '%s'" lexeme, List.head tokens)
+    | { Kind = Number; Lexeme = lexeme } :: tail ->
+        let lit =
+            if lexeme.Contains "." then Literal (Double (float lexeme))
+            else Literal (Integer (int lexeme))
+        Success (lit, tail)
+    | { Kind = StringLiteral; Lexeme = lexeme } :: tail ->
+        Success (Literal (Ast.String lexeme), tail)
+    | { Kind = Ast.Identifier; Lexeme = lexeme } :: tail ->
+        Success (Identifier lexeme, tail)
+    | { Kind = Dot } :: tail ->
+        match pidentifierOrKeyword tail with
+        | Success (name, remaining) -> Success (Member(WithDotExpr, name), remaining)
+        | Error (msg, token) -> Error (msg, token)
+    | { Kind = LParen } :: _ ->
+        (between (ptoken LParen) (ptoken RParen) pexpression) tokens
+    | head :: _ -> Error (sprintf "Expected expression but got %A ('%s')" head.Kind head.Lexeme, head)
+    | [] -> Error ("Expected expression but reached EOF", { Kind = Ast.EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
 
 /// Postfix loop: handles .name (member access) and (args) (call/index)
 and ppostfix : Parser<Expression> = fun tokens ->
@@ -966,6 +983,23 @@ and pexpressionStmt : Parser<Statement> = fun tokens ->
     | Success (expr, remaining) -> Success (ExpressionStmt expr, remaining)
     | Error (msg, token) -> Error (msg, token)
 
+and ptargetAssignment : Parser<Statement> = fun tokens ->
+    match ppostfix tokens with
+    | Success (expr, remaining) ->
+        match remaining with
+        | { Kind = Eq } :: _ ->
+            match (ptoken Eq >>. pexpression) remaining with
+            | Success (value, remaining2) ->
+                match expr with
+                | Identifier name -> Success (Assignment (name, value), remaining2)
+                | Member (objExpr, memberName) -> Success (MemberAssignment (objExpr, memberName, value), remaining2)
+                | Ast.Call (Identifier name, indices) -> Success (IndexedAssignment (name, indices, value), remaining2)
+                | headExpr -> Error (sprintf "Expected assignable target but got %A" headExpr, List.head remaining)
+            | Error (msg, token) -> Error (msg, token)
+        | head :: _ -> Error ("Expected assignment", head)
+        | [] -> Error ("Expected assignment", { Kind = Ast.EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
+    | Error (msg, token) -> Error (msg, token)
+
 and pstatement (dialect: Dialect) : Parser<Statement> = fun tokens ->
     // Try label before skipColons (VBA only), since label ends with ':'
     if dialect = VBA then
@@ -980,35 +1014,43 @@ and pstatementAfterColons (dialect: Dialect) : Parser<Statement> = fun tokens ->
     match skipColons tokens with
     | Success ((), tokens) ->
         // Try label after colons too (VBA only)
-        match (if dialect = VBA then plabel tokens else Error ("", List.head tokens)) with
-        | Success _ as result -> result
-        | Error _ ->
-        let parsers =
-            pselectCase dialect
-            <|> pOnError dialect
-            <|> pwithStmt dialect
-            <|> peraseStmt
-            <|> predim
-            <|> pdim dialect
-            <|> pconst dialect
-            <|> psetStmtFull
-            <|> pifStmt dialect
-            <|> pforEach dialect
-            <|> pforLoop dialect
-            <|> pwhileLoop dialect
-            <|> pdoLoop dialect
-            <|> pexit
-            <|> pcallStmt dialect
-            <|> pgotoStmt
-            <|> pgosubStmt
-            <|> preturnStmt
-            <|> pVisibilityDecl dialect
-            <|> pindexedAssignment
-            <|> pmemberAssignment
-            <|> pletStmt
-            <|> pSubCallNoParens
-            <|> pexpressionStmt
-        parsers tokens
+        let parseNonLabel () =
+            match tokens with
+            | [] -> Error ("Expected statement", { Kind = Ast.EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
+            | { Kind = Keyword; Lexeme = lexeme } :: _ ->
+                match lexeme.ToLower() with
+                | "select" -> pselectCase dialect tokens
+                | "on" -> pOnError dialect tokens
+                | "with" -> pwithStmt dialect tokens
+                | "erase" -> peraseStmt tokens
+                | "redim" -> predim tokens
+                | "dim" -> pdim dialect tokens
+                | "const" -> pconst dialect tokens
+                | "set" -> psetStmtFull tokens
+                | "if" -> pifStmt dialect tokens
+                | "for" -> (pforEach dialect <|> pforLoop dialect) tokens
+                | "while" -> pwhileLoop dialect tokens
+                | "do" -> pdoLoop dialect tokens
+                | "exit" -> pexit tokens
+                | "call" -> pcallStmt dialect tokens
+                | "goto" -> pgotoStmt tokens
+                | "gosub" -> pgosubStmt tokens
+                | "return" -> preturnStmt tokens
+                | "public" | "private" | "global" -> pVisibilityDecl dialect tokens
+                | _ -> pexpressionStmt tokens
+            | { Kind = Ast.Identifier } :: _
+            | { Kind = Dot } :: _ ->
+                (ptargetAssignment
+                 <|> pSubCallNoParens
+                 <|> pexpressionStmt) tokens
+            | _ -> pexpressionStmt tokens
+
+        if dialect = VBA then
+            match plabel tokens with
+            | Success _ as result -> result
+            | Error _ -> parseNonLabel ()
+        else
+            parseNonLabel ()
     | Error (msg, token) -> Error (msg, token)
 
 // ── Function/Sub/Property parsing ──
@@ -1273,27 +1315,21 @@ let pclass (dialect: Dialect) : Parser<TopLevel> = fun tokens ->
 let pTopLevel (dialect: Dialect) : Parser<TopLevel> = fun tokens ->
     match skipColons tokens with
     | Success ((), tokens) ->
-        let tryClass = pclass dialect
-
-        let tryFunc =
-            pfunction dialect |>> FunctionDef
-
-        // VBA-only top-level forms
-        let tryVbaOnly =
-            match dialect with
-            | VBA ->
-                penum <|> ptypeDecl <|> pimplements
-                <|> pdeclare dialect
-                <|> peventDecl dialect <|> pWithEventsDecl dialect
-            | VBScript ->
-                fun _ -> Error ("", { Kind = EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
-
-        let tryOption = poption
-
-        let tryStmt =
-            pstatement dialect |>> TopLevelStatement
-
-        (tryClass <|> tryFunc <|> tryVbaOnly <|> tryOption <|> tryStmt) tokens
+        let statement () = (pstatement dialect |>> TopLevelStatement) tokens
+        match topLevelHeadAfterModifiers tokens with
+        | { Kind = Keyword; Lexeme = lexeme } :: _ ->
+            match lexeme.ToLower() with
+            | "class" -> pclass dialect tokens
+            | "function" | "sub" | "property" -> (pfunction dialect |>> FunctionDef) tokens
+            | "option" -> poption tokens
+            | "enum" when dialect = VBA -> penum tokens
+            | "type" when dialect = VBA -> ptypeDecl tokens
+            | "implements" when dialect = VBA -> pimplements tokens
+            | "declare" when dialect = VBA -> pdeclare dialect tokens
+            | "event" when dialect = VBA -> peventDecl dialect tokens
+            | "withevents" when dialect = VBA -> pWithEventsDecl dialect tokens
+            | _ -> statement ()
+        | _ -> statement ()
     | Error (msg, token) -> Error (msg, token)
 
 let pprogram (dialect: Dialect) : Parser<Program> = fun tokens ->

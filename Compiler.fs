@@ -53,6 +53,7 @@ let private copyNameDictionary (source: Dictionary<string, 'T>) =
 type CompileContext = {
     Instructions: ResizeArray<Instruction>
     Constants: ResizeArray<Value>
+    ConstantIndex: Dictionary<Value, int>
     Globals: Dictionary<string, int>
     mutable Locals: Dictionary<string, int>
     Functions: ResizeArray<FunctionDef>
@@ -77,6 +78,7 @@ let emptyContext () =
     {
         Instructions = ResizeArray()
         Constants = ResizeArray()
+        ConstantIndex = Dictionary<Value, int>()
         Globals = newNameDictionary ()
         Locals = newNameDictionary ()
         Functions = ResizeArray()
@@ -103,15 +105,14 @@ let patchJump (ctx: CompileContext) (pc: int) (opcode: Opcode) =
     ctx.Instructions.[pc] <- { ctx.Instructions.[pc] with Opcode = opcode }
 
 let addConstant (ctx: CompileContext) (value: Value) =
-    let mutable foundIndex = -1
-    for i in 0 .. ctx.Constants.Count - 1 do
-        if ctx.Constants.[i] = value && foundIndex = -1 then
-            foundIndex <- i
-    if foundIndex >= 0 then
+    let mutable foundIndex = 0
+    if ctx.ConstantIndex.TryGetValue(value, &foundIndex) then
         foundIndex
     else
+        let index = ctx.Constants.Count
         ctx.Constants.Add(value)
-        ctx.Constants.Count - 1
+        ctx.ConstantIndex.[value] <- index
+        index
 
 let getGlobalSlot (ctx: CompileContext) (name: string) =
     match tryGetName ctx.Globals name with
@@ -171,7 +172,9 @@ let emitCall (ctx: CompileContext) (name: string) (args: Expression list) (compi
     | false, _ ->
         for i in List.length args - 1 .. -1 .. 0 do
             compileExpr ctx (List.item i args)
-        emit ctx (CallBuiltin (name, List.length args)) 0
+        // Builtins dispatch case-insensitively; lowercase the name once here so
+        // the VM needn't re-lowercase (allocate) on every call.
+        emit ctx (CallBuiltin (name.ToLowerInvariant(), List.length args)) 0
 
 let private emitDefaultCall (ctx: CompileContext) (args: Expression list) (compileExpr: CompileContext -> Expression -> unit) =
     for i in List.length args - 1 .. -1 .. 0 do
