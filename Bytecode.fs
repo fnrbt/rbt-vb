@@ -1,4 +1,4 @@
-module Bytecode
+module Rbt.Vb.Bytecode
 
 open Values
 

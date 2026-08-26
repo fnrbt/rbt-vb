@@ -1,4 +1,4 @@
-module Vm
+module Rbt.Vb.Vm
 
 open Ast
 

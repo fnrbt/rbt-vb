@@ -1,5 +1,7 @@
-module FsVb
+[<AutoOpen>]
+module Rbt.Vb.Api
 
+open Rbt.Vb
 open Ast
 
 let private equalsIgnoreCase (left: string) (right: string) =

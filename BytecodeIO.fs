@@ -1,4 +1,4 @@
-module BytecodeIO
+module Rbt.Vb.BytecodeIO
 
 // Binary (de)serialization of a compiled BytecodeProgram — our analogue of
 // VBA's persisted p-code. Lets a compiled macro be saved and re-run without

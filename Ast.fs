@@ -1,4 +1,4 @@
-module Ast
+module Rbt.Vb.Ast
 
 type Dialect = VBA | VBScript
 

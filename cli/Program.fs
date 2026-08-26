@@ -1,25 +1,29 @@
+module Rbt.Vb.Cli
+
+open Rbt.Vb
+open Rbt.Vb.Api
 open System
 open Ast
 
 let private printRunError = function
-    | FsVb.ParseError err ->
+    | Api.ParseError err ->
         printfn "Parse error: %s" err
-    | FsVb.ValidationErrors errors ->
+    | Api.ValidationErrors errors ->
         printfn "Validation errors:"
         for err in errors do
             printfn "  - %s" err.Message
-    | FsVb.RuntimeError err ->
+    | Api.RuntimeError err ->
         printfn "Runtime error: %s" err
 
 let runCode (dialect: Dialect) (tolerant: bool) (code: string) (label: string) =
     printfn "Executing: %s" label
     printfn "---"
-    let options: FsVb.ParseOptions = {
+    let options: Api.ParseOptions = {
         Dialect = dialect
         Tolerant = tolerant
         HostGlobalNames = []
     }
-    match FsVb.compileSource options code with
+    match Api.compileSource options code with
     | Ok (_, bytecode) ->
         printfn "Parse successful!"
         printfn "Compiling to bytecode..."
@@ -30,12 +34,12 @@ let runCode (dialect: Dialect) (tolerant: bool) (code: string) (label: string) =
         printfn "Running VM..."
         printfn "---"
         try
-            FsVb.execute bytecode |> ignore
+            Api.execute bytecode |> ignore
             printfn "---"
             printfn "VM execution complete"
             0
         with ex ->
-            printRunError (FsVb.RuntimeError ex.Message)
+            printRunError (Api.RuntimeError ex.Message)
             1
     | Error err ->
         printRunError err
@@ -43,8 +47,8 @@ let runCode (dialect: Dialect) (tolerant: bool) (code: string) (label: string) =
 
 let printUsage () =
     printfn "VB Parser and Stack VM"
-    printfn "Usage: FsVb.Cli [--vba] [--tolerant] <filename.vbs>"
-    printfn "   or: FsVb.Cli [--vba] [--tolerant] -e \"VB code\""
+    printfn "Usage: Api.Cli [--vba] [--tolerant] <filename.vbs>"
+    printfn "   or: Api.Cli [--vba] [--tolerant] -e \"VB code\""
     printfn ""
     printfn "  --vba       Parse as VBA (strict mode, rejects VBScript-only forms)"
     printfn "  --tolerant  Parse VBA superset, then validate against target dialect"

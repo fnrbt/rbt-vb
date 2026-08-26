@@ -1,4 +1,4 @@
-module Lexer
+module Rbt.Vb.Lexer
 
 open Ast
 

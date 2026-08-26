@@ -1,4 +1,4 @@
-module Validator
+module Rbt.Vb.Validator
 
 open Ast
 

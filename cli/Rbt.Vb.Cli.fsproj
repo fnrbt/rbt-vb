@@ -10,7 +10,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../VBScriptParser.fsproj" />
+    <ProjectReference Include="../Rbt.Vb.fsproj" />
   </ItemGroup>
 
 </Project>

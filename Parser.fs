@@ -1,4 +1,4 @@
-module Parser
+module Rbt.Vb.Parser
 
 open Ast
 open Lexer

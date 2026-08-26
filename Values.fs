@@ -1,4 +1,4 @@
-module Values
+module Rbt.Vb.Values
 
 open System.Collections.Generic
 

@@ -1,4 +1,4 @@
-module StackVm
+module Rbt.Vb.StackVm
 
 open Bytecode
 open Values

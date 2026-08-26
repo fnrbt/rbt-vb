@@ -1,4 +1,4 @@
-module Compiler
+module Rbt.Vb.Compiler
 
 open Ast
 open Bytecode
