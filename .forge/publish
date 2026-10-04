@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Build and publish Rbt.Vb to the Forge registry.
+
+Runs inside the Forge publish-action shell as the sole checkout. The package
+carries its F# sources under fable/ so Fable consumers (rbt-office) can compile
+it from the package alone.
+
+The coordinator injects FORGE_PACKAGE_SOURCE (registry v3 index URL) and
+FORGE_PACKAGE_API_KEYS (JSON prefix->token map). FORGE_VERSION comes from the
+pushed version tag (refs/tags/vX.Y.Z). Re-publishing an existing immutable
+version returns HTTP 409, treated as a no-op so re-pushing a tag is safe.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+
+# (publisher prefix, project), in dependency order.
+PROJECTS = [
+    ("Rbt.Vb", "Rbt.Vb.fsproj"),
+]
+
+
+def fail(message: str) -> None:
+    raise SystemExit(message)
+
+
+def run(command: list[str], **kwargs) -> None:
+    print("+ " + " ".join(command), flush=True)
+    # dotnet reports build and restore errors on stdout, but a failed action only
+    # records stderr; echo the output tail there so the failure explains itself.
+    completed = subprocess.run(command, capture_output=True, text=True, **kwargs)
+    sys.stdout.write(completed.stdout)
+    sys.stderr.write(completed.stderr)
+    if completed.returncode != 0:
+        tail = "\n".join((completed.stdout + completed.stderr).splitlines()[-60:])
+        fail(f"{command[0]} {command[1]} failed with exit code {completed.returncode}:\n{tail}")
+
+
+def main() -> int:
+    repo = Path(__file__).resolve().parent.parent
+
+    version = os.environ.get("FORGE_VERSION", "").strip()
+    if not version:
+        fail("FORGE_VERSION is required (set by the publish action from the version tag)")
+    source = os.environ.get("FORGE_PACKAGE_SOURCE")
+    if not source:
+        fail("FORGE_PACKAGE_SOURCE is required")
+    try:
+        api_keys = json.loads(os.environ.get("FORGE_PACKAGE_API_KEYS") or "{}")
+    except json.JSONDecodeError as error:
+        fail(f"FORGE_PACKAGE_API_KEYS is not valid JSON: {error}")
+    for prefix, _ in PROJECTS:
+        if not api_keys.get(prefix):
+            fail(f"FORGE_PACKAGE_API_KEYS has no {prefix} publisher token")
+    source_sha = os.environ.get("FORGE_SOURCE_SHA", "")
+
+    # Out-of-tree work directory so the checkout stays clean.
+    workdir = Path(tempfile.mkdtemp(prefix="rbt-vb-publish-"))
+
+    # Rbt dependencies restore through the sandbox's credential-injecting gateway
+    # (declared with packages.read). The sandbox writes the canonical NuGet.Config
+    # for it; the gateway is plain HTTP, so any fallback config must allow that.
+    sandbox_config = Path("/workspace/NuGet.Config")
+    if sandbox_config.is_file():
+        nuget_config = sandbox_config
+    else:
+        restore_source = os.environ.get("NUGET_REDBAT_SOURCE") or source
+        insecure = ' allowInsecureConnections="true"' if restore_source.startswith("http://") else ""
+        nuget_config = workdir / "NuGet.Config"
+        nuget_config.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<configuration>\n"
+            "  <packageSources>\n"
+            "    <clear />\n"
+            f'    <add key="forge" value="{restore_source}"{insecure} />\n'
+            '    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />\n'
+            "  </packageSources>\n"
+            "</configuration>\n",
+            encoding="utf-8",
+        )
+
+    # MSBuild creates its own temp directories under TMPDIR; give it one we own so a
+    # sandbox TMPDIR that is missing or cleaned mid-run cannot fail the pack.
+    build_tmp = workdir / "tmp"
+    build_tmp.mkdir()
+    environment = dict(os.environ, TMPDIR=str(build_tmp), TMP=str(build_tmp), TEMP=str(build_tmp))
+
+    # Pack and push in dependency order: a project's in-repo references become
+    # package dependencies at the same version, already published by then.
+    endpoint = publish_endpoint(source)
+    for index, (prefix, project) in enumerate(PROJECTS):
+        output = workdir / f"nupkg-{index}"
+        run(
+            [
+                "dotnet", "pack", project,
+                "-c", "Release",
+                "--configfile", str(nuget_config),
+                f"-p:Version={version}",
+                f"-p:PackageVersion={version}",
+                f"-p:RepositoryCommit={source_sha}",
+                "-p:ContinuousIntegrationBuild=true",
+                "-p:IncludeSymbols=false",
+                "-p:ForgePublish=true",
+                "-o", str(output),
+            ],
+            cwd=repo,
+            env=environment,
+        )
+        packages = sorted(path for path in output.glob("*.nupkg") if ".symbols." not in path.name)
+        if len(packages) != 1:
+            fail(f"expected one package from {project}, produced {[path.name for path in packages]}")
+        push(packages[0], endpoint, api_keys[prefix], source_sha)
+    return 0
+
+
+def push(package: Path, endpoint: str, api_key: str, source_sha: str) -> None:
+    boundary = "----ForgePackage" + uuid.uuid4().hex
+    prefix = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="package"; filename="{package.name}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode()
+    body = prefix + package.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+    request = urllib.request.Request(
+        endpoint,
+        data=body,
+        method="PUT",
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "X-NuGet-ApiKey": api_key,
+            "X-Forge-Source-Sha": source_sha,
+            "X-Forge-Version-Mode": "explicit",
+        },
+    )
+    print(f"+ publish {package.name} to {endpoint}", flush=True)
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            if response.status < 200 or response.status >= 300:
+                fail(f"publish returned HTTP {response.status}: {package.name}")
+    except urllib.error.HTTPError as error:
+        if error.code == 409:
+            print(f"{package.name} is already published (409); no-op", flush=True)
+            return
+        detail = error.read(4096).decode("utf-8", errors="replace")
+        fail(f"publish failed with HTTP {error.code}: {package.name}\n{detail}")
+    except (OSError, urllib.error.URLError) as error:
+        fail(f"publish failed: {package.name}: {error}")
+    print(f"published {package.name}", flush=True)
+
+
+def publish_endpoint(source: str) -> str:
+    request = urllib.request.Request(source, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            index = json.load(response)
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+        fail(f"could not read NuGet service index {source}: {error}")
+    for resource in index.get("resources", []):
+        resource_types = resource.get("@type", [])
+        if isinstance(resource_types, str):
+            resource_types = [resource_types]
+        if any(str(value).split("/", 1)[0] == "PackagePublish" for value in resource_types):
+            endpoint = str(resource.get("@id") or "").strip()
+            if endpoint:
+                return urllib.parse.urljoin(source, endpoint)
+    fail(f"NuGet service index has no PackagePublish resource: {source}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
