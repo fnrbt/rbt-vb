@@ -113,14 +113,15 @@ let pidentifier : Parser<string> = fun tokens ->
     | head :: _ -> Error (sprintf "Expected identifier but got %A ('%s')" head.Kind head.Lexeme, head)
     | [] -> Error ("Expected identifier but reached EOF", { Kind = Ast.EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
 
+let private numberLiteral (text: string) =
+    match System.Int32.TryParse text with
+    | true, value -> Literal (Integer value)
+    | _ -> Literal (Double (float text))
+
 let pnumber : Parser<Expression> = fun tokens ->
     match tokens with
     | { Kind = Number; Lexeme = lexeme } :: tail ->
-        let lit =
-            if lexeme.Contains "."
-            then Literal (Double (float lexeme))
-            else Literal (Integer (int lexeme))
-        Success (lit, tail)
+        Success (numberLiteral lexeme, tail)
     | head :: _ -> Error (sprintf "Expected number but got %A" head.Kind, head)
     | [] -> Error ("Expected number but reached EOF", { Kind = EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
 
@@ -196,10 +197,7 @@ and pprimary : Parser<Expression> = fun tokens ->
         | "nothing" -> Success (Literal Nothing, tail)
         | _ -> Error (sprintf "Expected expression but got keyword '%s'" lexeme, List.head tokens)
     | { Kind = Number; Lexeme = lexeme } :: tail ->
-        let lit =
-            if lexeme.Contains "." then Literal (Double (float lexeme))
-            else Literal (Integer (int lexeme))
-        Success (lit, tail)
+        Success (numberLiteral lexeme, tail)
     | { Kind = StringLiteral; Lexeme = lexeme } :: tail ->
         Success (Literal (Ast.String lexeme), tail)
     | { Kind = Ast.Identifier; Lexeme = lexeme } :: tail ->
@@ -209,7 +207,7 @@ and pprimary : Parser<Expression> = fun tokens ->
         | Success (name, remaining) -> Success (Member(WithDotExpr, name), remaining)
         | Error (msg, token) -> Error (msg, token)
     | { Kind = LParen } :: _ ->
-        (between (ptoken LParen) (ptoken RParen) pexpression) tokens
+        (between (ptoken LParen) (ptoken RParen) pexpression |>> Parenthesized) tokens
     | head :: _ -> Error (sprintf "Expected expression but got %A ('%s')" head.Kind head.Lexeme, head)
     | [] -> Error ("Expected expression but reached EOF", { Kind = Ast.EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
 
@@ -223,202 +221,157 @@ and ppostfix : Parser<Expression> = fun tokens ->
                 match pidentifierOrKeyword tail with
                 | Success (name, remaining2) -> loop (Member (acc, name)) remaining2
                 | Error (msg, token) -> Error (msg, token)
-            | { Kind = LParen } :: _ ->
+            | { Kind = LParen; PrecedingNewline = false } :: _ ->
                 match (between (ptoken LParen) (ptoken RParen) (sepBy (ptoken Comma) pexpression)) remaining with
                 | Success (args, remaining2) -> loop (Call (acc, args)) remaining2
-                | Error _ -> Success (acc, remaining)
+                | Error (msg, token) -> Error (msg, token)
             | _ -> Success (acc, remaining)
         loop expr remaining
     | Error (msg, token) -> Error (msg, token)
 
+// VB evaluates repeated binary operators at the same precedence from left to right,
+// including exponentiation. Exponentiation binds tighter than unary minus.
+and ppower : Parser<Expression> = fun tokens ->
+    match ppostfix tokens with
+    | Error (msg, token) -> Error (msg, token)
+    | Success (first, rest) ->
+        let rec loop left rem =
+            match rem with
+            | { Kind = Operator; Lexeme = "^"; PrecedingNewline = false } :: tail ->
+                let rec signedAtom toks =
+                    match toks with
+                    | { Kind = Operator; Lexeme = "-" } :: rest ->
+                        match signedAtom rest with
+                        | Success (expr, next) -> Success (Unary (Negate, expr), next)
+                        | Error (msg, token) -> Error (msg, token)
+                    | { Kind = Operator; Lexeme = "+" } :: rest -> signedAtom rest
+                    | _ -> ppostfix toks
+                match signedAtom tail with
+                | Success (right, next) -> loop (Binary (Power, left, right)) next
+                | Error (msg, token) -> Error (msg, token)
+            | _ -> Success (left, rem)
+        loop first rest
+
 and punary : Parser<Expression> = fun tokens ->
-    let not_ = pkeyword "not" >>. punary |>> fun e -> Unary (Not, e)
-    let neg = poperator "-" >>. punary |>> fun e -> Unary (Negate, e)
-    let pos = poperator "+" >>. punary
-    let postfix = ppostfix
-    (not_ <|> neg <|> pos <|> postfix) tokens
+    match tokens with
+    | { Kind = Operator; Lexeme = "-"; PrecedingNewline = false } :: tail ->
+        match punary tail with
+        | Success (expr, rest) -> Success (Unary (Negate, expr), rest)
+        | Error (msg, token) -> Error (msg, token)
+    | { Kind = Operator; Lexeme = "+"; PrecedingNewline = false } :: tail -> punary tail
+    | _ -> ppower tokens
 
-and pterm : Parser<Expression> = fun tokens ->
-    let rec loop acc remaining =
-        match remaining with
-        | { Kind = Operator; Lexeme = "*" } :: tail ->
-            match punary tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (Multiply, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | { Kind = Operator; Lexeme = "/" } :: tail ->
-            match punary tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (Divide, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | { Kind = Operator; Lexeme = "\\" } :: tail ->
-            match punary tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (IntDivide, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | { Kind = Keyword; Lexeme = "mod" } :: tail ->
-            match punary tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (Modulus, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | _ -> Success (acc, remaining)
-    match punary tokens with
-    | Success (leftExpr, remaining) -> loop leftExpr remaining
+and pchain (operand: Parser<Expression>) (operators: (Token -> BinaryOperator option)) : Parser<Expression> = fun tokens ->
+    match operand tokens with
     | Error (msg, token) -> Error (msg, token)
+    | Success (first, rest) ->
+        let rec loop left rem =
+            match rem with
+            | token :: tail when not token.PrecedingNewline ->
+                match operators token with
+                | Some op ->
+                    match operand tail with
+                    | Success (right, next) -> loop (Binary (op, left, right)) next
+                    | Error (msg, bad) -> Error (msg, bad)
+                | None -> Success (left, rem)
+            | _ -> Success (left, rem)
+        loop first rest
 
-and pfactor : Parser<Expression> = fun tokens ->
-    let rec loop acc remaining =
-        match remaining with
-        | { Kind = Operator; Lexeme = "^" } :: tail ->
-            match pfactor tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (Power, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | _ -> Success (acc, remaining)
-    match pterm tokens with
-    | Success (leftExpr, remaining) -> loop leftExpr remaining
-    | Error (msg, token) -> Error (msg, token)
-
-and pconcat : Parser<Expression> = fun tokens ->
-    let rec loop acc remaining =
-        match remaining with
-        | { Kind = Operator; Lexeme = "&" } :: tail ->
-            match pfactor tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (Concatenate, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | _ -> Success (acc, remaining)
-    match pfactor tokens with
-    | Success (leftExpr, remaining) -> loop leftExpr remaining
-    | Error (msg, token) -> Error (msg, token)
-
-and paddition : Parser<Expression> = fun tokens ->
-    let rec loop acc remaining =
-        match remaining with
-        | { Kind = Operator; Lexeme = "+" } :: tail ->
-            match pconcat tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (Add, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | { Kind = Operator; Lexeme = "-" } :: tail ->
-            match pconcat tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (Subtract, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | _ -> Success (acc, remaining)
-    match pconcat tokens with
-    | Success (leftExpr, remaining) -> loop leftExpr remaining
-    | Error (msg, token) -> Error (msg, token)
-
-and pcomparison : Parser<Expression> = fun tokens ->
-    let rec loop acc remaining =
-        match remaining with
-        | { Kind = Eq; Lexeme = "=" } :: tail ->
-            match paddition tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (Equal, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | { Kind = Operator; Lexeme = "<>" } :: tail ->
-            match paddition tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (NotEqual, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | { Kind = Operator; Lexeme = "<" } :: tail ->
-            match paddition tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (LessThan, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | { Kind = Operator; Lexeme = "<=" } :: tail ->
-            match paddition tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (LessEqual, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | { Kind = Operator; Lexeme = ">" } :: tail ->
-            match paddition tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (GreaterThan, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | { Kind = Operator; Lexeme = ">=" } :: tail ->
-            match paddition tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (GreaterEqual, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | { Kind = Keyword; Lexeme = "is" } :: tail ->
-            match paddition tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (Is, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | { Kind = Keyword; Lexeme = "like" } :: tail ->
-            match paddition tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (Like, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | _ -> Success (acc, remaining)
-    match paddition tokens with
-    | Success (leftExpr, remaining) -> loop leftExpr remaining
-    | Error (msg, token) -> Error (msg, token)
-
-and pand : Parser<Expression> = fun tokens ->
-    let rec loop acc remaining =
-        match remaining with
-        | { Kind = Keyword; Lexeme = "and" } :: tail ->
-            match pcomparison tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (And, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | _ -> Success (acc, remaining)
-    match pcomparison tokens with
-    | Success (leftExpr, remaining) -> loop leftExpr remaining
-    | Error (msg, token) -> Error (msg, token)
-
-and por : Parser<Expression> = fun tokens ->
-    let rec loop acc remaining =
-        match remaining with
-        | { Kind = Keyword; Lexeme = "or" } :: tail ->
-            match pand tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (Or, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | { Kind = Keyword; Lexeme = "xor" } :: tail ->
-            match pand tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (Xor, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | { Kind = Keyword; Lexeme = "eqv" } :: tail ->
-            match pand tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (Eqv, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | { Kind = Keyword; Lexeme = "imp" } :: tail ->
-            match pand tail with
-            | Success (rightExpr, newerRemaining) -> loop (Binary (Imp, acc, rightExpr)) newerRemaining
-            | Error (msg, token) -> Error (msg, token)
-        | _ -> Success (acc, remaining)
-    match pand tokens with
-    | Success (leftExpr, remaining) -> loop leftExpr remaining
-    | Error (msg, token) -> Error (msg, token)
-
-and pexpression : Parser<Expression> = por
+and pmultiply : Parser<Expression> =
+    pchain punary (fun t -> match t.Kind, t.Lexeme with Operator, "*" -> Some Multiply | Operator, "/" -> Some Divide | _ -> None)
+and pintdivide : Parser<Expression> =
+    pchain pmultiply (fun t -> match t.Kind, t.Lexeme with Operator, "\\" -> Some IntDivide | _ -> None)
+and pmodulus : Parser<Expression> =
+    pchain pintdivide (fun t -> match t.Kind, t.Lexeme with Keyword, "mod" -> Some Modulus | _ -> None)
+and paddition : Parser<Expression> =
+    pchain pmodulus (fun t -> match t.Kind, t.Lexeme with Operator, "+" -> Some Add | Operator, "-" -> Some Subtract | _ -> None)
+and pconcat : Parser<Expression> =
+    pchain paddition (fun t -> match t.Kind, t.Lexeme with Operator, "&" -> Some Concatenate | _ -> None)
+and pcomparison : Parser<Expression> =
+    pchain pconcat (fun t ->
+        match t.Kind, t.Lexeme with
+        | Eq, _ -> Some Equal
+        | Operator, "<>" -> Some NotEqual
+        | Operator, "<" -> Some LessThan
+        | Operator, "<=" -> Some LessEqual
+        | Operator, ">" -> Some GreaterThan
+        | Operator, ">=" -> Some GreaterEqual
+        | Keyword, "is" -> Some Is
+        | Keyword, "like" -> Some Like
+        | _ -> None)
+and pnot : Parser<Expression> = fun tokens ->
+    match tokens with
+    | { Kind = Keyword; Lexeme = "not" } :: tail ->
+        match pnot tail with
+        | Success (expr, rest) -> Success (Unary (Not, expr), rest)
+        | Error (msg, token) -> Error (msg, token)
+    | _ -> pcomparison tokens
+and pand : Parser<Expression> =
+    pchain pnot (fun t -> if t.Kind = Keyword && t.Lexeme = "and" then Some And else None)
+and por : Parser<Expression> =
+    pchain pand (fun t -> if t.Kind = Keyword && t.Lexeme = "or" then Some Or else None)
+and pxor : Parser<Expression> =
+    pchain por (fun t -> if t.Kind = Keyword && t.Lexeme = "xor" then Some Xor else None)
+and peqqv : Parser<Expression> =
+    pchain pxor (fun t -> if t.Kind = Keyword && t.Lexeme = "eqv" then Some Eqv else None)
+and pimp : Parser<Expression> =
+    pchain peqqv (fun t -> if t.Kind = Keyword && t.Lexeme = "imp" then Some Imp else None)
+and pexpression : Parser<Expression> = pimp
 
 // ── Type reference (VBA) ──
 
 let pTypeRef : Parser<TypeRef> =
     pidentifier |>> fun name -> { Name = name }
 
+let pDimension : Parser<Expression> = fun tokens ->
+    match pexpression tokens with
+    | Success (lower, { Kind = Keyword; Lexeme = "to" } :: rest) ->
+        match pexpression rest with
+        | Success (upper, remaining) -> Success (ArrayBound (lower, upper), remaining)
+        | Error (msg, token) -> Error (msg, token)
+    | result -> result
+
+let pDimensions allowEmpty : Parser<Expression list> = fun tokens ->
+    match tokens with
+    | { Kind = LParen } :: { Kind = RParen } :: rest when allowEmpty -> Success ([], rest)
+    | _ -> (between (ptoken LParen) (ptoken RParen) (sepBy1 (ptoken Comma) pDimension)) tokens
+
 // ── Dialect-aware declaration parsing ──
 
 let pVarDeclarator (dialect: Dialect) : Parser<VarDeclarator> = fun tokens ->
     match pidentifier tokens with
+    | Error (msg, token) -> Error (msg, token)
+    | Success (_, _) when (List.head tokens).PrecedingNewline ->
+        Error ("Expected variable name on the same logical line", List.head tokens)
     | Success (name, remaining) ->
-        // Check for array spec: name(bounds)
-        let arraySpec, remaining2 =
+        let dimensions =
             match remaining with
             | { Kind = LParen } :: _ ->
-                match (between (ptoken LParen) (ptoken RParen) (sepBy (ptoken Comma) pexpression)) remaining with
-                | Success (dims, rem) -> (Some { Dimensions = dims }, rem)
-                | Error _ -> (None, remaining)
-            | _ -> (None, remaining)
-        // Check for As Type (VBA only)
-        let typeRef, remaining3 =
-            match dialect with
-            | VBA ->
-                match remaining2 with
-                | { Kind = Keyword; Lexeme = "as" } :: _ ->
-                    match (pkeyword "as" >>. pTypeRef) remaining2 with
-                    | Success (tr, rem) -> (Some tr, rem)
-                    | Error _ -> (None, remaining2)
-                | _ -> (None, remaining2)
-            | VBScript -> (None, remaining2)
-        Success ({ Name = name; ArraySpec = arraySpec; Type = typeRef }, remaining3)
-    | Error (msg, token) -> Error (msg, token)
+                match pDimensions true remaining with
+                | Success (dims, rest) -> Success (Some { Dimensions = dims }, rest)
+                | Error (msg, token) -> Error (msg, token)
+            | _ -> Success (None, remaining)
+        match dimensions with
+        | Error (msg, token) -> Error (msg, token)
+        | Success (arraySpec, rest) ->
+            match dialect, rest with
+            | VBA, { Kind = Keyword; Lexeme = "as" } :: tail ->
+                match pTypeRef tail with
+                | Success (typeRef, next) ->
+                    Success ({ Name = name; ArraySpec = arraySpec; Type = Some typeRef }, next)
+                | Error (msg, token) -> Error (msg, token)
+            | _ -> Success ({ Name = name; ArraySpec = arraySpec; Type = None }, rest)
 
 let pdim (dialect: Dialect) : Parser<Statement> = fun tokens ->
     match pkeyword "dim" tokens with
     | Success (_, remaining) ->
-        match sepBy1 (ptoken Comma) (pVarDeclarator dialect) remaining with
-        | Success (declarators, remaining2) ->
-            Success (Declaration (None, Dim declarators), remaining2)
-        | Error (msg, token) -> Error (msg, token)
+        match remaining with
+        | { PrecedingNewline = true } :: _ -> Error ("Expected variable name after Dim", List.head remaining)
+        | _ ->
+            match sepBy1 (ptoken Comma) (pVarDeclarator dialect) remaining with
+            | Success (declarators, remaining2) ->
+                Success (Declaration (None, Dim declarators), remaining2)
+            | Error (msg, token) -> Error (msg, token)
     | Error (msg, token) -> Error (msg, token)
 
 let pconst (dialect: Dialect) : Parser<Statement> = fun tokens ->
@@ -445,9 +398,9 @@ let predim : Parser<Statement> = fun tokens ->
     let preserve = optional (pkeyword "preserve") |>> Option.isSome
     match (pkeyword "redim" >>. preserve .>>. pidentifier) tokens with
     | Success ((pres, name), remaining) ->
-        match (between (ptoken LParen) (ptoken RParen) pexpression) remaining with
-        | Success (sizeExpr, remaining2) ->
-            Success (Declaration (None, ReDim (name, sizeExpr, pres)), remaining2)
+        match pDimensions false remaining with
+        | Success (dimensions, remaining2) ->
+            Success (Declaration (None, ReDim (name, dimensions, pres)), remaining2)
         | Error (msg, token) -> Error (msg, token)
     | Error (msg, token) -> Error (msg, token)
 
@@ -518,13 +471,11 @@ let pParam (dialect: Dialect) : Parser<Parameter> =
     | VBScript -> pVbsParam
 
 let pParamList (dialect: Dialect) : Parser<Parameter list> = fun tokens ->
-    let extractParameters opt =
-        match opt with
-        | Some (Some ps) -> ps
-        | Some None -> []
-        | None -> []
-    let parametersParser = optional (ptoken LParen >>. optional (sepBy (ptoken Comma) (pParam dialect)) .>> ptoken RParen)
-    (parametersParser |>> extractParameters) tokens
+    match tokens with
+    | { Kind = LParen } :: { Kind = RParen } :: rest -> Success ([], rest)
+    | { Kind = LParen } :: _ ->
+        (between (ptoken LParen) (ptoken RParen) (sepBy1 (ptoken Comma) (pParam dialect))) tokens
+    | _ -> Success ([], tokens)
 
 // ── Procedure modifiers ──
 
@@ -582,39 +533,7 @@ let validateProcModifiers (dialect: Dialect) (kind: ProcKind) (mods: Modifier li
 
 // ── Statement parsers ──
 
-/// identifier(args) = expr  →  IndexedAssignment
-let rec pindexedAssignment : Parser<Statement> = fun tokens ->
-    match tokens with
-    | { Kind = Ast.Identifier; Lexeme = name } :: { Kind = LParen } :: _ ->
-        match (pidentifier .>>. between (ptoken LParen) (ptoken RParen) (sepBy (ptoken Comma) pexpression)) tokens with
-        | Success ((name, indices), remaining) ->
-            match remaining with
-            | { Kind = Eq } :: _ ->
-                match (ptoken Eq >>. pexpression) remaining with
-                | Success (value, remaining2) -> Success (IndexedAssignment (name, indices, value), remaining2)
-                | Error (msg, token) -> Error (msg, token)
-            | _ -> Error ("Expected '=' after indexed target", List.head remaining)
-        | Error (msg, token) -> Error (msg, token)
-    | head :: _ -> Error ("Expected indexed assignment", head)
-    | [] -> Error ("Expected indexed assignment", { Kind = Ast.EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
-
-/// expr.member = expr  →  MemberAssignment (tries identifier chains with dots)
-and pmemberAssignment : Parser<Statement> = fun tokens ->
-    // Parse a postfix expression, then check if it ends with = expr
-    match ppostfix tokens with
-    | Success (expr, remaining) ->
-        match expr with
-        | Member (objExpr, memberName) ->
-            match remaining with
-            | { Kind = Eq } :: _ ->
-                match (ptoken Eq >>. pexpression) remaining with
-                | Success (value, remaining2) -> Success (MemberAssignment (objExpr, memberName, value), remaining2)
-                | Error (msg, token) -> Error (msg, token)
-            | _ -> Error ("Expected '=' after member target", List.head remaining)
-        | _ -> Error ("Expected member assignment", List.head remaining)
-    | Error (msg, token) -> Error (msg, token)
-
-and psetStmtFull : Parser<Statement> = fun tokens ->
+let rec psetStmtFull : Parser<Statement> = fun tokens ->
     match pkeyword "set" tokens with
     | Success (_, remaining) ->
         // Try member assignment: Set obj.prop = expr
@@ -626,7 +545,7 @@ and psetStmtFull : Parser<Statement> = fun tokens ->
                 | Success (value, remaining3) ->
                     match expr with
                     | Member (objExpr, memberName) ->
-                        Success (MemberAssignment (objExpr, memberName, value), remaining3)
+                        Success (MemberAssignment (objExpr, memberName, value, true), remaining3)
                     | Identifier name ->
                         Success (Set (name, value), remaining3)
                     | Ast.Call (Identifier name, indices) ->
@@ -638,22 +557,11 @@ and psetStmtFull : Parser<Statement> = fun tokens ->
         | Error (msg, token) -> Error (msg, token)
     | Error (msg, token) -> Error (msg, token)
 
-and pletStmt : Parser<Statement> = fun tokens ->
-    let name = pidentifier
-    let eq = ptoken Ast.Eq >>. pexpression
-    match (name .>>. eq) tokens with
-    | Success ((n, e), remaining) -> Success (Assignment (n, e), remaining)
-    | Error (msg, token) -> Error (msg, token)
-
 /// Parenthesless Sub/method call: name arg1, arg2  OR  obj.method arg1, arg2
 and pSubCallNoParens : Parser<Statement> = fun tokens ->
     // Parse a postfix expression (identifier, obj.method, etc.)
     match ppostfix tokens with
     | Success (target, remaining) ->
-        // Only valid for Identifier or Member targets
-        match target with
-        | Identifier _ | Member _ -> ()
-        | _ -> ()
         // Must be followed by an arg on the same line (not =, (, :, newline, EOF)
         match remaining with
         | { Kind = Eq } :: _ -> Error ("Assignment", List.head remaining)
@@ -668,9 +576,17 @@ and pSubCallNoParens : Parser<Statement> = fun tokens ->
                 let rec parseMoreArgs acc rem =
                     match rem with
                     | { Kind = Comma } :: tail ->
-                        match pexpression tail with
-                        | Success (arg, rem2) -> parseMoreArgs (arg :: acc) rem2
-                        | Error _ -> (List.rev acc, rem)
+                        match tail with
+                        | { Kind = Comma } :: _ ->
+                            parseMoreArgs (Literal Empty :: acc) tail
+                        | { Kind = EOF } :: _
+                        | { Kind = Colon } :: _
+                        | { PrecedingNewline = true } :: _ ->
+                            (List.rev (Literal Empty :: acc), tail)
+                        | _ ->
+                            match pexpression tail with
+                            | Success (arg, rem2) -> parseMoreArgs (arg :: acc) rem2
+                            | Error _ -> (List.rev acc, rem)
                     | _ -> (List.rev acc, rem)
                 let (moreArgs, remaining3) = parseMoreArgs [firstArg] remaining2
                 match target with
@@ -684,71 +600,104 @@ and pSubCallNoParens : Parser<Statement> = fun tokens ->
             | Error (msg, token) -> Error (msg, token)
     | Error (msg, token) -> Error (msg, token)
 
-/// Simple (non-block) statement for single-line If
-and pSimpleStmt (dialect: Dialect) : Parser<Statement> = fun tokens ->
-    (pcallStmt dialect
-     <|> psetStmtFull
-     <|> pindexedAssignment
-     <|> pmemberAssignment
-     <|> pletStmt
-     <|> pexit
-     <|> pexpressionStmt) tokens
+// Block scanners stop only at structural delimiters; malformed statements are
+// errors, not a successful end of the enclosing list.
+and pstatements (dialect: Dialect) : Parser<Statement list> = fun tokens ->
+    let rec loop acc remaining =
+        match skipColons remaining with
+        | Error (msg, token) -> Error (msg, token)
+        | Success ((), rest) ->
+            match rest with
+            | { Kind = EOF } :: _
+            | { Kind = Keyword; Lexeme = ("end" | "else" | "elseif" | "next" | "wend" | "loop" | "case") } :: _ ->
+                Success (List.rev acc, rest)
+            | _ ->
+                match pstatement dialect rest with
+                | Error (msg, token) -> Error (msg, token)
+                | Success (stmt, next) ->
+                    match next with
+                    | { Kind = Colon } :: _
+                    | { Kind = EOF } :: _
+                    | { PrecedingNewline = true } :: _ -> loop (stmt :: acc) next
+                    | _ :: _ when (match stmt with LocatedStmt (_, LabelStmt _) -> true | _ -> false) ->
+                        loop (stmt :: acc) next
+                    | token :: _ -> Error ("Expected end of statement", token)
+                    | [] -> Success (List.rev (stmt :: acc), next)
+    loop [] tokens
 
 and pifStmt (dialect: Dialect) : Parser<Statement> = fun tokens ->
     match (pkeyword "if" >>. pexpression .>> pkeyword "then") tokens with
-    | Success (cond, remaining) ->
-        // Use PrecedingNewline to distinguish single-line vs block If:
-        // If the token after Then is on a new line, it's a block If (needs End If)
-        // If on the same line, it's single-line
-        match remaining with
-        | first :: _ when first.PrecedingNewline ->
-            // Block If: token after Then is on a new line
-            let thenBlock = many (pstatement dialect)
-            let pelseif =
-                (pkeyword "elseif" >>. pexpression .>> pkeyword "then") .>>. many (pstatement dialect)
-            let elseBlock = optional (pkeyword "else" >>. many (pstatement dialect))
-            let end_ = skipColons >>. pkeyword "end" >>. pkeyword "if"
-            match (thenBlock .>>. many pelseif .>>. elseBlock .>>. end_) remaining with
-            | Success ((((thenStmts, elseIfs), elseStmtsOpt), _), remaining2) ->
-                Success (IfStmt (cond, thenStmts, elseIfs, elseStmtsOpt), remaining2)
-            | Error (msg, token) -> Error (msg, token)
-        | _ ->
-            // Single-line If: token after Then is on the same line
-            // Also handles colon-separated: If x Then : y = 1 : End If
-            match remaining with
-            | { Kind = Colon } :: _ ->
-                // Colon after Then → treat as block If (the : acts like a newline)
-                let thenBlock = many (pstatement dialect)
-                let pelseif =
-                    (pkeyword "elseif" >>. pexpression .>> pkeyword "then") .>>. many (pstatement dialect)
-                let elseBlock = optional (pkeyword "else" >>. many (pstatement dialect))
-                let end_ = skipColons >>. pkeyword "end" >>. pkeyword "if"
-                match (thenBlock .>>. many pelseif .>>. elseBlock .>>. end_) remaining with
-                | Success ((((thenStmts, elseIfs), elseStmtsOpt), _), remaining2) ->
-                    Success (IfStmt (cond, thenStmts, elseIfs, elseStmtsOpt), remaining2)
-                | Error (msg, token) -> Error (msg, token)
-            | _ ->
-                // True single-line: If cond Then stmt [Else stmt]
-                match pSimpleStmt dialect remaining with
-                | Success (thenStmt, remaining2) ->
-                    match remaining2 with
-                    | { Kind = Keyword; Lexeme = "else" } :: _ ->
-                        match (pkeyword "else" >>. pSimpleStmt dialect) remaining2 with
-                        | Success (elseStmt, remaining3) ->
-                            Success (IfStmt (cond, [thenStmt], [], Some [elseStmt]), remaining3)
-                        | Error _ ->
-                            Success (IfStmt (cond, [thenStmt], [], None), remaining2)
-                    | _ ->
-                        Success (IfStmt (cond, [thenStmt], [], None), remaining2)
-                | Error (msg, token) -> Error (msg, token)
     | Error (msg, token) -> Error (msg, token)
+    | Success (cond, remaining) ->
+        match remaining with
+        | { PrecedingNewline = true } :: _
+        | { Kind = Colon } :: _ ->
+            match pstatements dialect remaining with
+            | Error (msg, token) -> Error (msg, token)
+            | Success (thenStmts, rest) ->
+                let rec elseIfs acc rem =
+                    match rem with
+                    | { Kind = Keyword; Lexeme = "elseif" } :: tail ->
+                        match (pexpression .>> pkeyword "then") tail with
+                        | Error (msg, token) -> Error (msg, token)
+                        | Success (condition, afterHeader) ->
+                            match pstatements dialect afterHeader with
+                            | Success (body, next) -> elseIfs ((condition, body) :: acc) next
+                            | Error (msg, token) -> Error (msg, token)
+                    | _ -> Success (List.rev acc, rem)
+                match elseIfs [] rest with
+                | Error (msg, token) -> Error (msg, token)
+                | Success (branches, rest) ->
+                    let elseBody =
+                        match rest with
+                        | { Kind = Keyword; Lexeme = "else" } :: tail ->
+                            match pstatements dialect tail with
+                            | Success (body, next) -> Success (Some body, next)
+                            | Error (msg, token) -> Error (msg, token)
+                        | _ -> Success (None, rest)
+                    match elseBody with
+                    | Error (msg, token) -> Error (msg, token)
+                    | Success (alternative, rest) ->
+                        match (skipColons >>. pkeyword "end" >>. pkeyword "if") rest with
+                        | Success (_, next) -> Success (IfStmt (cond, thenStmts, branches, alternative), next)
+                        | Error (msg, token) -> Error (msg, token)
+        | _ ->
+            // A nested inline If consumes its own Else before the enclosing branch.
+            let rec branch acc rest =
+                match rest with
+                | { Kind = EOF } :: _
+                | { PrecedingNewline = true } :: _
+                | { Kind = Keyword; Lexeme = "else" } :: _ -> Success (List.rev acc, rest)
+                | { Kind = Colon } :: tail -> branch acc tail
+                | _ ->
+                    match pstatement dialect rest with
+                    | Success (stmt, next) ->
+                        match next with
+                        | { Kind = Colon } :: _
+                        | { Kind = EOF } :: _
+                        | { PrecedingNewline = true } :: _
+                        | { Kind = Keyword; Lexeme = "else" } :: _ -> branch (stmt :: acc) next
+                        | _ :: _ when (match stmt with LocatedStmt (_, LabelStmt _) -> true | _ -> false) ->
+                            branch (stmt :: acc) next
+                        | token :: _ -> Error ("Expected end of inline If statement", token)
+                        | [] -> Success (List.rev (stmt :: acc), [])
+                    | Error (msg, token) -> Error (msg, token)
+            match branch [] remaining with
+            | Error (msg, token) -> Error (msg, token)
+            | Success ([], rest) -> Error ("Expected statement after Then", List.head rest)
+            | Success (thenStmts, { Kind = Keyword; Lexeme = "else" } :: tail) ->
+                match branch [] tail with
+                | Success ([], rest) -> Error ("Expected statement after Else", List.head rest)
+                | Success (elseStmts, rest) -> Success (IfStmt (cond, thenStmts, [], Some elseStmts), rest)
+                | Error (msg, token) -> Error (msg, token)
+            | Success (thenStmts, rest) -> Success (IfStmt (cond, thenStmts, [], None), rest)
 
 and pforLoop (dialect: Dialect) : Parser<Statement> = fun tokens ->
     let var = (pkeyword "for" >>. pidentifier)
     let start = (ptoken Eq >>. pexpression)
     let end_ = (pkeyword "to" >>. pexpression)
     let step = optional (pkeyword "step" >>. pexpression)
-    let body = many (pstatement dialect)
+    let body = pstatements dialect
     let next = (skipColons >>. pkeyword "next")
     let headerParser = var .>>. start .>>. end_ .>>. step
     match headerParser tokens with
@@ -770,14 +719,14 @@ and pforLoop (dialect: Dialect) : Parser<Statement> = fun tokens ->
 and pforEach (dialect: Dialect) : Parser<Statement> = fun tokens ->
     match (pkeyword "for" >>. pkeyword "each" >>. pidentifier .>> pkeyword "in" .>>. pexpression) tokens with
     | Success ((varName, collExpr), remaining) ->
-        match (many (pstatement dialect) .>> skipColons .>> pkeyword "next") remaining with
+        match (pstatements dialect .>> skipColons .>> pkeyword "next") remaining with
         | Success (body, remaining2) -> Success (ForEach (varName, collExpr, body), remaining2)
         | Error (msg, token) -> Error (msg, token)
     | Error (msg, token) -> Error (msg, token)
 
 and pwhileLoop (dialect: Dialect) : Parser<Statement> = fun tokens ->
     let cond = pkeyword "while" >>. pexpression
-    let body = many (pstatement dialect)
+    let body = pstatements dialect
     let end_ = skipColons >>. pkeyword "wend"
     match ((cond .>>. body) .>> end_) tokens with
     | Success ((c, body), remaining) ->
@@ -785,7 +734,7 @@ and pwhileLoop (dialect: Dialect) : Parser<Statement> = fun tokens ->
     | Error (msg, token) -> Error (msg, token)
 
 and pdoLoop (dialect: Dialect) : Parser<Statement> = fun tokens ->
-    let body = many (pstatement dialect)
+    let body = pstatements dialect
 
     let parseDoWhileCond tokens =
         match (pkeyword "do" .>>. ((pkeyword "while" <|> pkeyword "until") .>>. pexpression) .>>. body .>> skipColons .>>. pkeyword "loop") tokens with
@@ -810,10 +759,13 @@ and pdoLoop (dialect: Dialect) : Parser<Statement> = fun tokens ->
                     let negatedCond = Unary (Not, cond)
                     Success (DoLoop (None, Some { Condition = negatedCond; Body = body }), remaining)
             | None ->
-                Success (DoLoop (None, Some { Condition = Literal (Boolean false); Body = body }), remaining)
+                Success (DoLoop (None, Some { Condition = Literal (Boolean true); Body = body }), remaining)
         | Error (msg, token) -> Error (msg, token)
 
-    parseDoWhileCond <|> parseLoopUntilCond <| tokens
+    match tokens with
+    | { Kind = Keyword; Lexeme = "do" } :: { Kind = Keyword; Lexeme = ("while" | "until"); PrecedingNewline = false } :: _ ->
+        parseDoWhileCond tokens
+    | _ -> parseLoopUntilCond tokens
 
 and pexit : Parser<Statement> = fun tokens ->
     let exitKeyword = pkeyword "exit"
@@ -861,29 +813,41 @@ and pcaseTest : Parser<CaseTest> = fun tokens ->
         | Error (m, t) -> Error (m, t)
 
 and pcase (dialect: Dialect) : Parser<CaseTest list option * Statement list> = fun tokens ->
-    let caseKeyword = skipColons >>. pkeyword "case"
-    let elseKeyword = skipColons >>. pkeyword "case" >>. pkeyword "else"
-
-    let caseValues = sepBy1 (ptoken Comma) pcaseTest |>> fun tests -> Some tests
-    let normalCase = caseKeyword >>. caseValues
-    let elseCase = elseKeyword |>> fun _ -> None
-
-    match (normalCase <|> elseCase) tokens with
-    | Success (cond, remaining) ->
-        match many (pstatement dialect) remaining with
-        | Success (stmts, remaining2) -> Success ((cond, stmts), remaining2)
-        | Error (msg, token) -> Error (msg, token)
+    match (skipColons >>. pkeyword "case") tokens with
     | Error (msg, token) -> Error (msg, token)
+    | Success (_, rest) ->
+        let tests =
+            match rest with
+            | { Kind = Keyword; Lexeme = "else" } :: tail -> Success (None, tail)
+            | _ ->
+                match sepBy1 (ptoken Comma) pcaseTest rest with
+                | Success (items, tail) -> Success (Some items, tail)
+                | Error (msg, token) -> Error (msg, token)
+        match tests with
+        | Error (msg, token) -> Error (msg, token)
+        | Success (cond, remaining) ->
+            match pstatements dialect remaining with
+            | Success (stmts, next) -> Success ((cond, stmts), next)
+            | Error (msg, token) -> Error (msg, token)
 
 and pselectCase (dialect: Dialect) : Parser<Statement> = fun tokens ->
-    let selectExpr = pkeyword "select" >>. pkeyword "case" >>. pexpression
-    let cases = many1 (pcase dialect)
-    let endSelect = skipColons >>. pkeyword "end" >>. pkeyword "select"
-
-    match (selectExpr .>>. cases .>>. endSelect) tokens with
-    | Success (((expr, cases), _), remaining) ->
-        Success (SelectCase (expr, cases), remaining)
+    match (pkeyword "select" >>. pkeyword "case" >>. pexpression) tokens with
     | Error (msg, token) -> Error (msg, token)
+    | Success (selector, remaining) ->
+        let rec cases acc rest =
+            match skipColons rest with
+            | Error (msg, token) -> Error (msg, token)
+            | Success ((), ({ Kind = Keyword; Lexeme = "case" } :: _ as next)) ->
+                match pcase dialect next with
+                | Success (clause, following) -> cases (clause :: acc) following
+                | Error (msg, token) -> Error (msg, token)
+            | Success ((), rest) ->
+                if List.isEmpty acc then Error ("Expected Case clause", List.head rest)
+                else
+                    match (pkeyword "end" >>. pkeyword "select") rest with
+                    | Success (_, next) -> Success (SelectCase (selector, List.rev acc), next)
+                    | Error (msg, token) -> Error (msg, token)
+        cases [] remaining
 
 and pOnError (dialect: Dialect) : Parser<Statement> = fun tokens ->
     match (pkeyword "on" >>. pkeyword "error") tokens with
@@ -908,7 +872,7 @@ and pOnError (dialect: Dialect) : Parser<Statement> = fun tokens ->
 and pwithStmt (dialect: Dialect) : Parser<Statement> = fun tokens ->
     match (pkeyword "with" >>. pexpression) tokens with
     | Success (expr, remaining) ->
-        match (many (pstatement dialect) .>> skipColons .>> pkeyword "end" .>> pkeyword "with") remaining with
+        match (pstatements dialect .>> skipColons .>> pkeyword "end" .>> pkeyword "with") remaining with
         | Success (body, remaining2) -> Success (WithStmt (expr, body), remaining2)
         | Error (msg, token) -> Error (msg, token)
     | Error (msg, token) -> Error (msg, token)
@@ -980,6 +944,9 @@ and pVisibilityDecl (dialect: Dialect) : Parser<Statement> = fun tokens ->
 
 and pexpressionStmt : Parser<Statement> = fun tokens ->
     match pexpression tokens with
+    | Success (Identifier name, remaining) -> Success (CallStmt (Identifier name, []), remaining)
+    | Success (Member (receiver, name), remaining) ->
+        Success (ExpressionStmt (Ast.Call (Member (receiver, name), [])), remaining)
     | Success (expr, remaining) -> Success (ExpressionStmt expr, remaining)
     | Error (msg, token) -> Error (msg, token)
 
@@ -992,7 +959,7 @@ and ptargetAssignment : Parser<Statement> = fun tokens ->
             | Success (value, remaining2) ->
                 match expr with
                 | Identifier name -> Success (Assignment (name, value), remaining2)
-                | Member (objExpr, memberName) -> Success (MemberAssignment (objExpr, memberName, value), remaining2)
+                | Member (objExpr, memberName) -> Success (MemberAssignment (objExpr, memberName, value, false), remaining2)
                 | Ast.Call (Identifier name, indices) -> Success (IndexedAssignment (name, indices, value), remaining2)
                 | headExpr -> Error (sprintf "Expected assignable target but got %A" headExpr, List.head remaining)
             | Error (msg, token) -> Error (msg, token)
@@ -1001,14 +968,20 @@ and ptargetAssignment : Parser<Statement> = fun tokens ->
     | Error (msg, token) -> Error (msg, token)
 
 and pstatement (dialect: Dialect) : Parser<Statement> = fun tokens ->
-    // Try label before skipColons (VBA only), since label ends with ':'
-    if dialect = VBA then
-        match plabel tokens with
-        | Success _ as result -> result
-        | Error _ ->
-        pstatementAfterColons dialect tokens
-    else
-        pstatementAfterColons dialect tokens
+    let parse =
+        if dialect = VBA then
+            match plabel tokens with
+            | Success _ as result -> result
+            | Error _ -> pstatementAfterColons dialect tokens
+        else pstatementAfterColons dialect tokens
+    match parse with
+    | Success (stmt, rest) ->
+        let line =
+            match skipColons tokens with
+            | Success ((), token :: _) -> token.Line
+            | _ -> (List.head tokens).Line
+        Success (LocatedStmt (line, stmt), rest)
+    | Error (msg, token) -> Error (msg, token)
 
 and pstatementAfterColons (dialect: Dialect) : Parser<Statement> = fun tokens ->
     match skipColons tokens with
@@ -1027,8 +1000,12 @@ and pstatementAfterColons (dialect: Dialect) : Parser<Statement> = fun tokens ->
                 | "dim" -> pdim dialect tokens
                 | "const" -> pconst dialect tokens
                 | "set" -> psetStmtFull tokens
+                | "let" -> (pkeyword "let" >>. ptargetAssignment) tokens
                 | "if" -> pifStmt dialect tokens
-                | "for" -> (pforEach dialect <|> pforLoop dialect) tokens
+                | "for" ->
+                    match tokens with
+                    | _ :: { Kind = Keyword; Lexeme = "each" } :: _ -> pforEach dialect tokens
+                    | _ -> pforLoop dialect tokens
                 | "while" -> pwhileLoop dialect tokens
                 | "do" -> pdoLoop dialect tokens
                 | "exit" -> pexit tokens
@@ -1076,7 +1053,7 @@ let pfunction (dialect: Dialect) : Parser<Function> = fun tokens ->
                             | Error _ -> (None, remaining2)
                         | _ -> (None, remaining2)
                     | VBScript -> (None, remaining2)
-                match (many (pstatement dialect) .>> skipColons .>> pkeyword "end" .>> pkeyword "function") remaining3 with
+                match (pstatements dialect .>> skipColons .>> pkeyword "end" .>> pkeyword "function") remaining3 with
                 | Success (body, remaining4) ->
                     Success (FunctionDecl (mods, name, parameters, returnType, body), remaining4)
                 | Error (msg, token) -> Error (msg, token)
@@ -1088,7 +1065,7 @@ let pfunction (dialect: Dialect) : Parser<Function> = fun tokens ->
             | _ ->
             match (pkeyword "sub" >>. pidentifier .>>. pParamList dialect) remaining with
             | Success ((name, parameters), remaining2) ->
-                match (many (pstatement dialect) .>> skipColons .>> pkeyword "end" .>> pkeyword "sub") remaining2 with
+                match (pstatements dialect .>> skipColons .>> pkeyword "end" .>> pkeyword "sub") remaining2 with
                 | Success (body, remaining3) ->
                     Success (SubDecl (mods, name, parameters, body), remaining3)
                 | Error (msg, token) -> Error (msg, token)
@@ -1115,17 +1092,17 @@ let pfunction (dialect: Dialect) : Parser<Function> = fun tokens ->
                                     | Error _ -> (None, remaining3)
                                 | _ -> (None, remaining3)
                             | VBScript -> (None, remaining3)
-                        match (many (pstatement dialect) .>> skipColons .>> pkeyword "end" .>> pkeyword "property") remaining4 with
+                        match (pstatements dialect .>> skipColons .>> pkeyword "end" .>> pkeyword "property") remaining4 with
                         | Success (body, remaining5) ->
                             Success (PropertyGet (mods, name, parameters, returnType, body), remaining5)
                         | Error (msg, token) -> Error (msg, token)
                     | "let" ->
-                        match (many (pstatement dialect) .>> skipColons .>> pkeyword "end" .>> pkeyword "property") remaining3 with
+                        match (pstatements dialect .>> skipColons .>> pkeyword "end" .>> pkeyword "property") remaining3 with
                         | Success (body, remaining4) ->
                             Success (PropertyLet (mods, name, parameters, body), remaining4)
                         | Error (msg, token) -> Error (msg, token)
                     | "set" ->
-                        match (many (pstatement dialect) .>> skipColons .>> pkeyword "end" .>> pkeyword "property") remaining3 with
+                        match (pstatements dialect .>> skipColons .>> pkeyword "end" .>> pkeyword "property") remaining3 with
                         | Success (body, remaining4) ->
                             Success (PropertySet (mods, name, parameters, body), remaining4)
                         | Error (msg, token) -> Error (msg, token)
@@ -1257,13 +1234,17 @@ let pimplements : Parser<TopLevel> = fun tokens ->
 
 let poption : Parser<TopLevel> = fun tokens ->
     match pkeyword "option" tokens with
-    | Success (_, remaining) ->
-        // Option name can be a keyword (e.g. "Explicit") or identifier
-        match remaining with
-        | { Kind = Keyword; Lexeme = lexeme } :: tail -> Success (OptionStmt lexeme, tail)
-        | { Kind = Ast.Identifier; Lexeme = lexeme } :: tail -> Success (OptionStmt lexeme, tail)
-        | head :: _ -> Error ("Expected option name after 'Option'", head)
-        | [] -> Error ("Expected option name after 'Option'", { Kind = EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
+    | Success (_, option :: value :: tail)
+        when option.Lexeme.ToLowerInvariant() = "compare" && not option.PrecedingNewline &&
+             not value.PrecedingNewline && (value.Lexeme.ToLowerInvariant() = "text" || value.Lexeme.ToLowerInvariant() = "binary") ->
+        Success (OptionStmt ("compare " + value.Lexeme.ToLowerInvariant()), tail)
+    | Success (_, option :: tail) when option.Lexeme.ToLowerInvariant() = "compare" ->
+        Error ("Expected Text or Binary after Option Compare", List.head tail)
+    | Success (_, { Kind = Keyword; Lexeme = lexeme } :: tail)
+    | Success (_, { Kind = Ast.Identifier; Lexeme = lexeme } :: tail) ->
+        Success (OptionStmt lexeme, tail)
+    | Success (_, head :: _) -> Error ("Expected option name after 'Option'", head)
+    | Success (_, []) -> Error ("Expected option name after 'Option'", List.head tokens)
     | Error (msg, token) -> Error (msg, token)
 
 // ── Class parsing ──
@@ -1296,14 +1277,17 @@ let pclass (dialect: Dialect) : Parser<TopLevel> = fun tokens ->
                 match tryVbaClassMember with
                 | Some (tl, remaining2) -> parseMembers (tl :: acc) remaining2
                 | None ->
-                // Try function/sub/property
-                match pfunction dialect remaining with
-                | Success (func, remaining2) -> parseMembers (FunctionDef func :: acc) remaining2
-                | Error _ ->
-                // Try a statement (Dim, Public x, Private x, etc.)
-                match pstatement dialect remaining with
-                | Success (stmt, remaining2) -> parseMembers (TopLevelStatement stmt :: acc) remaining2
-                | Error (msg, token) -> Error (msg, token)
+                // Once a declaration head is seen, do not backtrack into an
+                // unrelated statement and lose the declaration's diagnostic.
+                match topLevelHeadAfterModifiers remaining with
+                | { Kind = Keyword; Lexeme = ("function" | "sub" | "property") } :: _ ->
+                    match pfunction dialect remaining with
+                    | Success (func, remaining2) -> parseMembers (FunctionDef func :: acc) remaining2
+                    | Error (msg, token) -> Error (msg, token)
+                | _ ->
+                    match pstatement dialect remaining with
+                    | Success (stmt, remaining2) -> parseMembers (TopLevelStatement stmt :: acc) remaining2
+                    | Error (msg, token) -> Error (msg, token)
             | Error (msg, token) -> Error (msg, token)
         match parseMembers [] remaining with
         | Success (members, remaining2) -> Success (ClassDecl (visOpt, name, members), remaining2)
@@ -1333,28 +1317,42 @@ let pTopLevel (dialect: Dialect) : Parser<TopLevel> = fun tokens ->
     | Error (msg, token) -> Error (msg, token)
 
 let pprogram (dialect: Dialect) : Parser<Program> = fun tokens ->
-    match many (pTopLevel dialect) tokens with
-    | Success (topLevels, remaining) ->
+    let rec loop acc remaining =
         match skipColons remaining with
-        | Success ((), remaining) ->
-            Success ({ Dialect = dialect; TopLevels = topLevels }, remaining)
         | Error (msg, token) -> Error (msg, token)
-    | Error (msg, token) -> Error (msg, token)
+        | Success ((), ({ Kind = EOF } :: _ as rest)) ->
+            Success ({ Dialect = dialect; TopLevels = List.rev acc }, rest)
+        | Success ((), rest) ->
+            match pTopLevel dialect rest with
+            | Error (msg, token) -> Error (msg, token)
+            | Success (topLevel, next) ->
+                match next with
+                | { Kind = Colon } :: _
+                | { Kind = EOF } :: _
+                | { PrecedingNewline = true } :: _ -> loop (topLevel :: acc) next
+                | _ :: _ when (match topLevel with TopLevelStatement (LocatedStmt (_, LabelStmt _)) -> true | _ -> false) ->
+                    loop (topLevel :: acc) next
+                | token :: _ -> Error ("Expected end of statement", token)
+                | [] -> Error ("Expected end of input", List.head rest)
+    loop [] tokens
 
-/// Strict mode: parser enforces dialect grammar rules at parse time
+let private parseSource dialect source =
+    try
+        match pprogram dialect (Lexer.tokenize source) with
+        | Success (program, { Kind = EOF } :: _) -> Ok program
+        | Success (_, token :: _) -> Result.Error (sprintf "Parse error at line %d, column %d: Expected end of input" token.Line token.Column)
+        | Success (_, []) -> Result.Error "Parse error: Expected end of input"
+        | Error (msg, token) -> Result.Error (sprintf "Parse error at line %d, column %d: %s" token.Line token.Column msg)
+    with ex ->
+        Result.Error (sprintf "Parse error: %s" ex.Message)
+
+/// Strict mode: parse only complete input with the selected dialect grammar.
 let parse_dialect (dialect: Dialect) (source: string) : Result<Program, string> =
-    let tokens = Lexer.tokenize source
-    match pprogram dialect tokens with
-    | Success (program, _) -> Result.Ok program
-    | Error (msg, token) -> Result.Error (sprintf "Parse error at line %d, column %d: %s" token.Line token.Column msg)
+    parseSource dialect source
 
-/// Tolerant mode: parse as VBA superset, tag with target dialect for validation
-/// Use this for migration tools, source converters, or "what's incompatible?" analysis
+/// Tolerant mode: parse as VBA superset, tag with target dialect for validation.
 let parse_tolerant (dialect: Dialect) (source: string) : Result<Program, string> =
-    let tokens = Lexer.tokenize source
-    match pprogram VBA tokens with
-    | Success (program, _) -> Result.Ok { program with Dialect = dialect }
-    | Error (msg, token) -> Result.Error (sprintf "Parse error at line %d, column %d: %s" token.Line token.Column msg)
+    parseSource VBA source |> Result.map (fun program -> { program with Dialect = dialect })
 
 let parse (source: string) : Result<Program, string> =
     parse_dialect VBScript source

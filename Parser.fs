@@ -1,3 +1,4 @@
+// Historical parser, excluded from Rbt.Vb.fsproj. ParserSimple.fs is the shipping parser.
 module Rbt.Vb.Parser
 
 open Ast

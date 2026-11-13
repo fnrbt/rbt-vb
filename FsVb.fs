@@ -89,7 +89,10 @@ let compileSource (options: ParseOptions) (source: string) : Result<Ast.Program 
         if errors.Length > 0 then
             Error (ValidationErrors errors)
         else
-            Ok (program, compileWithHostGlobals options.HostGlobalNames program)
+            try
+                Ok (program, compileWithHostGlobals options.HostGlobalNames program)
+            with ex ->
+                Error (RuntimeError ex.Message)
 
 let runSource (options: RunOptions) (source: string) : Result<RunResult, RunError> =
     let parseOptions = {
@@ -106,8 +109,8 @@ let runSource (options: RunOptions) (source: string) : Result<RunResult, RunErro
         if errors.Length > 0 then
             Error (ValidationErrors errors)
         else
-            let bytecode = compileWithHostGlobals parseOptions.HostGlobalNames program
             try
+                let bytecode = compileWithHostGlobals parseOptions.HostGlobalNames program
                 let state = executeWithHostGlobals (options.HostGlobals |> Map.toSeq) bytecode
                 Ok {
                     Program = program

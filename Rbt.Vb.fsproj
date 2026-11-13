@@ -10,6 +10,7 @@
     <Compile Include="ParserSimple.fs" />
     <Compile Include="Validator.fs" />
     <Compile Include="Values.fs" />
+    <Compile Include="ValueSemantics.fs" />
     <Compile Include="Builtins.fs" />
     <Compile Include="Bytecode.fs" />
     <Compile Include="BytecodeIO.fs" />

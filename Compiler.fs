@@ -9,7 +9,7 @@ let private normalizeName (name: string) =
 #if FABLE_COMPILER
     if isNull (box name) then "" else name.ToLowerInvariant()
 #else
-    name
+    name.ToLowerInvariant()
 #endif
 
 let private newNameDictionary<'T> () =
@@ -62,6 +62,7 @@ type CompileContext = {
     ClassIndex: Dictionary<string, int>
     ArrayVars: HashSet<string>
     mutable ClassFields: HashSet<string> option
+    mutable ClassName: string option
     ExitLoopPatches: ResizeArray<ResizeArray<int>>
     Labels: Dictionary<string, int>
     LabelPatches: ResizeArray<string * int>
@@ -87,6 +88,7 @@ let emptyContext () =
         ClassIndex = newNameDictionary ()
         ArrayVars = newNameSet ()
         ClassFields = None
+        ClassName = None
         ExitLoopPatches = ResizeArray()
         Labels = newNameDictionary ()
         LabelPatches = ResizeArray()
@@ -132,6 +134,27 @@ let getLocalSlot (ctx: CompileContext) (name: string) =
         ctx.NextLocalSlot <- ctx.NextLocalSlot + 1
         slot
 
+let private freshLocal (ctx: CompileContext) =
+    let slot = ctx.NextLocalSlot
+    ctx.NextLocalSlot <- slot + 1
+    slot
+
+let private isField (ctx: CompileContext) name =
+    not (containsName ctx.Locals name) &&
+    (match ctx.ClassFields with Some fields -> containsSetName fields name | None -> false)
+
+let private storeName (ctx: CompileContext) name =
+    if isField ctx name then
+        let temp = freshLocal ctx
+        emit ctx (StoreLocal temp) 0
+        emit ctx (LoadLocal 0) 0
+        emit ctx (LoadLocal temp) 0
+        emit ctx (SetMember (name, false)) 0
+    elif containsName ctx.Globals name && not (ctx.InFunction && containsName ctx.Locals name) then
+        emit ctx (StoreGlobal (getName ctx.Globals name)) 0
+    else
+        emit ctx (StoreLocal (getLocalSlot ctx name)) 0
+
 let emitExitLoop (ctx: CompileContext) =
     let jumpPc = ctx.Instructions.Count
     emit ctx (Jump -1) 0
@@ -158,6 +181,9 @@ let emitCall (ctx: CompileContext) (name: string) (args: Expression list) (compi
             let arg = List.item i args
             let isByRef = i < byRefInfo.Length && byRefInfo.[i]
             match isByRef, arg with
+            | true, Identifier varName when isField ctx varName ->
+                emit ctx (LoadLocal 0) 0
+                emit ctx (MakeRefMember varName) 0
             | true, Identifier varName ->
                 // Pass by reference: emit MakeRef instead of LoadLocal/LoadGlobal
                 if containsName ctx.Globals varName && not (ctx.InFunction && containsName ctx.Locals varName) then
@@ -166,6 +192,15 @@ let emitCall (ctx: CompileContext) (name: string) (args: Expression list) (compi
                     emit ctx (MakeRefLocal (getName ctx.Locals varName)) 0
                 else
                     compileExpr ctx arg  // fallback: pass by value
+            | true, Ast.Call (Identifier arrayName, indices) when containsSetName ctx.ArrayVars arrayName || containsName ctx.Locals arrayName || containsName ctx.Globals arrayName ->
+                compileExpr ctx (Identifier arrayName)
+                for index in indices do compileExpr ctx index
+                emit ctx (MakeRefArray indices.Length) 0
+            | true, Member (Identifier objectName, _) when objectName.ToLowerInvariant() = "err" ->
+                compileExpr ctx arg
+            | true, Member (receiver, memberName) ->
+                compileExpr ctx receiver
+                emit ctx (MakeRefMember memberName) 0
             | _ ->
                 compileExpr ctx arg  // pass by value
         emit ctx (Call (funcIndex, List.length args)) 0
@@ -183,6 +218,8 @@ let private emitDefaultCall (ctx: CompileContext) (args: Expression list) (compi
 
 let rec compileExpression (ctx: CompileContext) (expr: Expression) =
     match expr with
+    | Parenthesized e -> compileExpression ctx e
+    | ArrayBound _ -> failwith "Array bound outside declaration"
     | Literal (Integer i) ->
         let idx = addConstant ctx (Value.VInteger i)
         emit ctx (LoadConst idx) 0
@@ -203,7 +240,7 @@ let rec compileExpression (ctx: CompileContext) (expr: Expression) =
         emit ctx (LoadConst idx) 0
     | Identifier name ->
         match ctx.ClassFields with
-        | Some fields when containsSetName fields name ->
+        | Some fields when isField ctx name ->
             emit ctx (LoadLocal 0) 0
             emit ctx (GetMember name) 0
         | _ ->
@@ -244,9 +281,12 @@ let rec compileExpression (ctx: CompileContext) (expr: Expression) =
         | Ast.Like -> emit ctx LikeOp 0
         | Ast.Eqv -> emit ctx Bytecode.Eqv 0
         | Ast.Imp -> emit ctx Bytecode.Imp 0
+    | Ast.Call (Identifier name, args) when
+        (match ctx.ClassName with Some className -> containsName ctx.FunctionIndex (className + "." + name) | None -> false) ->
+        compileExpression ctx (Ast.Call (Member (MeExpr, name), args))
     | Ast.Call (Identifier name, args) ->
         match ctx.ClassFields with
-        | Some fields when containsSetName fields name ->
+        | Some fields when isField ctx name ->
             emit ctx (LoadLocal 0) 0
             emit ctx (GetMember name) 0
             emitDefaultCall ctx args compileExpression
@@ -279,14 +319,31 @@ let rec compileExpression (ctx: CompileContext) (expr: Expression) =
         | "raise" ->
             if args.Length >= 1 then compileExpression ctx (List.item 0 args)
             else emit ctx (LoadConst (addConstant ctx (VInteger 0))) 0
-            if args.Length >= 2 then compileExpression ctx (List.item 1 args)
+            if args.Length >= 3 then compileExpression ctx (List.item 2 args)
             else emit ctx (LoadConst (addConstant ctx (VString ""))) 0
             emit ctx RaiseErr 0
         | _ -> emit ctx LoadEmpty 0
     | Ast.Call (Member (objExpr, methodName), args) ->
         compileExpression ctx objExpr
         for i in List.length args - 1 .. -1 .. 0 do
-            compileExpression ctx (List.item i args)
+            match List.item i args with
+            | Identifier name when isField ctx name ->
+                emit ctx (LoadLocal 0) 0
+                emit ctx (MakeRefMember name) 0
+            | Identifier name when not (isField ctx name) ->
+                if containsName ctx.Globals name && not (ctx.InFunction && containsName ctx.Locals name) then
+                    emit ctx (MakeRefGlobal (getName ctx.Globals name)) 0
+                else emit ctx (MakeRefLocal (getLocalSlot ctx name)) 0
+            | Ast.Call (Identifier name, indices) when containsSetName ctx.ArrayVars name || containsName ctx.Locals name || containsName ctx.Globals name ->
+                compileExpression ctx (Identifier name)
+                for index in indices do compileExpression ctx index
+                emit ctx (MakeRefArray indices.Length) 0
+            | Member (Identifier objectName, _) as arg when objectName.ToLowerInvariant() = "err" ->
+                compileExpression ctx arg
+            | Member (receiver, memberName) ->
+                compileExpression ctx receiver
+                emit ctx (MakeRefMember memberName) 0
+            | arg -> compileExpression ctx arg
         emit ctx (CallMethod (methodName, List.length args)) 0
     | Ast.Call (_, args) ->
         for i in List.length args - 1 .. -1 .. 0 do
@@ -301,7 +358,7 @@ let rec compileExpression (ctx: CompileContext) (expr: Expression) =
     | NewExpr className ->
         match tryGetName ctx.ClassIndex className with
         | true, idx -> emit ctx (NewObj idx) 0
-        | false, _ -> emit ctx LoadNull 0
+        | false, _ -> failwithf "Unknown class %s" className
     | WithDotExpr ->
         match ctx.WithTargetSlot with
         | Some (true, slot) -> emit ctx (LoadGlobal slot) 0
@@ -320,16 +377,24 @@ let rec compileExpression (ctx: CompileContext) (expr: Expression) =
 
 let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
     match stmt with
+    | LocatedStmt (line, inner) ->
+        let start = ctx.Instructions.Count
+        emit ctx (Statement -1) line
+        compileStatement ctx inner
+        patchJump ctx start (Statement ctx.Instructions.Count)
+        for i in start .. ctx.Instructions.Count - 1 do
+            if ctx.Instructions.[i].LineNumber = 0 then
+                ctx.Instructions.[i] <- { ctx.Instructions.[i] with LineNumber = line }
     | ExpressionStmt expr ->
         compileExpression ctx expr
         emit ctx Pop 0
 
     | Assignment (name, expr) ->
         match ctx.ClassFields with
-        | Some fields when containsSetName fields name ->
+        | Some fields when isField ctx name ->
             emit ctx (LoadLocal 0) 0
             compileExpression ctx expr
-            emit ctx (SetMember name) 0
+            emit ctx (SetMember (name, false)) 0
         | _ ->
             compileExpression ctx expr
             if containsName ctx.Globals name && not (ctx.InFunction && containsName ctx.Locals name) then
@@ -340,33 +405,22 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
                 emit ctx (StoreLocal slot) 0
 
     | IndexedAssignment (name, indices, valueExpr) ->
-        match ctx.ClassFields with
-        | Some fields when containsSetName fields name ->
-            emit ctx (LoadLocal 0) 0
-            emit ctx (GetMember name) 0
-            compileExpression ctx (List.head indices)
-            compileExpression ctx valueExpr
-            emit ctx ArraySet 0
-        | _ ->
-            if containsName ctx.Globals name && not (ctx.InFunction && containsName ctx.Locals name) then
-                emit ctx (LoadGlobal (getName ctx.Globals name)) 0
-            else
-                emit ctx (LoadLocal (getLocalSlot ctx name)) 0
-            compileExpression ctx (List.head indices)
-            compileExpression ctx valueExpr
-            emit ctx ArraySet 0
+        compileExpression ctx (Identifier name)
+        for index in indices do compileExpression ctx index
+        compileExpression ctx valueExpr
+        emit ctx (ArraySet indices.Length) 0
 
-    | MemberAssignment (objExpr, memberName, valueExpr) ->
+    | MemberAssignment (objExpr, memberName, valueExpr, isSet) ->
         compileExpression ctx objExpr
         compileExpression ctx valueExpr
-        emit ctx (SetMember memberName) 0
+        emit ctx (SetMember (memberName, isSet)) 0
 
     | Ast.Set (name, expr) ->
         match ctx.ClassFields with
-        | Some fields when containsSetName fields name ->
+        | Some fields when isField ctx name ->
             emit ctx (LoadLocal 0) 0
             compileExpression ctx expr
-            emit ctx (SetMember name) 0
+            emit ctx (SetMember (name, true)) 0
         | _ ->
             compileExpression ctx expr
             if containsName ctx.Globals name && not (ctx.InFunction && containsName ctx.Locals name) then
@@ -377,33 +431,18 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
 
     | Declaration (_, Dim declarators) ->
         for d in declarators do
-            if not ctx.InFunction && ctx.ClassFields.IsNone then
-                // Top level: use globals
-                let gslot = getGlobalSlot ctx d.Name
-                match d.ArraySpec with
-                | Some spec when spec.Dimensions.Length > 0 ->
-                    compileExpression ctx (List.head spec.Dimensions)
-                    emit ctx (LoadConst (addConstant ctx (VInteger 1))) 0
-                    emit ctx Add 0
-                    emit ctx ArrayNew 0
-                    emit ctx (StoreGlobal gslot) 0
-                    addSetName ctx.ArrayVars d.Name |> ignore
-                | _ ->
-                    emit ctx LoadEmpty 0
-                    emit ctx (StoreGlobal gslot) 0
-            else
-                let slot = getLocalSlot ctx d.Name
-                match d.ArraySpec with
-                | Some spec when spec.Dimensions.Length > 0 ->
-                    compileExpression ctx (List.head spec.Dimensions)
-                    emit ctx (LoadConst (addConstant ctx (VInteger 1))) 0
-                    emit ctx Add 0
-                    emit ctx ArrayNew 0
-                    emit ctx (StoreLocal slot) 0
-                    addSetName ctx.ArrayVars d.Name |> ignore
-                | _ ->
-                    emit ctx LoadEmpty 0
-                    emit ctx (StoreLocal slot) 0
+            if ctx.InFunction then ignore (getLocalSlot ctx d.Name)
+            else ignore (getGlobalSlot ctx d.Name)
+            match d.ArraySpec with
+            | Some spec when not spec.Dimensions.IsEmpty ->
+                for dimension in spec.Dimensions do
+                    match dimension with
+                    | ArrayBound (lo, hi) -> compileExpression ctx lo; compileExpression ctx hi
+                    | upper -> emit ctx (LoadConst (addConstant ctx (VInteger 0))) 0; compileExpression ctx upper
+                emit ctx (ArrayNew spec.Dimensions.Length) 0
+                storeName ctx d.Name
+                addSetName ctx.ArrayVars d.Name |> ignore
+            | _ -> emit ctx LoadEmpty 0; storeName ctx d.Name
 
     | Declaration (_, Const (name, _, expr)) ->
         compileExpression ctx expr
@@ -413,157 +452,85 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
             let slot = getLocalSlot ctx name
             emit ctx (StoreLocal slot) 0
 
-    | Declaration (_, ReDim (name, sizeExpr, preserve)) ->
-        match ctx.ClassFields with
-        | Some fields when containsSetName fields name ->
-            // ReDim on a class field — store via Me
-            if preserve then
-                emit ctx (LoadLocal 0) 0
-                emit ctx (GetMember name) 0
-                compileExpression ctx sizeExpr
-                emit ctx (LoadConst (addConstant ctx (VInteger 1))) 0
-                emit ctx Add 0
-                emit ctx ReDimPreserve 0
-                // Store back: LoadLocal 0 (Me), swap, SetMember
-                // Simpler: just use a temp
-                let tmpSlot = getLocalSlot ctx "__redim_tmp__"
-                emit ctx (StoreLocal tmpSlot) 0
-                emit ctx (LoadLocal 0) 0
-                emit ctx (LoadLocal tmpSlot) 0
-                emit ctx (SetMember name) 0
-            else
-                emit ctx (LoadLocal 0) 0
-                compileExpression ctx sizeExpr
-                emit ctx (LoadConst (addConstant ctx (VInteger 1))) 0
-                emit ctx Add 0
-                emit ctx ArrayNew 0
-                emit ctx (SetMember name) 0
-        | _ ->
-            let useGlobal = containsName ctx.Globals name && not (ctx.InFunction && containsName ctx.Locals name)
-            if preserve then
-                if useGlobal then emit ctx (LoadGlobal (getName ctx.Globals name)) 0
-                else emit ctx (LoadLocal (getLocalSlot ctx name)) 0
-                compileExpression ctx sizeExpr
-                emit ctx (LoadConst (addConstant ctx (VInteger 1))) 0
-                emit ctx Add 0
-                emit ctx ReDimPreserve 0
-                if useGlobal then emit ctx (StoreGlobal (getName ctx.Globals name)) 0
-                else emit ctx (StoreLocal (getLocalSlot ctx name)) 0
-            else
-                compileExpression ctx sizeExpr
-                emit ctx (LoadConst (addConstant ctx (VInteger 1))) 0
-                emit ctx Add 0
-                emit ctx ArrayNew 0
-                if useGlobal then emit ctx (StoreGlobal (getName ctx.Globals name)) 0
-                else emit ctx (StoreLocal (getLocalSlot ctx name)) 0
-            addSetName ctx.ArrayVars name |> ignore
+    | Declaration (_, ReDim (name, dimensions, preserve)) ->
+        if preserve then compileExpression ctx (Identifier name)
+        for dimension in dimensions do
+            match dimension with
+            | ArrayBound (lo, hi) -> compileExpression ctx lo; compileExpression ctx hi
+            | upper -> emit ctx (LoadConst (addConstant ctx (VInteger 0))) 0; compileExpression ctx upper
+        emit ctx (if preserve then ReDimPreserve dimensions.Length else ArrayNew dimensions.Length) 0
+        storeName ctx name
+        addSetName ctx.ArrayVars name |> ignore
 
     | IfStmt (condition, thenStmts, elseIfs, elseStmtsOpt) ->
         compileExpression ctx condition
-        let elseJumpPc = ctx.Instructions.Count
+        let mutable falseJump = ctx.Instructions.Count
         emit ctx (JumpIfFalse -1) 0
-
-        for stmt in thenStmts do
-            compileStatement ctx stmt
-
+        for stmt in thenStmts do compileStatement ctx stmt
         let endJumps = ResizeArray<int>()
-
         for (elseIfCond, elseIfBody) in elseIfs do
-            let jumpToEndPc = ctx.Instructions.Count
+            let jump = ctx.Instructions.Count
             emit ctx (Jump -1) 0
-            endJumps.Add(jumpToEndPc)
-
-            patchJump ctx elseJumpPc (JumpIfFalse ctx.Instructions.Count)
-
+            endJumps.Add jump
+            patchJump ctx falseJump (JumpIfFalse ctx.Instructions.Count)
             compileExpression ctx elseIfCond
-            let nextJumpPc = ctx.Instructions.Count
+            falseJump <- ctx.Instructions.Count
             emit ctx (JumpIfFalse -1) 0
-
-            for stmt in elseIfBody do
-                compileStatement ctx stmt
-
-            let jumpToEnd2 = ctx.Instructions.Count
-            emit ctx (Jump -1) 0
-            endJumps.Add(jumpToEnd2)
-
-            patchJump ctx nextJumpPc (JumpIfFalse ctx.Instructions.Count)
-
+            for stmt in elseIfBody do compileStatement ctx stmt
         match elseStmtsOpt with
-        | Some elseStmts when elseStmts.Length > 0 ->
-            if elseIfs.IsEmpty then
-                let endJumpPc = ctx.Instructions.Count
-                emit ctx (Jump -1) 0
-                endJumps.Add(endJumpPc)
-                patchJump ctx elseJumpPc (JumpIfFalse ctx.Instructions.Count)
-
-            for stmt in elseStmts do
-                compileStatement ctx stmt
-
-        | _ ->
-            if elseIfs.IsEmpty then
-                patchJump ctx elseJumpPc (JumpIfFalse ctx.Instructions.Count)
-
-        let finalTarget = ctx.Instructions.Count
-        for jumpPc in endJumps do
-            patchJump ctx jumpPc (Jump finalTarget)
+        | Some body ->
+            let jump = ctx.Instructions.Count
+            emit ctx (Jump -1) 0
+            endJumps.Add jump
+            patchJump ctx falseJump (JumpIfFalse ctx.Instructions.Count)
+            for stmt in body do compileStatement ctx stmt
+        | None -> patchJump ctx falseJump (JumpIfFalse ctx.Instructions.Count)
+        for jump in endJumps do patchJump ctx jump (Jump ctx.Instructions.Count)
 
     | ForLoop (varName, startExpr, endExpr, stepOpt, body) ->
-        let isNegativeStep =
-            match stepOpt with
-            | Some (Ast.Unary (Ast.Negate, Literal (Integer _))) -> true
-            | Some (Ast.Unary (Ast.Negate, Literal (Double _))) -> true
-            | Some (Literal (Integer n)) when n < 0 -> true
-            | Some (Literal (Double d)) when d < 0.0 -> true
-            | _ -> false
-
-        // Use same storage as Identifier/Assignment for the loop variable
-        let useGlobal = containsName ctx.Globals varName && not (ctx.InFunction && containsName ctx.Locals varName)
         compileExpression ctx startExpr
-        if useGlobal then
-            emit ctx (StoreGlobal (getName ctx.Globals varName)) 0
-        else
-            let slot = getLocalSlot ctx varName
-            emit ctx (StoreLocal slot) 0
-
-        let loopStartPc = ctx.Instructions.Count
-
-        compileExpression ctx (Identifier varName)
+        storeName ctx varName
+        let endSlot = freshLocal ctx
         compileExpression ctx endExpr
-        if isNegativeStep then
-            emit ctx LessThan 0
-        else
-            emit ctx GreaterThan 0
+        emit ctx (StoreLocal endSlot) 0
+        let stepSlot = freshLocal ctx
+        match stepOpt with
+        | Some step -> compileExpression ctx step
+        | None -> emit ctx (LoadConst (addConstant ctx (VInteger 1))) 0
+        emit ctx (StoreLocal stepSlot) 0
+        let loopStartPc = ctx.Instructions.Count
+        emit ctx (LoadLocal stepSlot) 0
+        emit ctx (LoadConst (addConstant ctx (VInteger 0))) 0
+        emit ctx LessThan 0
+        let positiveJump = ctx.Instructions.Count
+        emit ctx (JumpIfFalse -1) 0
+        compileExpression ctx (Identifier varName)
+        emit ctx (LoadLocal endSlot) 0
+        emit ctx LessThan 0
+        let joinJump = ctx.Instructions.Count
+        emit ctx (Jump -1) 0
+        patchJump ctx positiveJump (JumpIfFalse ctx.Instructions.Count)
+        compileExpression ctx (Identifier varName)
+        emit ctx (LoadLocal endSlot) 0
+        emit ctx GreaterThan 0
+        patchJump ctx joinJump (Jump ctx.Instructions.Count)
         let exitJumpPc = ctx.Instructions.Count
         emit ctx (JumpIfTrue -1) 0
-
         ctx.ExitLoopPatches.Add(ResizeArray())
-
-        for stmt in body do
-            compileStatement ctx stmt
-
+        for stmt in body do compileStatement ctx stmt
         compileExpression ctx (Identifier varName)
-        match stepOpt with
-        | Some stepExpr ->
-            compileExpression ctx stepExpr
-        | None ->
-            emit ctx (LoadConst (addConstant ctx (VInteger 1))) 0
+        emit ctx (LoadLocal stepSlot) 0
         emit ctx Add 0
-        if useGlobal then
-            emit ctx (StoreGlobal (getName ctx.Globals varName)) 0
-        else
-            let slot = getLocalSlot ctx varName
-            emit ctx (StoreLocal slot) 0
-
+        storeName ctx varName
         emit ctx (Jump loopStartPc) 0
-
         patchJump ctx exitJumpPc (JumpIfTrue ctx.Instructions.Count)
         patchExitLoopTargets ctx
 
     | ForEach (varName, collExpr, body) ->
         compileExpression ctx collExpr
-        let collSlot = getLocalSlot ctx "__foreach_coll__"
+        let collSlot = freshLocal ctx
         emit ctx (StoreLocal collSlot) 0
-        let idxSlot = getLocalSlot ctx "__foreach_idx__"
+        let idxSlot = freshLocal ctx
         emit ctx (LoadConst (addConstant ctx (VInteger 0))) 0
         emit ctx (StoreLocal idxSlot) 0
 
@@ -578,9 +545,8 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
 
         emit ctx (LoadLocal collSlot) 0
         emit ctx (LoadLocal idxSlot) 0
-        emit ctx ArrayGet 0
-        let varSlot = getLocalSlot ctx varName
-        emit ctx (StoreLocal varSlot) 0
+        emit ctx ArrayGetFlat 0
+        storeName ctx varName
 
         ctx.ExitLoopPatches.Add(ResizeArray())
 
@@ -723,10 +689,10 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
         | None -> ()
 
     | CallStmt (Identifier name, args) ->
-        emitCall ctx name args compileExpression
+        compileExpression ctx (Ast.Call (Identifier name, args))
         emit ctx Pop 0
-    | CallStmt (expr, _) ->
-        compileExpression ctx expr
+    | CallStmt (expr, args) ->
+        if args.IsEmpty then compileExpression ctx expr else compileExpression ctx (Ast.Call (expr, args))
         emit ctx Pop 0
 
     | GoToStmt label ->
@@ -793,7 +759,7 @@ let patchLabels (ctx: CompileContext) =
                 | OnErrorGoToLabel _ -> OnErrorGoToLabel target
                 | other -> other
             patchJump ctx pc newOpcode
-        | false, _ -> ()
+        | false, _ -> failwithf "Unknown label %s" label
 
 let compileFunctionBody (ctx: CompileContext) (name: string) (returnName: string) (paramList: Parameter list) (body: Statement list) =
     let outerLocals = copyNameDictionary ctx.Locals
@@ -818,13 +784,31 @@ let compileFunctionBody (ctx: CompileContext) (name: string) (returnName: string
         ignore (getLocalSlot ctx param.Name)
 
     ignore (getLocalSlot ctx returnName)
+    let rec registerLocals stmt =
+        match stmt with
+        | LocatedStmt (_, inner) -> registerLocals inner
+        | Declaration (_, Dim ds) -> for d in ds do ignore (getLocalSlot ctx d.Name)
+        | Declaration (_, Const (n, _, _)) -> ignore (getLocalSlot ctx n)
+        | IfStmt (_, yes, alternatives, no) ->
+            for stmt in yes do registerLocals stmt
+            for (_, stmts) in alternatives do
+                for stmt in stmts do registerLocals stmt
+            match no with
+            | Some stmts -> for stmt in stmts do registerLocals stmt
+            | None -> ()
+        | ForLoop (_, _, _, _, stmts) | ForEach (_, _, stmts) | WhileLoop (_, stmts) | WithStmt (_, stmts) -> for stmt in stmts do registerLocals stmt
+        | SelectCase (_, cases) ->
+            for (_, stmts) in cases do
+                for stmt in stmts do registerLocals stmt
+        | DoLoop (a, b) ->
+            for condition in [a; b] do
+                match condition with
+                | Some c -> for stmt in c.Body do registerLocals stmt
+                | None -> ()
+        | _ -> ()
+    for stmt in body do registerLocals stmt
 
-    // Register function index BEFORE compiling body (enables recursion)
-    let funcIndex = ctx.Functions.Count
-    setName ctx.FunctionIndex name funcIndex
-    // Also register the return name for recursive calls (e.g. "Foo" not "Class.Foo")
-    if returnName <> name then
-        setName ctx.FunctionIndex returnName funcIndex
+    let funcIndex = getName ctx.FunctionIndex name
 
     let startPc = ctx.Instructions.Count
 
@@ -851,7 +835,7 @@ let compileFunctionBody (ctx: CompileContext) (name: string) (returnName: string
 
     let byRefArr = paramList |> List.map (fun p -> p.ByRef) |> List.toArray
     setName ctx.ByRefInfo name byRefArr
-    if returnName <> name then setName ctx.ByRefInfo returnName byRefArr
+
 
     let funcDef = {
         Name = name
@@ -861,7 +845,34 @@ let compileFunctionBody (ctx: CompileContext) (name: string) (returnName: string
         Code = [||]
         StartPC = startPc
     }
-    ctx.Functions.Add(funcDef)
+    ctx.Functions.[funcIndex] <- funcDef
+
+let private registerFunction (ctx: CompileContext) name (parameters: Parameter list) =
+    if containsName ctx.FunctionIndex name then failwithf "Duplicate procedure %s" name
+    let modes = parameters |> List.map (fun p -> p.ByRef) |> List.toArray
+    let index = ctx.Functions.Count
+    setName ctx.FunctionIndex name index
+    setName ctx.ByRefInfo name modes
+    ctx.Functions.Add({ Name = name; ParamsCount = modes.Length; LocalsCount = 0
+                        ByRefParams = modes; Code = [||]; StartPC = 0 })
+
+let private registerDeclarations (ctx: CompileContext) (tops: TopLevel list) =
+    let register prefix func =
+        match func with
+        | FunctionDecl (_, name, ps, _, _) | SubDecl (_, name, ps, _) -> registerFunction ctx (prefix + name) ps
+        | PropertyGet (_, name, ps, _, _) -> registerFunction ctx (prefix + name + "_get") ps
+        | PropertyLet (_, name, ps, _) -> registerFunction ctx (prefix + name + "_let") ps
+        | PropertySet (_, name, ps, _) -> registerFunction ctx (prefix + name + "_set") ps
+    for top in tops do
+        match top with
+        | FunctionDef f -> register "" f
+        | ClassDecl (_, name, members) ->
+            if containsName ctx.ClassIndex name then failwithf "Duplicate class %s" name
+            setName ctx.ClassIndex name ctx.Classes.Count
+            ctx.Classes.Add({ Name = name; Fields = [||]; Methods = Map.empty; PropertyGetters = Map.empty; PropertyLetters = Map.empty; PropertySetters = Map.empty })
+            for memberDecl in members do
+                match memberDecl with FunctionDef f -> register (name + ".") f | _ -> ()
+        | _ -> ()
 
 let rec compileFunctions (ctx: CompileContext) (topLevel: TopLevel) =
     match topLevel with
@@ -873,6 +884,9 @@ let rec compileFunctions (ctx: CompileContext) (topLevel: TopLevel) =
         | PropertyLet (_, name, paramList, body) -> compileFunctionBody ctx (name + "_let") name paramList body
         | PropertySet (_, name, paramList, body) -> compileFunctionBody ctx (name + "_set") name paramList body
     | ClassDecl (_, className, members) ->
+        let outerClassFields = ctx.ClassFields
+        let outerClassName = ctx.ClassName
+        ctx.ClassName <- Some className
         let mutable fields = []
         let mutable methods = Map.empty
         let mutable getters = Map.empty
@@ -882,6 +896,7 @@ let rec compileFunctions (ctx: CompileContext) (topLevel: TopLevel) =
         // First pass: collect field names
         for m in members do
             match m with
+            | TopLevelStatement (LocatedStmt (_, Declaration (_, Dim declarators)))
             | TopLevelStatement (Declaration (_, Dim declarators)) ->
                 for d in declarators do
                     fields <- d.Name :: fields
@@ -900,35 +915,36 @@ let rec compileFunctions (ctx: CompileContext) (topLevel: TopLevel) =
                 | SubDecl (_, name, paramList, body) ->
                     let fullName = className + "." + name
                     compileFunctionBody ctx fullName name paramList body
-                    methods <- Map.add name (ctx.Functions.Count - 1) methods
+                    methods <- Map.add (name.ToLowerInvariant()) (getName ctx.FunctionIndex fullName) methods
                 | FunctionDecl (_, name, paramList, _, body) ->
                     let fullName = className + "." + name
                     compileFunctionBody ctx fullName name paramList body
-                    methods <- Map.add name (ctx.Functions.Count - 1) methods
+                    methods <- Map.add (name.ToLowerInvariant()) (getName ctx.FunctionIndex fullName) methods
                 | PropertyGet (_, name, paramList, _, body) ->
                     let fullName = className + "." + name + "_get"
                     compileFunctionBody ctx fullName name paramList body
-                    getters <- Map.add name (ctx.Functions.Count - 1) getters
+                    getters <- Map.add (name.ToLowerInvariant()) (getName ctx.FunctionIndex fullName) getters
                 | PropertyLet (_, name, paramList, body) ->
                     let fullName = className + "." + name + "_let"
                     compileFunctionBody ctx fullName name paramList body
-                    letters <- Map.add name (ctx.Functions.Count - 1) letters
+                    letters <- Map.add (name.ToLowerInvariant()) (getName ctx.FunctionIndex fullName) letters
                 | PropertySet (_, name, paramList, body) ->
                     let fullName = className + "." + name + "_set"
                     compileFunctionBody ctx fullName name paramList body
-                    setters <- Map.add name (ctx.Functions.Count - 1) setters
+                    setters <- Map.add (name.ToLowerInvariant()) (getName ctx.FunctionIndex fullName) setters
             | _ -> ()
 
-        let classIdx = ctx.Classes.Count
-        setName ctx.ClassIndex className classIdx
-        ctx.Classes.Add({
+        let classIdx = getName ctx.ClassIndex className
+        ctx.Classes.[classIdx] <- {
             Name = className
             Fields = List.rev fields |> List.toArray
             Methods = methods
             PropertyGetters = getters
             PropertyLetters = letters
             PropertySetters = setters
-        })
+        }
+        ctx.ClassFields <- outerClassFields
+        ctx.ClassName <- outerClassName
     | _ -> ()
 
 let rec compileTopLevel (ctx: CompileContext) (topLevel: TopLevel) =
@@ -947,6 +963,7 @@ let rec compileTopLevel (ctx: CompileContext) (topLevel: TopLevel) =
 
 let rec preRegisterGlobals (ctx: CompileContext) (topLevel: TopLevel) =
     match topLevel with
+    | TopLevelStatement (LocatedStmt (_, stmt)) -> preRegisterGlobals ctx (TopLevelStatement stmt)
     | TopLevelStatement (Declaration (_, Dim declarators)) ->
         for d in declarators do
             ignore (getGlobalSlot ctx d.Name)
@@ -973,6 +990,7 @@ let compileWithGlobalNames (names: string seq) (program: Program) : BytecodeProg
     for tl in program.TopLevels do
         preRegisterGlobals ctx tl
 
+    registerDeclarations ctx program.TopLevels
     emit ctx (Jump -1) 0
 
     for tl in program.TopLevels do
@@ -988,6 +1006,7 @@ let compileWithGlobalNames (names: string seq) (program: Program) : BytecodeProg
     emit ctx Halt 0
 
     {
+        TextCompare = program.TopLevels |> List.exists (function OptionStmt option -> option.ToLowerInvariant() = "compare text" | _ -> false)
         Code = ctx.Instructions.ToArray()
         Constants = ctx.Constants.ToArray()
         Globals = ctx.NextGlobalSlot

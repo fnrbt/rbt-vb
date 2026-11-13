@@ -1,42 +1,30 @@
 module Rbt.Vb.Builtins
 
 open Values
+open ValueSemantics
 open System
 open System.Text
 
-let valueToInt = function
-    | VInteger i -> i
-    | VDouble d -> int d
-    | VBoolean b -> if b then 1 else 0
-    | VString s -> match Int32.TryParse(s) with true, i -> i | _ -> 0
-    | _ -> 0
+let private compareMode defaultTextCompare value =
+    match toInteger value with
+    | 0 -> false
+    | 1 -> true
+    | -1 -> defaultTextCompare
+    | _ -> failwith "Invalid comparison mode"
 
-let valueToDouble = function
-    | VInteger i -> float i
-    | VDouble d -> d
-    | VBoolean b -> if b then 1.0 else 0.0
-    | VString s -> match Double.TryParse(s) with true, d -> d | _ -> 0.0
-    | _ -> 0.0
+let private builtinArray (data: Value array) =
+    VArray { Data = data; LowerBounds = [| 0 |]; Lengths = [| data.Length |] }
 
-let valueToString = function
-    | VInteger i -> string i
-    | VDouble d -> string d
-    | VString s -> s
-    | VBoolean b -> if b then "True" else "False"
-    | VNull -> ""
-    | VEmpty -> ""
-    | VNothing -> ""
-    | VHostObject _ -> ""
-    | _ -> ""
-
-let valueToBool = function
-    | VBoolean b -> b
-    | VInteger i -> i <> 0
-    | VDouble d -> d <> 0.0
-    | VString s -> s <> ""
-    | VHostObject _ -> true
-    | _ -> false
-
+let private arrayBound upper (args: Value array) =
+    let array =
+        match dereference args.[0] with
+        | VArray array -> array
+        | _ -> failwith "Type mismatch"
+    let dimension = if args.Length >= 2 then toInteger args.[1] else 1
+    if dimension < 1 || dimension > array.Lengths.Length then failwith "Subscript out of range"
+    let index = dimension - 1
+    let lower = array.LowerBounds.[index]
+    VInteger (if upper then lower + array.Lengths.[index] - 1 else lower)
 let private rng = Random()
 
 let rec private typeName = function
@@ -52,14 +40,15 @@ let rec private typeName = function
     | VHostObject o -> o.TypeName
     | VRef (arr, idx) when idx >= 0 && idx < arr.Length -> typeName arr.[idx]
     | VRef _ -> "Empty"
+    | VFieldRef (instance, name) -> typeName instance.Fields.[name]
     | VUndefined -> "Undefined"
 
-let callBuiltin (name: string) (args: Value array) : Value =
+let callBuiltin (defaultTextCompare: bool) (name: string) (args: Value array) : Value =
     let argc = args.Length
-    let arg i = if i < argc then args.[i] else VEmpty
-    let s i = valueToString (arg i)
-    let n i = valueToInt (arg i)
-    let d i = valueToDouble (arg i)
+    let arg i = if i < argc then dereference args.[i] else VEmpty
+    let s i = toString (arg i)
+    let n i = toInteger (arg i)
+    let d i = toNumber (arg i)
 
     match name with
     // Output
@@ -67,7 +56,7 @@ let callBuiltin (name: string) (args: Value array) : Value =
         let sb = StringBuilder()
         for i in 0 .. argc - 1 do
             if i > 0 then sb.Append " " |> ignore
-            sb.Append(valueToString args.[i]) |> ignore
+            sb.Append(toString args.[i]) |> ignore
         printfn "%s" (sb.ToString())
         VEmpty
 
@@ -93,24 +82,38 @@ let callBuiltin (name: string) (args: Value array) : Value =
     | "ltrim" -> VString ((s 0).TrimStart())
     | "rtrim" -> VString ((s 0).TrimEnd())
     | "instr" ->
-        if argc >= 3 then
-            // InStr(start, string1, string2)
-            let start = max 1 (n 0) - 1
-            let str = s 1
-            let find = s 2
-            let idx = str.IndexOf(find, start, StringComparison.Ordinal)
-            VInteger (if idx >= 0 then idx + 1 else 0)
-        else
-            // InStr(string1, string2)
-            let idx = (s 0).IndexOf(s 1, StringComparison.Ordinal)
-            VInteger (if idx >= 0 then idx + 1 else 0)
+        if argc <> 2 && argc <> 3 && argc <> 4 then failwith "Invalid argument count"
+        let first, second = if argc = 2 then arg 0, arg 1 else arg 1, arg 2
+        match first, second with
+        | VNull, _ | _, VNull -> VNull
+        | _ ->
+            let start, text, needle, textMode =
+                if argc = 2 then 1, s 0, s 1, defaultTextCompare
+                else n 0, s 1, s 2, (if argc = 4 then compareMode defaultTextCompare (arg 3) else defaultTextCompare)
+            if start < 1 then failwith "Invalid procedure call or argument"
+            if text.Length = 0 || start > text.Length then VInteger 0
+            elif needle.Length = 0 then VInteger start
+            else
+#if FABLE_COMPILER
+                let index =
+                    if textMode then text.ToUpperInvariant().IndexOf(needle.ToUpperInvariant(), start - 1)
+                    else text.IndexOf(needle, start - 1)
+#else
+                let mode = if textMode then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
+                let index = text.IndexOf(needle, start - 1, mode)
+#endif
+                VInteger (if index < 0 then 0 else index + 1)
     | "instrrev" ->
         let str = s 0
         let find = s 1
         let start = if argc >= 3 then min (n 2) str.Length - 1 else str.Length - 1
         if start < 0 || str.Length = 0 then VInteger 0
         else
+#if FABLE_COMPILER
+            let idx = str.LastIndexOf(find, start)
+#else
             let idx = str.LastIndexOf(find, start, StringComparison.Ordinal)
+#endif
             VInteger (if idx >= 0 then idx + 1 else 0)
     | "replace" -> VString ((s 0).Replace(s 1, s 2))
     | "space" -> VString (String(' ', max 0 (n 0)))
@@ -124,29 +127,37 @@ let callBuiltin (name: string) (args: Value array) : Value =
         if str.Length > 0 then VInteger (int str.[0]) else VInteger 0
     | "chr" -> VString (string (char (n 0)))
     | "split" ->
-        let str = s 0
+        let text = s 0
         let delim = if argc >= 2 then s 1 else " "
-        let parts = str.Split([|delim|], StringSplitOptions.None)
-        VArray (parts |> Array.map VString)
+        let parts =
+            if text.Length = 0 then [||]
+            elif delim.Length = 0 then [| text |]
+            else text.Split([|delim|], StringSplitOptions.None)
+        builtinArray (parts |> Array.map VString)
     | "join" ->
         match arg 0 with
-        | VArray arr ->
+        | VArray arr when arr.Lengths.Length = 1 ->
             let delim = if argc >= 2 then s 1 else " "
-            VString (arr |> Array.map valueToString |> String.concat delim)
-        | _ -> VString (s 0)
+            VString (arr.Data |> Array.map toString |> String.concat delim)
+        | _ -> failwith "Type mismatch"
     | "strcomp" ->
-        let result = String.Compare(s 0, s 1, StringComparison.OrdinalIgnoreCase)
-        VInteger (sign result)
+        if argc < 2 || argc > 3 then failwith "Invalid argument count"
+        match arg 0, arg 1 with
+        | VNull, _ | _, VNull -> VNull
+        | _ ->
+            let textMode = if argc = 3 then compareMode defaultTextCompare (arg 2) else defaultTextCompare
+            VInteger (sign (compareStrings textMode (s 0) (s 1)))
 
     // Type conversion
-    | "cint" | "int" -> VInteger (valueToInt (arg 0))
-    | "clng" -> VInteger (valueToInt (arg 0))
-    | "cdbl" -> VDouble (valueToDouble (arg 0))
-    | "csng" -> VDouble (float (float32 (valueToDouble (arg 0))))
-    | "cstr" -> VString (valueToString (arg 0))
-    | "cbool" -> VBoolean (valueToBool (arg 0))
-    | "cbyte" -> VInteger (valueToInt (arg 0) &&& 0xFF)
-    | "fix" -> VInteger (int (Math.Truncate(valueToDouble (arg 0))))
+    | "cint" -> VInteger (roundedInteger -32768.0 32767.0 (arg 0))
+    | "clng" -> VInteger (toInteger (arg 0))
+    | "int" -> floorValue (arg 0)
+    | "fix" -> truncateValue (arg 0)
+    | "cdbl" -> VDouble (d 0)
+    | "csng" -> VDouble (float (float32 (d 0)))
+    | "cstr" -> VString (s 0)
+    | "cbool" -> VBoolean (toBool (arg 0))
+    | "cbyte" -> VInteger (roundedInteger 0.0 255.0 (arg 0))
 
     // Type checking
     | "isnull" -> VBoolean (match arg 0 with VNull -> true | _ -> false)
@@ -181,33 +192,35 @@ let callBuiltin (name: string) (args: Value array) : Value =
         match arg 0 with
         | VInteger i -> VInteger (abs i)
         | VDouble d -> VDouble (abs d)
-        | _ -> VDouble (abs (valueToDouble (arg 0)))
+        | _ -> VDouble (abs (d 0))
     | "sgn" ->
         match arg 0 with
         | VInteger i -> VInteger (sign i)
-        | _ -> VInteger (sign (valueToDouble (arg 0)))
-    | "sqr" -> VDouble (sqrt (valueToDouble (arg 0)))
-    | "exp" -> VDouble (Math.Exp(valueToDouble (arg 0)))
-    | "log" -> VDouble (Math.Log(valueToDouble (arg 0)))
-    | "sin" -> VDouble (Math.Sin(valueToDouble (arg 0)))
-    | "cos" -> VDouble (Math.Cos(valueToDouble (arg 0)))
-    | "tan" -> VDouble (Math.Tan(valueToDouble (arg 0)))
-    | "atn" -> VDouble (Math.Atan(valueToDouble (arg 0)))
+        | _ -> VInteger (sign (d 0))
+    | "sqr" -> VDouble (sqrt (d 0))
+    | "exp" -> VDouble (Math.Exp(d 0))
+    | "log" -> VDouble (Math.Log(d 0))
+    | "sin" -> VDouble (Math.Sin(d 0))
+    | "cos" -> VDouble (Math.Cos(d 0))
+    | "tan" -> VDouble (Math.Tan(d 0))
+    | "atn" -> VDouble (Math.Atan(d 0))
     | "rnd" -> VDouble (rng.NextDouble())
     | "round" ->
-        let value = valueToDouble (arg 0)
+        let value = d 0
         let decimals = if argc >= 2 then n 1 else 0
-        VDouble (Math.Round(value, decimals, MidpointRounding.AwayFromZero))
-    | "hex" -> VString (sprintf "%X" (valueToInt (arg 0)))
-    | "oct" -> VString (Convert.ToString(valueToInt (arg 0), 8))
+        if decimals < 0 || decimals > 15 then failwith "Invalid procedure call or argument"
+        VDouble (Math.Round(value, decimals, MidpointRounding.ToEven))
+    | "hex" -> VString (sprintf "%X" (n 0))
+    | "oct" -> VString (Convert.ToString(n 0, 8))
 
     // Array
-    | "array" -> VArray args
-    | "ubound" ->
-        match arg 0 with
-        | VArray arr -> VInteger (arr.Length - 1)
-        | _ -> VInteger -1
-    | "lbound" -> VInteger 0
+    | "array" -> builtinArray args
+    | "ubound" -> 
+        if argc < 1 || argc > 2 then failwith "Invalid argument count"
+        arrayBound true args
+    | "lbound" ->
+        if argc < 1 || argc > 2 then failwith "Invalid argument count"
+        arrayBound false args
 
     // Misc
     | "msgbox" ->
@@ -224,8 +237,8 @@ let callBuiltin (name: string) (args: Value array) : Value =
     | "now" -> VString (DateTime.Now.ToString())
     | "timer" -> VDouble (float (DateTime.Now.TimeOfDay.TotalSeconds))
     | "formatnumber" ->
-        let value = valueToDouble (arg 0)
+        let value = d 0
         let decimals = if argc >= 2 then n 1 else 2
         VString (value.ToString("F" + string decimals))
 
-    | _ -> VEmpty
+    | _ -> failwith ("Unknown builtin: " + name)

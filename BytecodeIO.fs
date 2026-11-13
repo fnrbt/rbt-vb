@@ -9,13 +9,29 @@ open Values
 open Bytecode
 
 let magic = 0x46_56_42_43   // "FVBC"
-let version = 1
+let version = 2
 
 #if FABLE_COMPILER
 let serialize (_: BytecodeProgram) : byte[] = failwith "bytecode serialization is native-only"
 let deserialize (_: byte[]) : BytecodeProgram = failwith "bytecode serialization is native-only"
 #else
 open System.IO
+
+let private readString (r: BinaryReader) =
+    let mutable length = 0
+    let mutable shift = 0
+    let mutable more = true
+    while more do
+        if shift >= 35 then failwith "Invalid string length"
+        let b = int (r.ReadByte())
+        if shift = 28 && b > 7 then failwith "Invalid string length"
+        length <- length ||| ((b &&& 127) <<< shift)
+        more <- (b &&& 128) <> 0
+        shift <- shift + 7
+    if length < 0 || length > 1000000 || int64 length > r.BaseStream.Length - r.BaseStream.Position then
+        failwith "Invalid string length"
+    let bytes = r.ReadBytes length
+    System.Text.Encoding.UTF8.GetString bytes
 
 // --- Value (constant-pool literals only; runtime-only cases never appear) ---
 let private writeValue (w: BinaryWriter) (v: Value) =
@@ -34,7 +50,7 @@ let private readValue (r: BinaryReader) : Value =
     match r.ReadByte() with
     | 0uy -> VInteger (r.ReadInt32())
     | 1uy -> VDouble (r.ReadDouble())
-    | 2uy -> VString (r.ReadString())
+    | 2uy -> VString (readString r)
     | 3uy -> VBoolean (r.ReadBoolean())
     | 4uy -> VNull
     | 5uy -> VEmpty
@@ -46,6 +62,10 @@ let private readValue (r: BinaryReader) : Value =
 let private writeOpcode (w: BinaryWriter) (op: Opcode) =
     let t (b: int) = w.Write (byte b)
     match op with
+    | Statement i -> t 64; w.Write i
+    | ArrayGetFlat -> t 65
+    | MakeRefArray n -> t 66; w.Write n
+    | MakeRefMember s -> t 67; w.Write s
     | Nop -> t 0
     | LoadConst i -> t 1; w.Write i
     | LoadNull -> t 2
@@ -81,14 +101,14 @@ let private writeOpcode (w: BinaryWriter) (op: Opcode) =
     | Negate -> t 32
     | IsOp -> t 33
     | LikeOp -> t 34
-    | ArrayNew -> t 35
-    | ArrayGet -> t 36
-    | ArraySet -> t 37
+    | ArrayNew n -> t 35; w.Write n
+    | ArrayGet n -> t 36; w.Write n
+    | ArraySet n -> t 37; w.Write n
     | ArrayLength -> t 38
-    | ReDimPreserve -> t 39
+    | ReDimPreserve n -> t 39; w.Write n
     | NewObj i -> t 40; w.Write i
     | GetMember s -> t 41; w.Write s
-    | SetMember s -> t 42; w.Write s
+    | SetMember (s, isSet) -> t 42; w.Write s; w.Write isSet
     | CallMethod (s, n) -> t 43; w.Write s; w.Write n
     | CallDefault n -> t 44; w.Write n
     | TypeCheck s -> t 45; w.Write s
@@ -113,7 +133,7 @@ let private writeOpcode (w: BinaryWriter) (op: Opcode) =
 
 let private readOpcode (r: BinaryReader) : Opcode =
     let i () = r.ReadInt32()
-    let s () = r.ReadString()
+    let s () = readString r
     match int (r.ReadByte()) with
     | 0 -> Nop
     | 1 -> LoadConst (i())
@@ -150,14 +170,14 @@ let private readOpcode (r: BinaryReader) : Opcode =
     | 32 -> Negate
     | 33 -> IsOp
     | 34 -> LikeOp
-    | 35 -> ArrayNew
-    | 36 -> ArrayGet
-    | 37 -> ArraySet
+    | 35 -> ArrayNew (i())
+    | 36 -> ArrayGet (i())
+    | 37 -> ArraySet (i())
     | 38 -> ArrayLength
-    | 39 -> ReDimPreserve
+    | 39 -> ReDimPreserve (i())
     | 40 -> NewObj (i())
     | 41 -> GetMember (s())
-    | 42 -> SetMember (s())
+    | 42 -> let name = s() in SetMember (name, r.ReadBoolean())
     | 43 -> let a = s() in CallMethod (a, i())
     | 44 -> CallDefault (i())
     | 45 -> TypeCheck (s())
@@ -179,6 +199,10 @@ let private readOpcode (r: BinaryReader) : Opcode =
     | 61 -> MakeRefLocal (i())
     | 62 -> MakeRefGlobal (i())
     | 63 -> Halt
+    | 64 -> Statement (i())
+    | 65 -> ArrayGetFlat
+    | 66 -> MakeRefArray (i())
+    | 67 -> MakeRefMember (s())
     | t -> failwithf "bad opcode tag %d" t
 
 let private writeArray (w: BinaryWriter) (writeItem: 'a -> unit) (xs: 'a array) =
@@ -187,6 +211,7 @@ let private writeArray (w: BinaryWriter) (writeItem: 'a -> unit) (xs: 'a array) 
 
 let private readArray (r: BinaryReader) (readItem: unit -> 'a) : 'a array =
     let n = r.ReadInt32()
+    if n < 0 || n > 1000000 || int64 n > r.BaseStream.Length - r.BaseStream.Position then failwith "Invalid bytecode count"
     Array.init n (fun _ -> readItem ())
 
 let private writeInstr (w: BinaryWriter) (ins: Instruction) =
@@ -201,13 +226,15 @@ let private writeMap (w: BinaryWriter) (m: Map<string, int>) =
     for KeyValue(k, v) in m do w.Write k; w.Write v
 let private readMap (r: BinaryReader) : Map<string, int> =
     let n = r.ReadInt32()
-    Seq.init n (fun _ -> let k = r.ReadString() in k, r.ReadInt32()) |> Map.ofSeq
+    if n < 0 || n > 1000000 || int64 n > r.BaseStream.Length - r.BaseStream.Position then failwith "Invalid bytecode count"
+    Seq.init n (fun _ -> let k = readString r in k, r.ReadInt32()) |> Map.ofSeq
 
 let serialize (prog: BytecodeProgram) : byte[] =
     use ms = new MemoryStream()
     use w = new BinaryWriter(ms)
     w.Write magic
     w.Write version
+    w.Write prog.TextCompare
     writeArray w (writeInstr w) prog.Code
     writeArray w (writeValue w) prog.Constants
     w.Write prog.Globals
@@ -236,13 +263,14 @@ let deserialize (bytes: byte[]) : BytecodeProgram =
     let v = r.ReadInt32()
     if m <> magic then failwithf "not a bytecode blob (magic %08x)" m
     if v <> version then failwithf "unsupported bytecode version %d" v
+    let textCompare = r.ReadBoolean()
     let code = readArray r (fun () -> readInstr r)
     let constants = readArray r (fun () -> readValue r)
     let globals = r.ReadInt32()
-    let globalNames = readArray r (fun () -> r.ReadString())
+    let globalNames = readArray r (fun () -> readString r)
     let functions =
         readArray r (fun () ->
-            let name = r.ReadString()
+            let name = readString r
             let p = r.ReadInt32()
             let l = r.ReadInt32()
             let byref = readArray r (fun () -> r.ReadBoolean())
@@ -251,14 +279,17 @@ let deserialize (bytes: byte[]) : BytecodeProgram =
             { Name = name; ParamsCount = p; LocalsCount = l; ByRefParams = byref; Code = fcode; StartPC = start })
     let classes =
         readArray r (fun () ->
-            let name = r.ReadString()
-            let fields = readArray r (fun () -> r.ReadString())
+            let name = readString r
+            let fields = readArray r (fun () -> readString r)
             let methods = readMap r
             let getters = readMap r
             let letters = readMap r
             let setters = readMap r
             { Name = name; Fields = fields; Methods = methods
               PropertyGetters = getters; PropertyLetters = letters; PropertySetters = setters })
-    { Code = code; Constants = constants; Globals = globals; GlobalNames = globalNames
-      Functions = functions; Classes = classes }
+    if ms.Position <> ms.Length then failwith "Trailing bytecode data"
+    let program = { TextCompare = textCompare; Code = code; Constants = constants; Globals = globals; GlobalNames = globalNames
+                    Functions = functions; Classes = classes }
+    validate program
+    program
 #endif

@@ -75,10 +75,7 @@ let private lexNumber (state: LexerState) =
     while isDigit (peek st) || peek st = '.' do
         st <- advance st
     let lexeme = state.Source.Substring(state.Position, st.Position - state.Position)
-    let value =
-        if lexeme.Contains "." then Double (float lexeme)
-        else Integer (int lexeme)
-    (value, st)
+    (lexeme, st)
 
 let private lexString (state: LexerState) =
     let stateAfterOpenQuote = advance state
@@ -144,16 +141,22 @@ let tokenize (source: string) =
             state <- newState
             precedingNewline <- false
         | c when isDigit c ->
-            let (lit, newState) = lexNumber state
-            let lexeme = match lit with Integer i -> string i | Double d -> string d | _ -> ""
+            let (lexeme, newState) = lexNumber state
             add Number lexeme
             state <- newState
             precedingNewline <- false
         | c when isAlpha c ->
             let (lexeme, isKeyword, newState) = lexIdentifier state
             if lexeme = "_" && not isKeyword then
-                state <- newState
-                precedingNewline <- true  // line continuation implies newline consumed
+                let hasLeadingSpace =
+                    state.Position > 0 && (state.Source.[state.Position - 1] = ' ' || state.Source.[state.Position - 1] = '\t')
+                let afterMarker = newState.Position
+                let afterCr = if peek newState = '\r' then advance newState else newState
+                if not hasLeadingSpace || peek afterCr <> '\n' then
+                    failwithf "Invalid line continuation at line %d, column %d" line col
+                state <- advance afterCr
+                // The physical newline is not a logical statement separator.
+                precedingNewline <- nl
             else
                 let kind = if isKeyword then Ast.Keyword else Ast.Identifier
                 add kind lexeme
@@ -195,5 +198,5 @@ let tokenize (source: string) =
             precedingNewline <- false
         | '&' -> add Operator "&"; state <- advance state; precedingNewline <- false
         | _ -> add Operator (string c); state <- advance state; precedingNewline <- false
-    tokens.Add { Kind = EOF; Lexeme = ""; Line = initialState.Line; Column = initialState.Column; PrecedingNewline = false }
+    tokens.Add { Kind = EOF; Lexeme = ""; Line = state.Line; Column = state.Column; PrecedingNewline = precedingNewline }
     resizeArrayToList tokens

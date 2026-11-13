@@ -10,11 +10,18 @@ type Value =
     | VNull
     | VEmpty
     | VNothing
-    | VArray of Value array
+    | VArray of VBArray
     | VObject of VBObject
     | VHostObject of IHostObject
     | VRef of Value array * int
+    | VFieldRef of VBObject * string
     | VUndefined
+
+and VBArray = {
+    Data: Value array
+    LowerBounds: int array
+    Lengths: int array
+}
 
 and VBObject = {
     ClassName: string

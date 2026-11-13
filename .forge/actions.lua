@@ -1,11 +1,22 @@
 local publish = [[set -euo pipefail; python3 .forge/publish]]
+local test = [[set -euo pipefail; dotnet run --project tests/Rbt.Vb.Tests.fsproj -c Release]]
 
 return {
     select = function(ctx)
         if string.match(ctx.ref_name, "^refs/tags/v%d+%.%d+%.%d+") then
             return { "publish" }
         end
-        return {}
+        return { "test" }
+    end,
+    test = function(_)
+        return {
+            base = test,
+            packages = {
+                read = {
+                    { registry = "41021897", ecosystem = "nuget" },
+                },
+            },
+        }
     end,
     publish = function(_)
         return {

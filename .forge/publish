@@ -94,6 +94,18 @@ def main() -> int:
     build_tmp.mkdir()
     environment = dict(os.environ, TMPDIR=str(build_tmp), TMP=str(build_tmp), TEMP=str(build_tmp))
 
+    # A package is publishable only after the semantic regression suite passes.
+    run(
+        ["dotnet", "restore", "tests/Rbt.Vb.Tests.fsproj", "--configfile", str(nuget_config)],
+        cwd=repo,
+        env=environment,
+    )
+    run(
+        ["dotnet", "run", "--project", "tests/Rbt.Vb.Tests.fsproj", "-c", "Release", "--no-restore"],
+        cwd=repo,
+        env=environment,
+    )
+
     # Pack and push in dependency order: a project's in-repo references become
     # package dependencies at the same version, already published by then.
     endpoint = publish_endpoint(source)
@@ -113,7 +125,9 @@ def main() -> int:
                 "-o", str(output),
             ],
             cwd=repo,
-            env=environment,
+            # Avoid the .NET 10 tiered-JIT CLR crash in the F# compiler host.
+            # This does not disable Release optimization of the produced library.
+            env=dict(environment, DOTNET_TieredCompilation="0"),
         )
         packages = sorted(path for path in output.glob("*.nupkg") if ".symbols." not in path.name)
         if len(packages) != 1:

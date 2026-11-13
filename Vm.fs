@@ -1,3 +1,4 @@
+// Historical interpreter, excluded from Rbt.Vb.fsproj. StackVm.fs is the shipping runtime.
 module Rbt.Vb.Vm
 
 open Ast

@@ -63,6 +63,8 @@ and Expression =
     | Unary of UnaryOperator * Expression
     | Call of Expression * Expression list
     | Member of Expression * string
+    | Parenthesized of Expression
+    | ArrayBound of Expression * Expression // lower To upper, only in dimension lists
     | NewExpr of string  // New ClassName
     | MeExpr
     | TypeOfIs of Expression * string
@@ -77,7 +79,7 @@ type VarDeclarator = {
 type Declaration =
     | Dim of VarDeclarator list
     | Const of string * TypeRef option * Expression
-    | ReDim of string * Expression * bool  // name, size, preserve flag
+    | ReDim of string * Expression list * bool // name, dimensions, preserve flag
 
 type Parameter = {
     Name: string
@@ -100,6 +102,7 @@ type CaseTest =
     | CaseComparison of BinaryOperator * Expression
 
 type Statement =
+    | LocatedStmt of int * Statement
     | ExpressionStmt of Expression
     | Let of string * Expression
     | Set of string * Expression
@@ -118,7 +121,7 @@ type Statement =
     | Declaration of Visibility option * Declaration
     | Assignment of string * Expression
     | IndexedAssignment of string * Expression list * Expression
-    | MemberAssignment of Expression * string * Expression
+    | MemberAssignment of Expression * string * Expression * bool // isSet
     | OnError of OnErrorAction
     | WithStmt of Expression * Statement list
     | EraseStmt of string
