@@ -102,6 +102,23 @@ let private tryLexRadix (state: LexerState) =
         Some (state.Source.Substring(state.Position, st.Position - state.Position), st)
     else None
 
+/// `#1/31/2024 13:45#`: a date literal when the text up to the next `#` on
+/// the line is a date or time.
+let private tryLexDate (state: LexerState) =
+    let source = state.Source
+    let close = source.IndexOf('#', state.Position + 1)
+    if close < 0 then None
+    else
+        let text = source.Substring(state.Position + 1, close - state.Position - 1)
+        if text.IndexOf '\n' >= 0 || text.Trim() = "" then None
+        else
+            match DateCore.tryParse text System.DateTime.Now.Year with
+            | Some _ ->
+                let mutable st = state
+                for _ in state.Position .. close do st <- advance st
+                Some (text, st)
+            | None -> None
+
 let private lexString (state: LexerState) =
     let stateAfterOpenQuote = advance state
     let startLine = stateAfterOpenQuote.Line
@@ -189,6 +206,13 @@ let tokenize (source: string) =
                 add kind lexeme
                 state <- newState
                 precedingNewline <- false
+        | '#' when (match tryLexDate state with Some _ -> true | None -> false) ->
+            match tryLexDate state with
+            | Some (text, newState) ->
+                add DateLiteral text
+                state <- newState
+            | None -> ()
+            precedingNewline <- false
         | '(' -> add LParen "("; state <- advance state; precedingNewline <- false
         | ')' -> add RParen ")"; state <- advance state; precedingNewline <- false
         | ',' -> add Comma ","; state <- advance state; precedingNewline <- false

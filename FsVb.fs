@@ -102,10 +102,16 @@ let executeWith (hooks: RuntimeHooks) (instructionLimit: int option) (globals: s
     match instructionLimit with
     | None -> StackVm.run state
     | Some limit ->
-        if not (StackVm.runSlice state limit) then
+        // Stop is a no-op outside a session: continue after a pause.
+        let mutable finished = StackVm.runSlice state limit
+        while not finished && state.Paused do
+            state.Paused <- false
+            finished <- StackVm.runSlice state limit
+        if not finished then
             raise (StackVm.VbRuntimeException {
                 Number = 17; Description = "Instruction limit exceeded"; Source = state.ProjectName
                 Line = (let line, _, _ = StackVm.currentLocation state in line); Procedure = ""; Module = "" })
+        if not state.EndRequested then StackVm.finalizeObjects state
     state
 
 let tryGetGlobal (name: string) (state: StackVm.VmState) =
@@ -157,6 +163,40 @@ let runSource (options: RunOptions) (source: string) : Result<RunResult, RunErro
             | Compiler.CompileFailure (message, line, _) -> Error (RuntimeError (compileMessage message line))
             | ex -> Error (RuntimeError ex.Message)
 
+/// Dates for hosts. A VB Date is `VDate serial`, an OLE Automation date:
+/// days since 1899-12-30 with the time as the fraction, the same numbers as
+/// Excel's 1900 date system from 1900-03-01 on.
+module VbDate =
+    /// A Date from calendar parts (local, no time zone).
+    let ofParts year month day hour minute second =
+        VDate (DateCore.fromComponents year month day (float (hour * 3600 + minute * 60 + second)))
+
+    /// A Date from a DateTime (its Kind is ignored; milliseconds are kept).
+    let ofDateTime (value: System.DateTime) =
+        let seconds = float (value.Hour * 3600 + value.Minute * 60 + value.Second) + float value.Millisecond / 1000.0
+        VDate (DateCore.fromComponents value.Year value.Month value.Day seconds)
+
+    /// A Date from an Excel / OLE serial number.
+    let ofSerial (serial: float) = VDate serial
+
+    /// The serial number of a Date (or of a number).
+    let tryToSerial (value: Value) =
+        match ValueSemantics.dereference value with
+        | VDate serial -> Some serial
+        | VDouble d -> Some d
+        | VInteger i -> Some (float i)
+        | _ -> None
+
+    /// (year, month, day, hour, minute, second) of a Date.
+    let tryToParts (value: Value) =
+        match ValueSemantics.dereference value with
+        | VDate serial -> Some (DateCore.components serial)
+        | _ -> None
+
+    /// A DateTime (Kind Unspecified, rounded to the second) of a Date.
+    let tryToDateTime (value: Value) =
+        tryToParts value |> Option.map (fun (y, m, d, h, n, s) -> System.DateTime(y, m, d, h, n, s))
+
 /// The text the Immediate window shows for a value.
 let rec displayValue (value: Value) =
     match ValueSemantics.dereference value with
@@ -166,6 +206,7 @@ let rec displayValue (value: Value) =
     | VUndefined -> "Error 448"
     | VBoolean b -> if b then "True" else "False"
     | VArray _ -> "Variant()"
+    | VError e -> "Error " + string e
     | VObject o -> o.ClassName
     | VHostObject h ->
         match (try h.GetMember "" with _ -> None) with
@@ -342,18 +383,20 @@ type Project = {
     Programs: (ModuleSource * Ast.Program) list
 }
 
+type Location = {
+    Line: int
+    Procedure: string
+    Module: string
+}
+
 type ExecutionStatus =
     /// Paused between slices; call `Step` again.
     | Running
     /// Finished; the value of a Function / expression, Empty otherwise.
     | Finished of Value
     | Failed of VbFailure
-
-type Location = {
-    Line: int
-    Procedure: string
-    Module: string
-}
+    /// A `Stop` statement was reached; `Step` / `RunToEnd` resumes after it.
+    | Paused of Location
 
 module private ProjectInternals =
     let toCompilerKind kind =
@@ -454,10 +497,19 @@ module private ProjectInternals =
         { Kind = Compile; Number = 0; Description = message; Source = options.ProjectName
           Line = line; Column = 0; Procedure = ""; Module = moduleName }
 
+    /// `Attribute Value.VB_UserMemId = 0` makes Value a class's default member.
+    let defaultMember (m: ModuleSource) =
+        (ModuleSource.parseHeader m.Source).Attributes
+        |> List.tryPick (fun (key, value) ->
+            let suffix = ".VB_UserMemId"
+            if key.Length > suffix.Length && key.EndsWith(suffix, System.StringComparison.OrdinalIgnoreCase) && value.Trim() = "0" then
+                Some (key.Substring(0, key.Length - suffix.Length))
+            else None)
+
     let compilePrograms (options: ProjectOptions) (programs: (ModuleSource * Ast.Program) list) =
         let modules =
             programs |> List.map (fun (m, program) ->
-                ({ Name = m.Name; Kind = toCompilerKind m.Kind; Program = program } : Compiler.CompileModule))
+                ({ Name = m.Name; Kind = toCompilerKind m.Kind; Program = program; DefaultMember = defaultMember m } : Compiler.CompileModule))
         let hostNames = options.HostGlobals |> Map.toSeq |> Seq.map fst
         try Ok (Compiler.compileModules hostNames modules)
         with
@@ -522,6 +574,26 @@ type Session private (project: Project, ctx: Compiler.CompileContext, state: Sta
         { Kind = Runtime; Number = 17; Description = "Can't perform requested operation: the session is already running"
           Source = project.Options.ProjectName; Line = 0; Column = 0; Procedure = ""; Module = "" }
 
+    /// `End`: module-level variables return to their initial values (the
+    /// module-level code runs again) and host globals are restored.
+    let reinitialize () =
+        for i in 0 .. state.Globals.Length - 1 do state.Globals.[i] <- VEmpty
+        for KeyValue (name, value) in project.Options.HostGlobals do
+            match state.Program.GlobalNames |> Array.tryFindIndex (fun n -> equalsIgnoreCase n name) with
+            | Some index when index < state.Globals.Length -> state.Globals.[index] <- value
+            | _ -> ()
+        state.Terminable.Clear()
+        state.EndRequested <- false
+        state.Paused <- false
+        state.Pc <- 0
+        state.BaseCsp <- 1
+        try
+            let mutable finished = false
+            while not finished do
+                finished <- StackVm.runSlice state System.Int32.MaxValue
+        with _ -> ()
+        reset ()
+
     let refreshProgram () =
         let program = Compiler.toProgram ctx
         state.Program <- program
@@ -585,8 +657,21 @@ type Session private (project: Project, ctx: Compiler.CompileContext, state: Sta
                 try
                     if StackVm.runSlice state (max 1 maxInstructions) then
                         let value = if state.Csp = 1 && state.Sp > 0 then ValueSemantics.dereference state.Stack.[state.Sp - 1] else VEmpty
-                        reset ()
-                        Finished value
+                        if state.EndRequested then
+                            reinitialize ()
+                            Finished VEmpty
+                        else
+                            // Objects the module state no longer reaches are terminated.
+                            (try StackVm.collectUnreachable state with _ -> ())
+                            reset ()
+                            Finished value
+                    elif state.Paused then
+                        state.Paused <- false
+                        // Report the Stop statement itself, not the next one.
+                        state.Pc <- state.Pc - 1
+                        let line, procedure, moduleName = StackVm.currentLocation state
+                        state.Pc <- state.Pc + 1
+                        Paused { Line = line; Procedure = procedure; Module = moduleName }
                     else Running
                 with
                 | :? StackVm.VbRuntimeException as e ->

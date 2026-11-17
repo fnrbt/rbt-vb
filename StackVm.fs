@@ -64,6 +64,8 @@ type StackFrame = {
     mutable GoSubBase: int
     /// Index into Program.Functions, or -1 for module-level / host snippet code.
     mutable FunctionIndex: int
+    /// The last numeric line label reached (Erl).
+    mutable LineLabel: int
 }
 
 type VmState = {
@@ -88,7 +90,21 @@ type VmState = {
     mutable BaseCsp: int
     mutable CancelRequested: bool
     mutable ErrObject: IHostObject option
+    /// Erl of the last error.
+    mutable LastErl: int
+    /// A `Stop` paused the execution (runSlice returned early).
+    mutable Paused: bool
+    /// An `End` statement stopped the program.
+    mutable EndRequested: bool
+    /// Live instances of classes with a Class_Terminate.
+    Terminable: ResizeArray<VBObject>
+    /// Mark epoch for finding unreachable Terminable objects.
+    mutable MarkEpoch: int
+    Marks: Dictionary<obj, int>
 }
+
+/// Raised by `Stop` to end the current slice.
+exception StopSignal
 
 let valueToInt = ValueSemantics.toInteger
 let valueToDouble = ValueSemantics.toNumber
@@ -168,6 +184,7 @@ let private clearError (state: VmState) =
     state.LastErrorNumber <- 0
     state.LastErrorDescription <- ""
     state.LastErrorSource <- ""
+    state.LastErl <- 0
 
 /// The `Err` object of a VM state.
 type ErrObject(state: VmState) =
@@ -223,6 +240,7 @@ let newFrameWith returnAddress (locals: Value array) sp goSubBase functionIndex 
     StatementStart = 0; StatementEnd = 0; StatementSp = sp
     ResumeStart = 0; ResumeNext = 0
     DiscardResult = false; GoSubBase = goSubBase; FunctionIndex = functionIndex
+    LineLabel = 0
 }
 
 let newFrame returnAddress localsCount sp goSubBase functionIndex =
@@ -261,6 +279,12 @@ let emptyStateWithHooks (hooks: RuntimeHooks) (constants: Value array) (program:
         BaseCsp = 1
         CancelRequested = false
         ErrObject = None
+        LastErl = 0
+        Paused = false
+        EndRequested = false
+        Terminable = ResizeArray()
+        MarkEpoch = 0
+        Marks = Dictionary<obj, int>(HashIdentity.Reference)
     }
 
 let emptyState (constants: Value array) (program: BytecodeProgram) : VmState =
@@ -325,7 +349,7 @@ let rec newInstance (state: VmState) (classIdx: int) =
             if code < 0 then newInstance state (-code - 1)
             elif code = 0 then VEmpty
             else ValueSemantics.defaultOf (enum<ValueSemantics.DeclaredType> code)
-    VObject { ClassName = classDef.Name; Fields = fields; ClassIndex = classIdx }
+    VObject { ClassName = classDef.Name; Fields = fields; ClassIndex = classIdx; Sinks = [] }
 
 let rec private copyValueType (state: VmState) (value: Value) =
     match value with
@@ -373,6 +397,18 @@ let private hostDefaultCall (hostObj: IHostObject) (args: Value array) =
                     | VArray a -> a.Data.[indexArray a args]
                     | _ -> raiseVbError 438
 
+/// `obj.Name(args)` on a host object: CallMethod, then GetMember indexed.
+let private hostCall (hostObj: IHostObject) (name: string) (args: Value array) =
+    match hostObj.CallMethod name args with
+    | Some value -> value
+    | None ->
+        match hostObj.GetMember name with
+        | Some value when args.Length = 0 -> value
+        | Some (VArray a) -> a.Data.[indexArray a args]
+        | Some (VHostObject inner) -> hostDefaultCall inner args
+        | Some _ -> raiseVbError 13
+        | None -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
+
 let private defaultCall (value: Value) (args: Value array) =
     match value with
     | VArray a when args.Length = 0 -> value
@@ -389,6 +425,16 @@ let private assignDefault (target: Value) (value: Value) =
     | VObject _ -> raiseVbError 438
     | other -> objectError other
 
+/// `obj(args) = value` on a host object: SetIndexed, else the item's default member.
+let private hostIndexedAssign (hostObj: IHostObject) (name: string) (args: Value array) (value: Value) =
+    let handled =
+        match box hostObj with
+        | :? HostObject as h -> h.SetIndexed name args value
+        | _ -> false
+    if not handled then
+        let item = if name = "" then hostDefaultCall hostObj args else hostCall hostObj name args
+        assignDefault item (ValueSemantics.dereference value)
+
 let private enterFunction (state: VmState) (funcIdx: int) (receiver: Value) (returnAddress: int) =
     let funcDef = state.Program.Functions.[funcIdx]
     pushFrameFor state returnAddress funcDef.LocalsCount funcIdx
@@ -396,6 +442,183 @@ let private enterFunction (state: VmState) (funcIdx: int) (receiver: Value) (ret
     frame.Locals.[0] <- receiver
     state.Pc <- funcDef.StartPC
     frame
+
+/// Call a class method with arguments in a new frame; the result is
+/// discarded (Property Let / Set, event handlers).
+let private enterWithArgs (state: VmState) (funcIdx: int) (receiver: Value) (args: Value array) =
+    let funcDef = state.Program.Functions.[funcIdx]
+    if args.Length > funcDef.ParamsCount then raiseVbError 450
+    let frame = enterFunction state funcIdx receiver (state.Pc + 1)
+    for i in 0 .. funcDef.ParamsCount - 1 do
+        frame.Locals.[i + 1] <-
+            if i < args.Length then
+                match args.[i] with
+                | VRef (cells, index) when not funcDef.ByRefParams.[i] -> cells.[index]
+                | VFieldRef (obj, field) when not funcDef.ByRefParams.[i] -> obj.Fields.[field]
+                | value -> value
+            else VUndefined
+    frame.DiscardResult <- true
+    frame.StatementSp <- state.Sp
+
+let private classOf (state: VmState) (o: VBObject) = state.Program.Classes.[o.ClassIndex]
+
+/// A VB object assigned with Let through its default Property Let.
+let private tryLetDefault (state: VmState) (o: VBObject) (args: Value array) (value: Value) =
+    let classDef = classOf state o
+    if classDef.DefaultMember = "" || classDef.IsValueType then false
+    else
+        match Map.tryFind classDef.DefaultMember classDef.PropertyLetters with
+        | Some funcIdx -> enterWithArgs state funcIdx (VObject o) (Array.append args [| value |]); true
+        | None ->
+            if args.Length = 0 && o.Fields.ContainsKey classDef.DefaultMember then
+                o.Fields.[classDef.DefaultMember] <- value
+                state.Pc <- state.Pc + 1
+                true
+            else false
+
+let private isObjectValue (state: VmState) (value: Value) =
+    match value with
+    | VHostObject _ | VNothing -> true
+    | VObject o -> not (classOf state o).IsValueType
+    | _ -> false
+
+/// Let-store into a cell that holds an object: assign its default member
+/// (`r = 5` with r a Range). Advances the pc unless a Property Let runs.
+let private letStore (state: VmState) (current: Value) (value: Value) (store: Value -> unit) =
+    match current with
+    | VHostObject hostObj when not (isObjectValue state value) ->
+        if not (hostObj.SetMember "" (ValueSemantics.dereference value)) then raiseVbError 438
+        state.Pc <- state.Pc + 1
+    | VObject o when not (isObjectValue state value) && tryLetDefault state o [||] value -> ()
+    | _ ->
+        store value
+        state.Pc <- state.Pc + 1
+
+/// `target(args) = value` for an array element, a host item or a VB default member.
+let private indexedAssign (state: VmState) (target: Value) (args: Value array) (value: Value) =
+    match ValueSemantics.dereference target with
+    | VArray a ->
+        a.Data.[indexArray a args] <- value
+        state.Pc <- state.Pc + 1
+    | VHostObject hostObj ->
+        hostIndexedAssign hostObj "" (hostArgs args) value
+        state.Pc <- state.Pc + 1
+    | VObject o when tryLetDefault state o args value -> ()
+    | VObject _ -> raiseVbError 438
+    | other -> objectError other
+
+/// A method, Property Get or field of a VB class instance by name.
+let private classCallable (classDef: ClassDef) (key: string) =
+    match Map.tryFind key classDef.Methods with
+    | Some funcIdx -> Some funcIdx
+    | None -> Map.tryFind key classDef.PropertyGetters
+
+/// `receiver.name(args)` with the receiver and arguments on the stack.
+let rec private callMethod (state: VmState) (name: string) (argCount: int) =
+    if state.Sp < argCount + 1 then raiseVbErrorWith 51 "Stack underflow"
+    let receiver = state.Stack.[state.Sp - argCount - 1]
+    match receiver with
+    | VObject vbObj ->
+        let classDef = classOf state vbObj
+        let key = name.ToLowerInvariant()
+        match classCallable classDef key with
+        | Some funcIdx ->
+            let funcDef = state.Program.Functions.[funcIdx]
+            if argCount > funcDef.ParamsCount then raiseVbError 450
+            pushFrameFor state (state.Pc + 1) funcDef.LocalsCount funcIdx
+            let frame = state.CallStack.[state.Csp - 1]
+            for i in argCount - 1 .. -1 .. 0 do
+                frame.Locals.[i + 1] <-
+                    match pop state with
+                    | VRef (cells, index) when not funcDef.ByRefParams.[i] -> cells.[index]
+                    | VFieldRef (obj, field) when not funcDef.ByRefParams.[i] -> obj.Fields.[field]
+                    | value -> value
+            ignore (pop state)
+            frame.Locals.[0] <- receiver
+            frame.StatementSp <- state.Sp
+            for i in argCount .. funcDef.ParamsCount - 1 do
+                frame.Locals.[i + 1] <- VUndefined
+            state.Pc <- funcDef.StartPC
+        | None ->
+            match vbObj.Fields.TryGetValue key with
+            | true, field ->
+                let args = Array.zeroCreate argCount
+                for i in argCount - 1 .. -1 .. 0 do args.[i] <- ValueSemantics.dereference (pop state)
+                ignore (pop state)
+                match field with
+                | VObject inner when argCount > 0 && (classOf state inner).DefaultMember <> "" ->
+                    // A field holding an object with a default member: obj.field(i).
+                    push state field
+                    for arg in args do push state arg
+                    callMethod state (classOf state inner).DefaultMember argCount
+                | _ ->
+                    push state (if argCount = 0 then field else defaultCall field args)
+                    state.Pc <- state.Pc + 1
+            | false, _ -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
+    | VHostObject hostObj ->
+        let args = Array.zeroCreate argCount
+        for i in argCount - 1 .. -1 .. 0 do
+            args.[i] <- ValueSemantics.dereference (pop state)
+        ignore (pop state)
+        push state (hostCall hostObj name args)
+        state.Pc <- state.Pc + 1
+    | other -> objectError other
+
+/// `obj.name = value` with the object and value popped.
+let private setMember (state: VmState) (obj: Value) (name: string) (value: Value) (isSet: bool) =
+    match obj with
+    | VObject vbObj ->
+        let key = name.ToLowerInvariant()
+        if vbObj.Fields.ContainsKey key then
+            vbObj.Fields.[key] <- value
+            state.Pc <- state.Pc + 1
+        else
+            let classDef = classOf state vbObj
+            let handlers = if isSet then classDef.PropertySetters else classDef.PropertyLetters
+            match Map.tryFind key handlers with
+            | Some funcIdx ->
+                let frame = enterFunction state funcIdx obj (state.Pc + 1)
+                frame.Locals.[1] <- value
+                frame.DiscardResult <- true
+            | None -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
+    | VHostObject hostObj ->
+        if not (hostObj.SetMember name (ValueSemantics.dereference value)) then
+            raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
+        state.Pc <- state.Pc + 1
+    | other -> objectError other
+
+/// `obj.name(args) = value`.
+let private setMemberIndexed (state: VmState) (obj: Value) (name: string) (args: Value array) (value: Value) =
+    match obj with
+    | VObject vbObj ->
+        let key = name.ToLowerInvariant()
+        let classDef = classOf state vbObj
+        match Map.tryFind key classDef.PropertyLetters |> Option.orElse (Map.tryFind key classDef.PropertySetters) with
+        | Some funcIdx -> enterWithArgs state funcIdx obj (Array.append args [| value |])
+        | None ->
+            match vbObj.Fields.TryGetValue key with
+            | true, field -> indexedAssign state field (Array.map ValueSemantics.dereference args) value
+            | _ -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
+    | VHostObject hostObj ->
+        hostIndexedAssign hostObj name (hostArgs args) value
+        state.Pc <- state.Pc + 1
+    | other -> objectError other
+
+/// Hooks the VM installs after its dispatcher is defined: run unreachable
+/// Class_Terminate handlers (after a frame returns / a Set overwrote an object).
+let mutable private collectHook : VmState -> unit = fun _ -> ()
+
+let private hasTerminate (state: VmState) (o: VBObject) =
+    let classDef = classOf state o
+    not classDef.IsValueType && Map.containsKey "class_terminate" classDef.Methods
+
+let private frameHoldsTerminable (state: VmState) (frame: StackFrame) =
+    let mutable found = false
+    for value in frame.Locals do
+        match value with
+        | VObject o when hasTerminate state o -> found <- true
+        | _ -> ()
+    found
 
 let private executeCold (state: VmState) (instr: Instruction) =
     match instr.Opcode with
@@ -438,15 +661,15 @@ let private executeCold (state: VmState) (instr: Instruction) =
         state.Pc <- state.Pc + 1
 
     | Eqv ->
-        let right = pop state
-        let left = pop state
+        let right = ValueSemantics.scalar (pop state)
+        let left = ValueSemantics.scalar (pop state)
         if left = VNull || right = VNull then push state VNull
         else push state (VBoolean (valueToBool left = valueToBool right))
         state.Pc <- state.Pc + 1
 
     | Imp ->
-        let right = pop state
-        let left = pop state
+        let right = ValueSemantics.scalar (pop state)
+        let left = ValueSemantics.scalar (pop state)
         if left = VNull || right = VNull then push state VNull
         else push state (VBoolean (not (valueToBool left) || valueToBool right))
         state.Pc <- state.Pc + 1
@@ -493,6 +716,7 @@ let private executeCold (state: VmState) (instr: Instruction) =
         match opcode with
         | ReDimPreserve _ ->
             match pop state with
+            | VArray old when old.Lengths.Length = 0 -> ()
             | VArray old ->
                 if old.Lengths.Length <> rank then raiseVbError 9
                 for i in 0 .. rank - 2 do
@@ -544,6 +768,17 @@ let private executeCold (state: VmState) (instr: Instruction) =
         | _ -> ()
         state.Pc <- state.Pc + 1
 
+    | ArrayReset code ->
+        match pop state with
+        | VArray a ->
+            for i in 0 .. a.Data.Length - 1 do
+                a.Data.[i] <-
+                    if code = System.Int32.MinValue then VEmpty
+                    elif code >= 0 then state.Constants.[code]
+                    else newInstance state (-code - 1)
+        | _ -> raiseVbError 13
+        state.Pc <- state.Pc + 1
+
     | CopyUdt ->
         match peek state with
         | VObject o when state.Program.Classes.[o.ClassIndex].IsValueType ->
@@ -554,12 +789,25 @@ let private executeCold (state: VmState) (instr: Instruction) =
     | SetDefault ->
         let value = pop state
         let target = pop state
-        assignDefault target value
-        state.Pc <- state.Pc + 1
+        match target with
+        | VObject o when tryLetDefault state o [||] value -> ()
+        | _ ->
+            assignDefault target value
+            state.Pc <- state.Pc + 1
+
+    | SetMemberIndexed (name, argCount) ->
+        let value = pop state
+        let args = Array.zeroCreate argCount
+        for i in argCount - 1 .. -1 .. 0 do args.[i] <- pop state
+        let receiver = pop state
+        setMemberIndexed state receiver name args value
 
     | NewObj classIdx ->
         let classDef = state.Program.Classes.[classIdx]
         let obj = newInstance state classIdx
+        match obj with
+        | VObject o when Map.containsKey "class_terminate" classDef.Methods -> state.Terminable.Add o
+        | _ -> ()
         // Auto-call Class_Initialize if it exists
         match Map.tryFind "class_initialize" classDef.Methods with
         | Some funcIdx ->
@@ -580,11 +828,7 @@ let private executeCold (state: VmState) (instr: Instruction) =
         | VObject vbObj ->
             let classDef = state.Program.Classes.[vbObj.ClassIndex]
             let key = name.ToLowerInvariant()
-            let callable =
-                match Map.tryFind key classDef.Methods with
-                | Some funcIdx -> Some funcIdx
-                | None -> Map.tryFind key classDef.PropertyGetters
-            match callable with
+            match classCallable classDef key with
             | Some funcIdx ->
                 let funcDef = state.Program.Functions.[funcIdx]
                 let slots = Array.create funcDef.ParamsCount VUndefined
@@ -614,11 +858,14 @@ let private executeCold (state: VmState) (instr: Instruction) =
     | TypeCheck className ->
         let obj = pop state
         match obj with
-        | VObject vbObj -> push state (VBoolean (equalsIgnoreCase vbObj.ClassName className))
+        | VObject vbObj ->
+            let classDef = classOf state vbObj
+            push state (VBoolean (equalsIgnoreCase vbObj.ClassName className || classDef.Implements |> Array.exists (equalsIgnoreCase className)))
         | VHostObject hostObj ->
             let typeName = hostObj.TypeName
             let shortName = match typeName.LastIndexOf '.' with -1 -> typeName | i -> typeName.Substring(i + 1)
-            push state (VBoolean (equalsIgnoreCase typeName className || equalsIgnoreCase shortName className))
+            let classShort = match className.LastIndexOf '.' with -1 -> className | i -> className.Substring(i + 1)
+            push state (VBoolean (equalsIgnoreCase typeName className || equalsIgnoreCase shortName className || equalsIgnoreCase shortName classShort))
         | VNothing -> push state (VBoolean false)
         | _ -> raiseVbError 424
         state.Pc <- state.Pc + 1
@@ -701,6 +948,117 @@ let private executeCold (state: VmState) (instr: Instruction) =
         let description = match text desc with "" -> errorDescription num | d -> d
         raise (VbError { Number = num; Description = description; Source = text source })
 
+    | LineLabel number ->
+        state.CallStack.[state.Csp - 1].LineLabel <- number
+        state.Pc <- state.Pc + 1
+
+    | LoadErl ->
+        push state (VInteger state.LastErl)
+        state.Pc <- state.Pc + 1
+
+    | StopOp ->
+        state.Pc <- state.Pc + 1
+        raise StopSignal
+
+    | EndOp ->
+        state.EndRequested <- true
+        // End does not run Class_Terminate.
+        state.Terminable.Clear()
+        state.Pc <- hostReturnAddress
+
+    | LetGlobal slot ->
+        let value = pop state
+        match state.Globals.[slot] with
+        | (VHostObject _ | VObject _) as current -> letStore state current value (fun v -> state.Globals.[slot] <- v)
+        | _ ->
+            state.Globals.[slot] <- value
+            state.Pc <- state.Pc + 1
+
+    | EventHandlers eventName ->
+        match pop state with
+        | VObject source ->
+            let entries =
+                source.Sinks
+                |> List.rev
+                |> List.choose (fun (binding, sink) ->
+                    match Map.tryFind eventName state.Program.EventBindings.[binding].Handlers with
+                    | Some funcIdx -> Some (VArray { Data = [| VInteger funcIdx; sink |]; LowerBounds = [| 0 |]; Lengths = [| 2 |] })
+                    | None -> None)
+                |> List.toArray
+            push state (VArray { Data = entries; LowerBounds = [| 0 |]; Lengths = [| entries.Length |] })
+        | _ -> push state (VArray { Data = [||]; LowerBounds = [| 0 |]; Lengths = [| 0 |] })
+        state.Pc <- state.Pc + 1
+
+    | CallHandler argCount ->
+        let args = Array.zeroCreate argCount
+        for i in argCount - 1 .. -1 .. 0 do args.[i] <- pop state
+        match pop state with
+        | VArray { Data = [| VInteger funcIdx; sink |] } ->
+            let funcDef = state.Program.Functions.[funcIdx]
+            pushFrameFor state (state.Pc + 1) funcDef.LocalsCount funcIdx
+            let frame = state.CallStack.[state.Csp - 1]
+            let offset =
+                match sink with
+                | VObject _ -> frame.Locals.[0] <- sink; 1
+                | _ -> 0
+            for i in 0 .. funcDef.ParamsCount - 1 do
+                frame.Locals.[i + offset] <-
+                    if i < argCount then
+                        match args.[i] with
+                        | VRef (cells, index) when not funcDef.ByRefParams.[i] -> cells.[index]
+                        | VFieldRef (obj, field) when not funcDef.ByRefParams.[i] -> obj.Fields.[field]
+                        | value -> value
+                    else VUndefined
+            frame.DiscardResult <- true
+            frame.StatementSp <- state.Sp
+            state.Pc <- funcDef.StartPC
+        | _ -> raiseVbErrorWith 51 "Invalid event handler"
+
+    | BindEvents binding ->
+        let sink = pop state
+        let old = pop state
+        let sameSink a b =
+            match a, b with
+            | VObject x, VObject y -> obj.ReferenceEquals(x.Fields, y.Fields)
+            | VObject _, _ | _, VObject _ -> false
+            | _ -> true
+        match old with
+        | VObject o -> o.Sinks <- o.Sinks |> List.filter (fun (b, s) -> not (b = binding && sameSink s sink))
+        | _ -> ()
+        match peek state with
+        | VObject n when not (n.Sinks |> List.exists (fun (b, s) -> b = binding && sameSink s sink)) ->
+            n.Sinks <- (binding, sink) :: n.Sinks
+        | _ -> ()
+        state.Pc <- state.Pc + 1
+
+    | ReleaseCheck ->
+        let old = pop state
+        state.Pc <- state.Pc + 1
+        match old with
+        | VObject o when state.Terminable.Count > 0 && hasTerminate state o -> collectHook state
+        | _ -> ()
+
+    | CallByNameOp argCount ->
+        let args = Array.zeroCreate argCount
+        for i in argCount - 1 .. -1 .. 0 do args.[i] <- ValueSemantics.dereference (pop state)
+        let callType = valueToInt (pop state)
+        let name = valueToString (pop state)
+        let target = ValueSemantics.dereference (pop state)
+        match callType with
+        | 1 | 2 ->
+            push state target
+            for arg in args do push state arg
+            callMethod state name argCount
+        | 4 | 8 ->
+            if argCount = 0 then raiseVbError 449
+            let value = args.[argCount - 1]
+            let indices = args.[.. argCount - 2]
+            // CallByName is an expression: its value is Empty.
+            push state VEmpty
+            if indices.Length = 0 then setMember state target name value (callType = 8)
+            else setMemberIndexed state target name indices value
+        | _ -> raiseVbError 5
+
     | Halt ->
         state.Pc <- hostReturnAddress
     | _ -> raiseVbErrorWith 51 "Unknown opcode"
@@ -749,6 +1107,23 @@ let executeOneInstruction (state: VmState) =
         | _ -> frame.Locals.[slot] <- value
         state.Pc <- state.Pc + 1
 
+    | LetLocal slot ->
+        let value = pop state
+        let frame = state.CallStack.[state.Csp - 1]
+        match frame.Locals.[slot] with
+        | VRef (arr, idx) ->
+            match arr.[idx] with
+            | (VHostObject _ | VObject _) as current -> letStore state current value (fun v -> arr.[idx] <- v)
+            | _ -> arr.[idx] <- value; state.Pc <- state.Pc + 1
+        | VFieldRef (obj, name) ->
+            match obj.Fields.[name] with
+            | (VHostObject _ | VObject _) as current -> letStore state current value (fun v -> obj.Fields.[name] <- v)
+            | _ -> obj.Fields.[name] <- value; state.Pc <- state.Pc + 1
+        | (VHostObject _ | VObject _) as current -> letStore state current value (fun v -> frame.Locals.[slot] <- v)
+        | _ ->
+            frame.Locals.[slot] <- value
+            state.Pc <- state.Pc + 1
+
     | LoadGlobal slot ->
         push state state.Globals.[slot]
         state.Pc <- state.Pc + 1
@@ -784,8 +1159,15 @@ let executeOneInstruction (state: VmState) =
         state.Pc <- state.Pc + 1
 
     | Concat ->
-        let right = ValueSemantics.scalar (pop state)
-        let left = ValueSemantics.scalar (pop state)
+        let right = pop state
+        let left = pop state
+        match left, right with
+        | VString l, VString r ->
+            push state (VString (l + r))
+            state.Pc <- state.Pc + 1
+        | _ ->
+        let right = ValueSemantics.scalar right
+        let left = ValueSemantics.scalar left
         match left, right with
         | VNull, VNull -> push state VNull
         | VNull, r -> push state (VString (valueToString r))
@@ -838,16 +1220,25 @@ let executeOneInstruction (state: VmState) =
             | ArraySet _ -> a.Data.[offset] <- value
             | MakeRefArray _ -> push state (VRef (a.Data, offset))
             | _ -> push state a.Data.[offset]
+            state.Pc <- state.Pc + 1
         | VHostObject hostObj ->
-            let item = hostDefaultCall hostObj (hostArgs indices)
             match opcode with
-            | ArraySet _ -> assignDefault item value
-            | _ -> push state item
+            | ArraySet _ -> hostIndexedAssign hostObj "" (hostArgs indices) value
+            | _ -> push state (hostDefaultCall hostObj (hostArgs indices))
+            state.Pc <- state.Pc + 1
+        | VObject o as target ->
+            match opcode with
+            | ArraySet _ -> indexedAssign state target (hostArgs indices) value
+            | _ ->
+                let dm = (classOf state o).DefaultMember
+                if dm = "" then raiseVbError 438
+                push state target
+                for index in indices do push state (ValueSemantics.dereference index)
+                callMethod state dm rank
         | other ->
             match opcode with
             | ArraySet _ -> objectError other
             | _ -> raiseVbError 13
-        state.Pc <- state.Pc + 1
 
     | Coerce code ->
         match state.Stack.[state.Sp - 1] with
@@ -892,81 +1283,9 @@ let executeOneInstruction (state: VmState) =
     | SetMember (name, isSet) ->
         let value = pop state
         let obj = pop state
-        match obj with
-        | VObject vbObj ->
-            let key = name.ToLowerInvariant()
-            if vbObj.Fields.ContainsKey key then
-                vbObj.Fields.[key] <- value
-                state.Pc <- state.Pc + 1
-            else
-                let classDef = state.Program.Classes.[vbObj.ClassIndex]
-                let handlers = if isSet then classDef.PropertySetters else classDef.PropertyLetters
-                match Map.tryFind key handlers with
-                | Some funcIdx ->
-                    let frame = enterFunction state funcIdx obj (state.Pc + 1)
-                    frame.Locals.[1] <- value
-                    frame.DiscardResult <- true
-                | None -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
-        | VHostObject hostObj ->
-            if not (hostObj.SetMember name (ValueSemantics.dereference value)) then
-                raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
-            state.Pc <- state.Pc + 1
-        | other -> objectError other
+        setMember state obj name value isSet
 
-    | CallMethod (name, argCount) ->
-        if state.Sp < argCount + 1 then raiseVbErrorWith 51 "Stack underflow"
-        let receiver = state.Stack.[state.Sp - argCount - 1]
-        match receiver with
-        | VObject vbObj ->
-            let classDef = state.Program.Classes.[vbObj.ClassIndex]
-            let key = name.ToLowerInvariant()
-            let callable =
-                match Map.tryFind key classDef.Methods with
-                | Some funcIdx -> Some funcIdx
-                | None -> Map.tryFind key classDef.PropertyGetters
-            match callable with
-            | Some funcIdx ->
-                let funcDef = state.Program.Functions.[funcIdx]
-                if argCount > funcDef.ParamsCount then raiseVbError 450
-                pushFrameFor state (state.Pc + 1) funcDef.LocalsCount funcIdx
-                let frame = state.CallStack.[state.Csp - 1]
-                for i in argCount - 1 .. -1 .. 0 do
-                    frame.Locals.[i + 1] <-
-                        match pop state with
-                        | VRef (cells, index) when not funcDef.ByRefParams.[i] -> cells.[index]
-                        | VFieldRef (obj, field) when not funcDef.ByRefParams.[i] -> obj.Fields.[field]
-                        | value -> value
-                ignore (pop state)
-                frame.Locals.[0] <- receiver
-                frame.StatementSp <- state.Sp
-                for i in argCount .. funcDef.ParamsCount - 1 do
-                    frame.Locals.[i + 1] <- VUndefined
-                state.Pc <- funcDef.StartPC
-            | None ->
-                match vbObj.Fields.TryGetValue key with
-                | true, field ->
-                    let args = Array.zeroCreate argCount
-                    for i in argCount - 1 .. -1 .. 0 do args.[i] <- ValueSemantics.dereference (pop state)
-                    ignore (pop state)
-                    push state (if argCount = 0 then field else defaultCall field args)
-                    state.Pc <- state.Pc + 1
-                | false, _ -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
-        | VHostObject hostObj ->
-            let args = Array.zeroCreate argCount
-            for i in argCount - 1 .. -1 .. 0 do
-                args.[i] <- ValueSemantics.dereference (pop state)
-            ignore (pop state)
-            let result =
-                match hostObj.CallMethod name args with
-                | Some value -> value
-                | None ->
-                    match hostObj.GetMember name with
-                    | Some value when argCount = 0 -> value
-                    | Some value -> defaultCall value args
-                    | None -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
-            push state result
-            state.Pc <- state.Pc + 1
-        | other -> objectError other
+    | CallMethod (name, argCount) -> callMethod state name argCount
 
     | CallBuiltin (name, argCount) ->
         let args = Array.zeroCreate argCount
@@ -1015,6 +1334,7 @@ let executeOneInstruction (state: VmState) =
         if frame.HandlerActive then clearError state
         if not frame.DiscardResult then push state retVal
         state.Pc <- frame.ReturnAddress
+        if state.Terminable.Count > 0 && frameHoldsTerminable state frame then collectHook state
 
     | MakeRefLocal slot ->
         let frame = state.CallStack.[state.Csp - 1]
@@ -1119,8 +1439,22 @@ let executeOneInstruction (state: VmState) =
                 ignore (pop state)
                 push state (match v with VHostObject _ -> ValueSemantics.scalar v | _ -> v)
             | None -> ()
-        | _ -> ()
-        state.Pc <- state.Pc + 1
+            state.Pc <- state.Pc + 1
+        | VObject o when (classOf state o).DefaultMember <> "" && not (classOf state o).IsValueType ->
+            // A VB object with a default member: read it (Property Get or method).
+            let classDef = classOf state o
+            match classCallable classDef classDef.DefaultMember with
+            | Some funcIdx ->
+                let target = pop state
+                let frame = enterFunction state funcIdx target (state.Pc + 1)
+                frame.StatementSp <- state.Sp
+                for i in 0 .. state.Program.Functions.[funcIdx].ParamsCount - 1 do frame.Locals.[i + 1] <- VUndefined
+            | _ ->
+                match o.Fields.TryGetValue classDef.DefaultMember with
+                | true, v -> ignore (pop state); push state v
+                | _ -> ()
+                state.Pc <- state.Pc + 1
+        | _ -> state.Pc <- state.Pc + 1
 
     | CallDefault 1 when (match state.Stack.[state.Sp - 2], state.Stack.[state.Sp - 1] with
                           | VArray a, VInteger _ -> a.Lengths.Length = 1
@@ -1139,8 +1473,17 @@ let executeOneInstruction (state: VmState) =
         for i in argCount - 1 .. -1 .. 0 do
             args.[i] <- ValueSemantics.dereference (pop state)
         let target = ValueSemantics.dereference (pop state)
-        push state (defaultCall target args)
-        state.Pc <- state.Pc + 1
+        match target with
+        | VObject o when (classOf state o).DefaultMember <> "" ->
+            push state target
+            for arg in args do push state arg
+            callMethod state (classOf state o).DefaultMember argCount
+        | VObject _ when argCount = 0 ->
+            push state target
+            state.Pc <- state.Pc + 1
+        | _ ->
+            push state (defaultCall target args)
+            state.Pc <- state.Pc + 1
 
     | _ -> executeCold state instr
 
@@ -1176,6 +1519,7 @@ let dispatchError (state: VmState) (ex: exn) =
     state.LastErrorNumber <- info.Number
     state.LastErrorDescription <- info.Description
     state.LastErrorSource <- source
+    state.LastErl <- state.CallStack.[state.Csp - 1].LineLabel
     let mutable handled = false
     while not handled do
         let frame = state.CallStack.[state.Csp - 1]
@@ -1203,30 +1547,177 @@ let cancelledFailure (state: VmState) =
     { Number = 18; Description = errorDescription 18; Source = state.ProjectName
       Line = line; Procedure = procedure; Module = moduleName }
 
+/// Run a VB procedure to its end from inside an instruction (a default
+/// member read during arithmetic, a Class_Terminate) and return its value.
+/// Errors it does not handle propagate as VbError.
+let callNested (state: VmState) (funcIdx: int) (receiver: Value option) (args: Value array) =
+    let savedPc = state.Pc
+    let savedBase = state.BaseCsp
+    let savedCsp = state.Csp
+    let savedSp = state.Sp
+    let funcDef = state.Program.Functions.[funcIdx]
+    pushFrameFor state hostReturnAddress funcDef.LocalsCount funcIdx
+    let frame = state.CallStack.[state.Csp - 1]
+    let offset =
+        match receiver with
+        | Some r -> frame.Locals.[0] <- r; 1
+        | None -> 0
+    for i in 0 .. funcDef.ParamsCount - 1 do
+        frame.Locals.[i + offset] <- if i < args.Length then args.[i] else VUndefined
+    frame.StatementSp <- state.Sp
+    state.BaseCsp <- state.Csp
+    state.Pc <- funcDef.StartPC
+    let unwind () =
+        while state.Csp > savedCsp do ignore (popFrame state)
+        while state.Sp > savedSp do ignore (pop state)
+    try
+        try
+            while state.Pc <> hostReturnAddress && state.Pc < state.Program.Code.Length do
+                try executeOneInstruction state
+                with
+                | StopSignal -> ()
+                | ex -> dispatchError state ex
+            // An End or Quit inside ends the nested call only.
+            let result = if state.Csp = savedCsp && state.Sp > savedSp then pop state else VEmpty
+            unwind ()
+            result
+        with
+        | :? VbRuntimeException as e ->
+            unwind ()
+            raise (VbError { Number = e.Failure.Number; Description = e.Failure.Description; Source = e.Failure.Source })
+    finally
+        state.BaseCsp <- savedBase
+        state.Pc <- savedPc
+
+/// The default member of a VB object (Property Get, method or field), read
+/// for arithmetic, comparison, concatenation and built-in arguments.
+let private objectDefaultOf (state: VmState) (o: VBObject) =
+    let classDef = state.Program.Classes.[o.ClassIndex]
+    if classDef.DefaultMember = "" || classDef.IsValueType then None
+    else
+        match Map.tryFind classDef.DefaultMember classDef.PropertyGetters
+              |> Option.orElse (Map.tryFind classDef.DefaultMember classDef.Methods) with
+        | Some funcIdx -> Some (callNested state funcIdx (Some (VObject o)) [||])
+        | None ->
+            match o.Fields.TryGetValue classDef.DefaultMember with
+            | true, v -> Some v
+            | _ -> None
+
+// ── Class_Terminate ──
+//
+// Objects of classes with a Class_Terminate are registered when created.
+// After a procedure returns holding one, after `Set` overwrites one, and when
+// a run ends, the registered objects that can no longer be reached from the
+// module variables, the stack and the active procedures' locals are
+// terminated, each once.
+
+let private markReachable (state: VmState) =
+    state.MarkEpoch <- state.MarkEpoch + 1
+    let epoch = state.MarkEpoch
+    state.Marks.Clear()
+    let pending = Stack<Value>()
+    let visit (value: Value) =
+        match value with
+        | VObject _ | VArray _ | VRef _ | VFieldRef _ | VHostObject _ -> pending.Push value
+        | _ -> ()
+    let markKey (key: obj) =
+        if state.Marks.ContainsKey key then false
+        else
+            state.Marks.[key] <- epoch
+            true
+    for g in state.Globals do visit g
+    for i in 0 .. state.Sp - 1 do visit state.Stack.[i]
+    for f in 0 .. state.Csp - 1 do
+        let frame = state.CallStack.[f]
+        if not (obj.ReferenceEquals(frame, null)) then
+            for l in frame.Locals do visit l
+    while pending.Count > 0 do
+        match pending.Pop() with
+        | VObject o ->
+            if markKey (box o.Fields) then
+                for kv in o.Fields do visit kv.Value
+                for (_, sink) in o.Sinks do visit sink
+        | VArray a -> if markKey (box a.Data) then for item in a.Data do visit item
+        | VRef (cells, index) -> visit cells.[index]
+        | VFieldRef (o, _) -> visit (VObject o)
+        | VHostObject h ->
+            if markKey (box h) then
+                match box h with
+                | :? Collections.VbCollection as c -> for item in c.Items do visit item
+                | :? Collections.VbDictionary as d ->
+                    for item in d.Keys do visit item
+                    for item in d.Items do visit item
+                | _ -> ()
+        | _ -> ()
+
+let private terminate (state: VmState) (objects: VBObject list) =
+    for o in objects do
+        match Map.tryFind "class_terminate" state.Program.Classes.[o.ClassIndex].Methods with
+        | Some funcIdx -> ignore (callNested state funcIdx (Some (VObject o)) [||])
+        | None -> ()
+
+/// Terminate the registered objects that are no longer reachable.
+let collectUnreachable (state: VmState) =
+    if state.Terminable.Count > 0 then
+        markReachable state
+        let dead = state.Terminable |> Seq.filter (fun o -> not (state.Marks.ContainsKey (box o.Fields))) |> List.ofSeq
+        state.Marks.Clear()
+        if not dead.IsEmpty then
+            let deadSet = HashSet<obj>(HashIdentity.Reference)
+            for o in dead do deadSet.Add(box o.Fields) |> ignore
+            state.Terminable.RemoveAll(fun o -> deadSet.Contains(box o.Fields)) |> ignore
+            terminate state dead
+
+/// End of a run: terminate every object still registered, oldest first.
+/// Errors in Class_Terminate are ignored here.
+let finalizeObjects (state: VmState) =
+    while state.Terminable.Count > 0 do
+        let objects = List.ofSeq state.Terminable
+        state.Terminable.Clear()
+        for o in objects do
+            try terminate state [ o ] with _ -> ()
+
+collectHook <- collectUnreachable
+
 /// Execute at most `budget` instructions. Returns true when the program (or
 /// the host-entered frame) has finished. Raises `VbRuntimeException` for an
-/// unhandled error, including cancellation (error 18).
+/// unhandled error, including cancellation (error 18). A `Stop` ends the
+/// slice early with `Paused` set.
 let runSlice (state: VmState) (budget: int) =
-    let mutable remaining = budget
-    while remaining > 0 && state.Pc < state.Program.Code.Length do
-        if state.CancelRequested then
-            state.CancelRequested <- false
-            raise (VbRuntimeException (cancelledFailure state))
-        let chunk = min remaining 8192
-        let mutable executed = 0
-        try
-            let code = state.Program.Code
-            while executed < chunk && state.Pc < code.Length do
-                executeOneInstruction state
+    let previousDefault = ValueSemantics.objectDefault
+    let hasDefaults = state.Program.Classes |> Array.exists (fun c -> c.DefaultMember <> "")
+    if hasDefaults then ValueSemantics.objectDefault <- objectDefaultOf state
+    try
+        let mutable remaining = budget
+        while remaining > 0 && state.Pc < state.Program.Code.Length do
+            if state.CancelRequested then
+                state.CancelRequested <- false
+                raise (VbRuntimeException (cancelledFailure state))
+            let chunk = min remaining 8192
+            let mutable executed = 0
+            try
+                let code = state.Program.Code
+                while executed < chunk && state.Pc < code.Length do
+                    executeOneInstruction state
+                    executed <- executed + 1
+            with
+            | StopSignal ->
                 executed <- executed + 1
-        with ex ->
-            executed <- executed + 1
-            dispatchError state ex
-        remaining <- remaining - executed
-    state.Pc >= state.Program.Code.Length
+                state.Paused <- true
+                remaining <- 0
+            | ex ->
+                executed <- executed + 1
+                dispatchError state ex
+            remaining <- remaining - executed
+        state.Pc >= state.Program.Code.Length
+    finally
+        if hasDefaults then ValueSemantics.objectDefault <- previousDefault
 
 let run (state: VmState) =
-    while not (runSlice state System.Int32.MaxValue) do ()
+    while not (runSlice state System.Int32.MaxValue) do
+        state.Paused <- false
+    state.Paused <- false
+    if not state.EndRequested then finalizeObjects state
 
 let private setInitialGlobals (state: VmState) (globals: seq<string * Value>) =
     for name, value in globals do

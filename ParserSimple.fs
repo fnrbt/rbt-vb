@@ -186,6 +186,18 @@ let pidentifierOrKeyword : Parser<string> = fun tokens ->
     | head :: _ -> Error (sprintf "Expected identifier or keyword but got %A ('%s')" head.Kind head.Lexeme, head)
     | [] -> Error ("Expected identifier but reached EOF", { Kind = Ast.EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
 
+/// A type or class name, possibly qualified: `Long`, `Scripting.Dictionary`.
+let pqualifiedName : Parser<string> = fun tokens ->
+    match pidentifierOrKeyword tokens with
+    | Success (first, rest) ->
+        let rec loop (name: string) toks =
+            match toks with
+            | { Kind = Dot; PrecedingNewline = false } :: { Kind = (Ast.Identifier | Keyword); Lexeme = part; PrecedingNewline = false } :: tail ->
+                loop (name + "." + part) tail
+            | _ -> Success (name, toks)
+        loop first rest
+    | Error (msg, token) -> Error (msg, token)
+
 let rec pliteral : Parser<Expression> = fun tokens ->
     let num = pnumber
     let str = pstring
@@ -201,7 +213,7 @@ and pprimary : Parser<Expression> = fun tokens ->
     | { Kind = Keyword; Lexeme = lexeme } :: tail ->
         match lexeme.ToLower() with
         | "new" ->
-            match pidentifier tail with
+            match pqualifiedName tail with
             | Success (name, remaining) -> Success (NewExpr name, remaining)
             | Error (msg, token) -> Error (msg, token)
         | "typeof" ->
@@ -219,6 +231,10 @@ and pprimary : Parser<Expression> = fun tokens ->
         Success (numberLiteral lexeme, tail)
     | { Kind = StringLiteral; Lexeme = lexeme } :: tail ->
         Success (Literal (Ast.String lexeme), tail)
+    | { Kind = DateLiteral; Lexeme = lexeme } :: tail ->
+        match DateCore.tryParse lexeme System.DateTime.Now.Year with
+        | Some serial -> Success (Literal (Ast.Date serial), tail)
+        | None -> Error ("Invalid date literal", List.head tokens)
     | { Kind = Ast.Identifier; Lexeme = lexeme } :: tail ->
         Success (Identifier lexeme, tail)
     | { Kind = Dot } :: tail ->
@@ -372,7 +388,7 @@ and pexpression : Parser<Expression> = pimp
 // ── Type reference (VBA) ──
 
 let pTypeRef : Parser<TypeRef> =
-    pidentifier |>> fun name -> { Name = name }
+    pqualifiedName |>> fun name -> { Name = name }
 
 let pDimension : Parser<Expression> = fun tokens ->
     match pexpression tokens with
@@ -406,24 +422,31 @@ let pVarDeclarator (dialect: Dialect) : Parser<VarDeclarator> = fun tokens ->
         | Error (msg, token) -> Error (msg, token)
         | Success (arraySpec, rest) ->
             match dialect, rest with
+            | VBA, { Kind = Keyword; Lexeme = "as" } :: { Kind = Keyword; Lexeme = "new" } :: tail ->
+                match pTypeRef tail with
+                | Success (typeRef, next) ->
+                    Success ({ Name = name; ArraySpec = arraySpec; Type = Some typeRef; IsNew = true }, next)
+                | Error (msg, token) -> Error (msg, token)
             | VBA, { Kind = Keyword; Lexeme = "as" } :: tail ->
                 match pTypeRef tail with
                 | Success (typeRef, next) ->
-                    Success ({ Name = name; ArraySpec = arraySpec; Type = Some typeRef }, next)
+                    Success ({ Name = name; ArraySpec = arraySpec; Type = Some typeRef; IsNew = false }, next)
                 | Error (msg, token) -> Error (msg, token)
-            | _ -> Success ({ Name = name; ArraySpec = arraySpec; Type = None }, rest)
+            | _ -> Success ({ Name = name; ArraySpec = arraySpec; Type = None; IsNew = false }, rest)
 
-let pdim (dialect: Dialect) : Parser<Statement> = fun tokens ->
-    match pkeyword "dim" tokens with
+let pdimWith (keyword: string) (dialect: Dialect) : Parser<Statement> = fun tokens ->
+    match pkeyword keyword tokens with
     | Success (_, remaining) ->
         match remaining with
         | { PrecedingNewline = true } :: _ -> Error ("Expected variable name after Dim", List.head remaining)
         | _ ->
             match sepBy1 (ptoken Comma) (pVarDeclarator dialect) remaining with
             | Success (declarators, remaining2) ->
-                Success (Declaration (None, Dim declarators), remaining2)
+                Success (Declaration (None, (if keyword = "static" then StaticDim declarators else Dim declarators)), remaining2)
             | Error (msg, token) -> Error (msg, token)
     | Error (msg, token) -> Error (msg, token)
+
+let pdim dialect = pdimWith "dim" dialect
 
 let pconst (dialect: Dialect) : Parser<Statement> = fun tokens ->
     match (pkeyword "const" >>. pidentifier) tokens with
@@ -589,6 +612,15 @@ let validateProcModifiers (dialect: Dialect) (kind: ProcKind) (mods: Modifier li
 
 // ── Statement parsers ──
 
+/// `End` on its own (not `End If`, `End Sub`, ...) stops the program.
+let isEndStatement (tokens: Token list) =
+    match tokens with
+    | { Kind = Keyword; Lexeme = "end" } :: next :: _ ->
+        next.Kind = EOF || next.Kind = Colon || next.PrecedingNewline ||
+        (next.Kind = Keyword && next.Lexeme = "else")
+    | [ { Kind = Keyword; Lexeme = "end" } ] -> true
+    | _ -> false
+
 let rec psetStmtFull : Parser<Statement> = fun tokens ->
     match pkeyword "set" tokens with
     | Success (_, remaining) ->
@@ -694,6 +726,10 @@ and pstatements (dialect: Dialect) : Parser<Statement list> = fun tokens ->
         | Error (msg, token) -> Error (msg, token)
         | Success ((), rest) ->
             match rest with
+            | { Kind = Keyword; Lexeme = "end" } :: _ when isEndStatement rest ->
+                match pstatement dialect rest with
+                | Success (stmt, next) -> loop (stmt :: acc) next
+                | Error (msg, token) -> Error (msg, token)
             | { Kind = EOF } :: _
             | { Kind = Keyword; Lexeme = ("end" | "else" | "elseif" | "next" | "wend" | "loop" | "case") } :: _ ->
                 Success (List.rev acc, rest)
@@ -948,7 +984,7 @@ and pOnError (dialect: Dialect) : Parser<Statement> = fun tokens ->
             | { Kind = Operator; Lexeme = "-" } :: { Kind = Number; Lexeme = "1" } :: tail2 ->
                 Success (OnError GoToMinusOne, tail2)
             | _ when dialect = VBA ->
-                match pidentifier tail with
+                match plabelName tail with
                 | Success (label, remaining2) -> Success (OnError (GoToLabel label), remaining2)
                 | Error (msg, token) -> Error (msg, token)
             | head :: _ -> Error ("Expected '0' after 'On Error GoTo' in VBScript", head)
@@ -972,14 +1008,48 @@ and presumeStmt : Parser<Statement> = fun tokens ->
         | { Kind = Keyword; Lexeme = "next"; PrecedingNewline = false } :: tail -> Success (ResumeStmt ResumeNextStatement, tail)
         | { Kind = Number; Lexeme = "0"; PrecedingNewline = false } :: tail -> Success (ResumeStmt ResumeRetry, tail)
         | { Kind = Ast.Identifier; Lexeme = label; PrecedingNewline = false } :: tail -> Success (ResumeStmt (ResumeAtLabel label), tail)
+        | { Kind = Number; Lexeme = label; PrecedingNewline = false } :: tail when label |> Seq.forall System.Char.IsDigit ->
+            Success (ResumeStmt (ResumeAtLabel label), tail)
         | _ -> Success (ResumeStmt ResumeRetry, rest)
     | head :: _ -> Error ("Expected Resume", head)
     | [] -> Error ("Expected Resume", { Kind = EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
 
 and peraseStmt : Parser<Statement> = fun tokens ->
-    match (pkeyword "erase" >>. pidentifier) tokens with
-    | Success (name, remaining) -> Success (EraseStmt name, remaining)
+    match (pkeyword "erase" >>. sepBy1 (ptoken Comma) pidentifier) tokens with
+    | Success (names, remaining) -> Success (EraseStmt names, remaining)
     | Error (msg, token) -> Error (msg, token)
+
+/// A GoTo / GoSub / Resume target: a label or a line number.
+and plabelName : Parser<string> = fun tokens ->
+    match tokens with
+    | { Kind = Number; Lexeme = lexeme } :: tail when lexeme |> Seq.forall System.Char.IsDigit -> Success (lexeme, tail)
+    | _ -> pidentifier tokens
+
+and praiseEventStmt : Parser<Statement> = fun tokens ->
+    match (pkeyword "raiseevent" >>. pidentifier) tokens with
+    | Success (name, ({ Kind = LParen; PrecedingNewline = false } :: _ as rest)) ->
+        match pargList rest with
+        | Success (args, next) -> Success (RaiseEventStmt (name, args), next)
+        | Error (msg, token) -> Error (msg, token)
+    | Success (name, rest) -> Success (RaiseEventStmt (name, []), rest)
+    | Error (msg, token) -> Error (msg, token)
+
+/// `LSet s = value` / `RSet s = value`: assign through a built-in.
+and plsetStmt : Parser<Statement> = fun tokens ->
+    match tokens with
+    | { Kind = Ast.Identifier; Lexeme = keyword } :: rest ->
+        let builtin = keyword.ToLowerInvariant() + ":statement"
+        match ptargetAssignment rest with
+        | Success (Assignment (name, value), next) ->
+            Success (Assignment (name, Ast.Call (Identifier builtin, [ Identifier name; value ])), next)
+        | Success (MemberAssignment (target, memberName, value, false), next) ->
+            Success (MemberAssignment (target, memberName, Ast.Call (Identifier builtin, [ Member (target, memberName); value ]), false), next)
+        | Success (IndexedAssignment (name, indices, value), next) ->
+            Success (IndexedAssignment (name, indices, Ast.Call (Identifier builtin, [ Ast.Call (Identifier name, indices); value ])), next)
+        | Success (_, _) -> Error ("Expected variable after LSet/RSet", List.head rest)
+        | Error (msg, token) -> Error (msg, token)
+    | head :: _ -> Error ("Expected LSet", head)
+    | [] -> Error ("Expected LSet", { Kind = EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
 
 and pcallStmt (dialect: Dialect) : Parser<Statement> = fun tokens ->
     match (pkeyword "call" >>. ppostfix) tokens with
@@ -987,12 +1057,12 @@ and pcallStmt (dialect: Dialect) : Parser<Statement> = fun tokens ->
     | Error (msg, token) -> Error (msg, token)
 
 and pgotoStmt : Parser<Statement> = fun tokens ->
-    match (pkeyword "goto" >>. pidentifier) tokens with
+    match (pkeyword "goto" >>. plabelName) tokens with
     | Success (label, remaining) -> Success (GoToStmt label, remaining)
     | Error (msg, token) -> Error (msg, token)
 
 and pgosubStmt : Parser<Statement> = fun tokens ->
-    match (pkeyword "gosub" >>. pidentifier) tokens with
+    match (pkeyword "gosub" >>. plabelName) tokens with
     | Success (label, remaining) -> Success (GoSubStmt label, remaining)
     | Error (msg, token) -> Error (msg, token)
 
@@ -1005,6 +1075,11 @@ and plabel : Parser<Statement> = fun tokens ->
     match tokens with
     | { Kind = Ast.Identifier; Lexeme = name } :: { Kind = Colon } :: tail ->
         Success (LabelStmt name, tail)
+    // A line number: `10 x = 1`, `20: y = 2`.
+    | { Kind = Number; Lexeme = number } :: tail when number |> Seq.forall System.Char.IsDigit ->
+        match tail with
+        | { Kind = Colon } :: rest -> Success (LabelStmt number, rest)
+        | _ -> Success (LabelStmt number, tail)
     | head :: _ -> Error ("Expected label", head)
     | [] -> Error ("Expected label but reached EOF", { Kind = Ast.EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
 
@@ -1099,6 +1174,9 @@ and pstatementAfterColons (dialect: Dialect) : Parser<Statement> = fun tokens ->
                 | "resume" -> presumeStmt tokens
                 | "redim" -> predim tokens
                 | "dim" -> pdim dialect tokens
+                | "static" -> pdimWith "static" dialect tokens
+                | "raiseevent" -> praiseEventStmt tokens
+                | "end" when isEndStatement tokens -> Success (EndStmt, List.tail tokens)
                 | "const" -> pconst dialect tokens
                 | "set" -> psetStmtFull tokens
                 | "let" -> (pkeyword "let" >>. ptargetAssignment) tokens
@@ -1116,6 +1194,9 @@ and pstatementAfterColons (dialect: Dialect) : Parser<Statement> = fun tokens ->
                 | "return" -> preturnStmt tokens
                 | "public" | "private" | "global" -> pVisibilityDecl dialect tokens
                 | _ -> pexpressionStmt tokens
+            | { Kind = Ast.Identifier; Lexeme = keyword } :: { Kind = Ast.Identifier; PrecedingNewline = false } :: _
+                when (let k = keyword.ToLowerInvariant() in k = "lset" || k = "rset") ->
+                plsetStmt tokens
             | { Kind = Ast.Identifier } :: _
             | { Kind = Dot } :: _ ->
                 (ptargetAssignment

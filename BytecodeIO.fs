@@ -9,7 +9,7 @@ open Values
 open Bytecode
 
 let magic = 0x46_56_42_43   // "FVBC"
-let version = 3
+let version = 4
 
 #if FABLE_COMPILER
 let serialize (_: BytecodeProgram) : byte[] = failwith "bytecode serialization is native-only"
@@ -44,6 +44,9 @@ let private writeValue (w: BinaryWriter) (v: Value) =
     | VEmpty -> w.Write 5uy
     | VNothing -> w.Write 6uy
     | VUndefined -> w.Write 7uy
+    | VDate d -> w.Write 8uy; w.Write d
+    | VCurrency c -> w.Write 9uy; w.Write c
+    | VError e -> w.Write 10uy; w.Write e
     | other -> failwithf "non-constant value in bytecode: %A" other
 
 let private readValue (r: BinaryReader) : Value =
@@ -56,6 +59,9 @@ let private readValue (r: BinaryReader) : Value =
     | 5uy -> VEmpty
     | 6uy -> VNothing
     | 7uy -> VUndefined
+    | 8uy -> VDate (r.ReadDouble())
+    | 9uy -> VCurrency (r.ReadInt64())
+    | 10uy -> VError (r.ReadInt32())
     | t -> failwithf "bad value tag %d" (int t)
 
 // --- Opcode (tag byte + payload) ---
@@ -143,6 +149,19 @@ let private writeOpcode (w: BinaryWriter) (op: Opcode) =
     | ArrayFill n -> t 78; w.Write n
     | ArrayFillNew n -> t 79; w.Write n
     | CallMethodNamed (name, names) -> t 80; w.Write name; w.Write names.Length; (for n in names do w.Write n)
+    | LineLabel n -> t 81; w.Write n
+    | LoadErl -> t 82
+    | StopOp -> t 83
+    | EndOp -> t 84
+    | LetLocal n -> t 85; w.Write n
+    | LetGlobal n -> t 86; w.Write n
+    | SetMemberIndexed (name, n) -> t 87; w.Write name; w.Write n
+    | ArrayReset n -> t 88; w.Write n
+    | EventHandlers name -> t 89; w.Write name
+    | CallHandler n -> t 90; w.Write n
+    | BindEvents n -> t 91; w.Write n
+    | ReleaseCheck -> t 92
+    | CallByNameOp n -> t 93; w.Write n
 
 let private readOpcode (r: BinaryReader) : Opcode =
     let i () = r.ReadInt32()
@@ -233,6 +252,19 @@ let private readOpcode (r: BinaryReader) : Opcode =
         let count = i()
         if count < 0 || count > 1024 then failwith "Invalid argument count"
         CallMethodNamed (name, Array.init count (fun _ -> s()))
+    | 81 -> LineLabel (i())
+    | 82 -> LoadErl
+    | 83 -> StopOp
+    | 84 -> EndOp
+    | 85 -> LetLocal (i())
+    | 86 -> LetGlobal (i())
+    | 87 -> let name = s() in SetMemberIndexed (name, i())
+    | 88 -> ArrayReset (i())
+    | 89 -> EventHandlers (s())
+    | 90 -> CallHandler (i())
+    | 91 -> BindEvents (i())
+    | 92 -> ReleaseCheck
+    | 93 -> CallByNameOp (i())
     | t -> failwithf "bad opcode tag %d" t
 
 let private writeArray (w: BinaryWriter) (writeItem: 'a -> unit) (xs: 'a array) =
@@ -287,8 +319,11 @@ let serialize (prog: BytecodeProgram) : byte[] =
         writeMap w c.PropertyLetters
         writeMap w c.PropertySetters
         w.Write c.IsValueType
-        writeArray w (fun (code: int) -> w.Write code) c.FieldTypes) prog.Classes
+        writeArray w (fun (code: int) -> w.Write code) c.FieldTypes
+        w.Write c.DefaultMember
+        writeArray w (fun (s: string) -> w.Write s) c.Implements) prog.Classes
     writeArray w (fun ((pc: int), (name: string)) -> w.Write pc; w.Write name) prog.ModuleStarts
+    writeArray w (fun (b: EventBinding) -> writeMap w b.Handlers; w.Write b.ClassSink) prog.EventBindings
     w.Flush()
     ms.ToArray()
 
@@ -326,12 +361,16 @@ let deserialize (bytes: byte[]) : BytecodeProgram =
             let setters = readMap r
             let isValueType = r.ReadBoolean()
             let fieldTypes = readArray r (fun () -> r.ReadInt32())
+            let defaultMember = readString r
+            let implements = readArray r (fun () -> readString r)
             { Name = name; Fields = fields; Methods = methods
-              PropertyGetters = getters; PropertyLetters = letters; PropertySetters = setters; IsValueType = isValueType; FieldTypes = fieldTypes })
+              PropertyGetters = getters; PropertyLetters = letters; PropertySetters = setters; IsValueType = isValueType; FieldTypes = fieldTypes
+              DefaultMember = defaultMember; Implements = implements })
     let moduleStarts = readArray r (fun () -> let pc = r.ReadInt32() in pc, readString r)
+    let bindings = readArray r (fun () -> let handlers = readMap r in { Handlers = handlers; ClassSink = r.ReadBoolean() })
     if ms.Position <> ms.Length then failwith "Trailing bytecode data"
     let program = { TextCompare = textCompare; Code = code; Constants = constants; Globals = globals; GlobalNames = globalNames
-                    Functions = functions; Classes = classes; ModuleStarts = moduleStarts }
+                    Functions = functions; Classes = classes; ModuleStarts = moduleStarts; EventBindings = bindings }
     validate program
     program
 #endif

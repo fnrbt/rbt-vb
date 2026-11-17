@@ -17,6 +17,7 @@ type TokenKind =
     | Dot
     | Eq
     | Newline
+    | DateLiteral
     | EOF
 
 type Token = {
@@ -45,6 +46,8 @@ type Literal =
     | Null
     | Empty
     | Nothing
+    /// `#1/31/2024#`: an OLE Automation date.
+    | Date of float
 
 type Visibility = Public | Private | Friend | Global
 
@@ -76,12 +79,16 @@ type VarDeclarator = {
     Name: string
     ArraySpec: ArraySpec option
     Type: TypeRef option         // null in VBS
+    /// `Dim x As New Class`: created on first use.
+    IsNew: bool
 }
 
 type Declaration =
     | Dim of VarDeclarator list
     | Const of string * TypeRef option * Expression
     | ReDim of string * Expression list * bool // name, dimensions, preserve flag
+    /// `Static x As Long` inside a procedure.
+    | StaticDim of VarDeclarator list
 
 type Parameter = {
     Name: string
@@ -127,10 +134,15 @@ type Statement =
     | MemberAssignment of Expression * string * Expression * bool // isSet
     | OnError of OnErrorAction
     | WithStmt of Expression * Statement list
-    | EraseStmt of string
+    | EraseStmt of string list
     | ResumeStmt of ResumeTarget
     /// `target = value` through the default member, e.g. `ws.Range("A1") = 5`.
     | DefaultAssignment of Expression * Expression * bool // isSet
+    | RaiseEventStmt of string * Expression list
+    /// `Stop`: a breakpoint.
+    | StopStmt
+    /// `End`: stop the program and reset module state.
+    | EndStmt
 
 and ResumeTarget =
     | ResumeRetry

@@ -17,6 +17,14 @@ type Value =
     | VFieldRef of VBObject * string
     /// The value of an omitted Optional Variant argument (`IsMissing` is True).
     | VUndefined
+    /// A Date: an OLE Automation date, days since 1899-12-30 with the time of
+    /// day as the fraction (the same serial numbers as Excel's 1900 system
+    /// from 1900-03-01 on). See `DateCore` and `Api.VbDate`.
+    | VDate of float
+    /// A Currency: a 64-bit count of 1/10000 units (CCur(1.5) is VCurrency 15000L).
+    | VCurrency of int64
+    /// An Error value (`CVErr(2042)`, Excel's #N/A); VarType 10.
+    | VError of int
 
 and VBArray = {
     Data: Value array
@@ -28,6 +36,9 @@ and VBObject = {
     ClassName: string
     Fields: Dictionary<string, Value>
     ClassIndex: int
+    /// WithEvents variables bound to this object: (binding index, sink
+    /// object or Empty for a module).
+    mutable Sinks: (int * Value) list
 }
 
 /// An object supplied by the embedding host.
@@ -70,6 +81,12 @@ type HostObject(typeName: string) =
     default this.CallNamed name args _ = this.CallMethod name args
     abstract Enumerate: unit -> Value seq option
     default _.Enumerate () = None
+    /// `obj(args) = value` (name "") and `obj.Name(args) = value` with the
+    /// arguments, for objects whose items are not objects themselves (a
+    /// Dictionary's `d("k") = v`). Return false to fall back to calling
+    /// `CallMethod name args` and assigning the result's default member.
+    abstract SetIndexed: name: string -> args: Value array -> value: Value -> bool
+    default _.SetIndexed _ _ _ = false
     interface IHostObject with
         member _.TypeName = typeName
         member this.GetMember name = this.GetMember name
@@ -115,6 +132,8 @@ let errorDescription number =
     | 449 -> "Argument not optional"
     | 450 -> "Wrong number of arguments or invalid property assignment"
     | 451 -> "Object not a collection"
+    | 457 -> "This key is already associated with an element of this collection"
+    | 32811 -> "Element not found"
     | 1004 -> "Application-defined or object-defined error"
     | _ -> "Application-defined or object-defined error"
 
@@ -133,6 +152,9 @@ type RuntimeHooks = {
     MsgBox: string -> int -> string -> int
     /// `InputBox prompt, title, default`; `None` means Cancel (returns "").
     InputBox: string -> string -> string -> string option
-    /// `CreateObject progId`; `None` raises error 429.
+    /// `CreateObject progId`; `None` raises error 429. The engine serves
+    /// "Scripting.Dictionary" itself and asks this hook for anything else.
     CreateObject: string -> Value option
+    /// `Environ("NAME")`; return "" for an unknown variable.
+    Environ: string -> string
 }

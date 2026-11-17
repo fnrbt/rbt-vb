@@ -94,6 +94,20 @@ type Opcode =
     | ArrayFill of int            // fill Empty elements with constant
     | ArrayFillNew of int         // fill Empty elements with new instances of a class
     | CallMethodNamed of string * string array  // method, argument names ("" = positional)
+    // 0.4.0
+    | LineLabel of int            // a numeric line label was reached (Erl)
+    | LoadErl
+    | StopOp                      // Stop: pause a session
+    | EndOp                       // End: stop and reset module state
+    | LetLocal of int             // Let-store: through the default member when the slot holds an object
+    | LetGlobal of int
+    | SetMemberIndexed of string * int  // obj.Name(args) = value (receiver, args, value)
+    | ArrayReset of int           // Erase a fixed array: >= 0 fill constant, < 0 -(class+1) UDT, MinValue Empty
+    | EventHandlers of string     // receiver -> [| [| handler; sink |] ... |] for RaiseEvent
+    | CallHandler of int          // entry, args -> call an event handler
+    | BindEvents of int           // new, old, sink -> new: WithEvents binding
+    | ReleaseCheck                // a value just overwritten by Set: terminate it when unreachable
+    | CallByNameOp of int         // obj, name, call type, args
 
 type Instruction = {
     Opcode: Opcode
@@ -116,6 +130,13 @@ type FunctionDef = {
     InitialLocals: Value array
 }
 
+/// Handlers of a WithEvents variable: event name -> procedure; ClassSink
+/// when the variable is a field of a class (the handler gets the instance).
+type EventBinding = {
+    Handlers: Map<string, int>
+    ClassSink: bool
+}
+
 type ClassDef = {
     Name: string
     Fields: string array
@@ -127,6 +148,10 @@ type ClassDef = {
     /// Per field: 0 Variant, > 0 a ValueSemantics.DeclaredType code, < 0 a
     /// nested user-defined type -(classIndex + 1).
     FieldTypes: int array
+    /// The default member (lowercase), or "".
+    DefaultMember: string
+    /// Interfaces named by `Implements`.
+    Implements: string array
 }
 
 type BytecodeProgram = {
@@ -139,6 +164,7 @@ type BytecodeProgram = {
     Classes: ClassDef array
     /// Start pc of each module's module-level code in the main region, in order.
     ModuleStarts: (int * string) array
+    EventBindings: EventBinding array
 }
 
 // Structural validation protects the runtime from malformed bytecode; it is not a sandbox.
@@ -151,7 +177,7 @@ let validate (program: BytecodeProgram) =
     let validTarget target = target >= 0 && target < program.Code.Length
     for constant in program.Constants do
         match constant with
-        | VInteger _ | VDouble _ | VString _ | VBoolean _ | VNull | VEmpty | VNothing | VUndefined -> ()
+        | VInteger _ | VDouble _ | VString _ | VBoolean _ | VNull | VEmpty | VNothing | VUndefined | VDate _ | VCurrency _ | VError _ -> ()
         | _ -> failwith "Invalid bytecode: runtime value in constant pool"
     for f in program.Functions do
         check (f.ParamsCount >= 0 && f.LocalsCount > f.ParamsCount && f.LocalsCount <= 1000000) "function locals"
@@ -159,11 +185,12 @@ let validate (program: BytecodeProgram) =
         check (not (isNull f.InitialLocals) && (f.InitialLocals.Length = 0 || f.InitialLocals.Length = f.LocalsCount)) "function initial locals"
         for v in f.InitialLocals do
             match v with
-            | VInteger _ | VDouble _ | VString _ | VBoolean _ | VEmpty | VNothing -> ()
+            | VInteger _ | VDouble _ | VString _ | VBoolean _ | VEmpty | VNothing | VDate _ | VCurrency _ -> ()
             | _ -> failwith "Invalid bytecode: runtime value in initial locals"
     for c in program.Classes do
         check (not (isNull c.FieldTypes) && c.FieldTypes.Length <= c.Fields.Length) "class fields"
         for code in c.FieldTypes do check (code >= -program.Classes.Length && code <= 64) "field type"
+        check (not (isNull c.Implements) && not (isNull c.DefaultMember)) "class metadata"
         for m in [c.Methods; c.PropertyGetters; c.PropertyLetters; c.PropertySetters] do
             for KeyValue(_, index) in m do
                 check (index >= 0 && index < program.Functions.Length) "class member"
@@ -179,7 +206,12 @@ let validate (program: BytecodeProgram) =
         | NewObj i -> check (i >= 0 && i < program.Classes.Length) "class"
         | ArrayNew n | ArrayGet n | ArraySet n | ReDimPreserve n | MakeRefArray n -> check (n > 0 && n <= 32) "array rank"
         | CallMethodNamed (_, names) -> check (not (isNull names) && names.Length <= 1024) "argument count"
-        | CallMethod (_, n) | CallDefault n | CallBuiltin (_, n) -> check (n >= 0 && n <= 1024) "argument count"
+        | CallMethod (_, n) | CallDefault n | CallBuiltin (_, n) | SetMemberIndexed (_, n) | CallHandler n | CallByNameOp n ->
+            check (n >= 0 && n <= 1024) "argument count"
+        | LetGlobal i -> check (i >= 0 && i < program.Globals) "global slot"
+        | LetLocal i -> check (i >= 0 && i < 1000000) "local slot"
+        | BindEvents i -> check (i >= 0 && i < program.EventBindings.Length) "event binding"
+        | ArrayReset i -> check (i = System.Int32.MinValue || (i >= 0 && i < program.Constants.Length) || (i < 0 && -i - 1 < program.Classes.Length)) "array reset"
         | _ -> ()
 
     let starts = program.Functions |> Array.map (fun f -> f.StartPC) |> Array.sort
@@ -190,6 +222,10 @@ let validate (program: BytecodeProgram) =
         | _ -> 0
     for f in program.Functions do
         check (f.StartPC > 0 && f.StartPC < mainStart && f.Code.Length = 0) "function region"
+    check (not (isNull program.EventBindings)) "event bindings"
+    for binding in program.EventBindings do
+        for KeyValue(_, index) in binding.Handlers do
+            check (index >= 0 && index < program.Functions.Length) "event handler"
     for c in program.Classes do
         for m in [c.Methods; c.PropertyGetters; c.PropertyLetters; c.PropertySetters] do
             for KeyValue(_, index) in m do
@@ -201,7 +237,7 @@ let validate (program: BytecodeProgram) =
         if pc = mainStart then current <- None
         match Map.tryFind pc byStart with Some f -> current <- Some f | None -> ()
         match current, program.Code.[pc].Opcode with
-        | Some f, (LoadLocal slot | StoreLocal slot | MakeRefLocal slot) ->
+        | Some f, (LoadLocal slot | StoreLocal slot | MakeRefLocal slot | LetLocal slot) ->
             check (slot < f.LocalsCount) "function local slot"
         | _ -> ()
 

@@ -96,6 +96,28 @@ type CompileContext = {
     mutable TextCompare: bool
     /// `Option Base 1` in the current module.
     mutable OptionBase: int
+    /// `Option Explicit` in the current module: undeclared names are errors.
+    mutable OptionExplicit: bool
+    /// A ReDim may declare its array implicitly.
+    mutable ImplicitAllowed: bool
+    /// `Dim x As New Class`: variable key -> class name (globals and fields).
+    AsNew: Dictionary<string, string>
+    mutable LocalAsNew: Dictionary<string, string>
+    /// Arrays declared with fixed bounds (`Dim a(10)`), for Erase.
+    FixedArrays: HashSet<string>
+    /// Static locals of the current procedure: name -> global key.
+    mutable StaticLocals: Dictionary<string, string>
+    /// Static locals to initialise when the program starts: module, key, declarator.
+    StaticInits: ResizeArray<string * string * VarDeclarator>
+    /// Some class has a Class_Terminate.
+    mutable HasTerminate: bool
+    /// Class name -> declared event names.
+    ClassEvents: Dictionary<string, string list>
+    /// "Scope.variable" -> event binding index.
+    WithEventsVars: Dictionary<string, int>
+    EventBindings: ResizeArray<EventBinding>
+    /// Class name -> default member (from `Attribute X.VB_UserMemId = 0`).
+    DefaultMembers: Dictionary<string, string>
 }
 
 let emptyContext () =
@@ -130,6 +152,18 @@ let emptyContext () =
         CurrentLine = 0
         TextCompare = false
         OptionBase = 0
+        OptionExplicit = false
+        ImplicitAllowed = false
+        AsNew = newNameDictionary ()
+        LocalAsNew = newNameDictionary ()
+        FixedArrays = newNameSet ()
+        StaticLocals = newNameDictionary ()
+        StaticInits = ResizeArray()
+        HasTerminate = false
+        ClassEvents = newNameDictionary ()
+        WithEventsVars = newNameDictionary ()
+        EventBindings = ResizeArray()
+        DefaultMembers = newNameDictionary ()
     }
 
 let private fail (ctx: CompileContext) message : 'a =
@@ -222,7 +256,17 @@ type private VarLoc =
 let private isLocalVariable (ctx: CompileContext) name =
     ctx.InFunction && containsName ctx.Locals name
 
+let private staticKey (ctx: CompileContext) name =
+    if ctx.InFunction then
+        match tryGetName ctx.StaticLocals name with
+        | true, key -> Some key
+        | _ -> None
+    else None
+
 let private resolveVar (ctx: CompileContext) (name: string) (forWrite: bool) =
+    match staticKey ctx name with
+    | Some key -> GlobalLoc (getName ctx.Globals key)
+    | None ->
     if isField ctx name then FieldLoc
     elif isLocalVariable ctx name then LocalLoc (getName ctx.Locals name)
     else
@@ -234,6 +278,8 @@ let private resolveVar (ctx: CompileContext) (name: string) (forWrite: bool) =
                 match (if forWrite then None else Builtins.tryConstant name) with
                 | Some value -> ConstLoc value
                 | None ->
+                    if ctx.OptionExplicit && not ctx.ImplicitAllowed then
+                        fail ctx (sprintf "Variable not defined: %s" name)
                     // Undeclared names in module-level code are module variables,
                     // so they survive into later host calls and snippets.
                     if not ctx.InFunction && ctx.ClassFields.IsNone then GlobalLoc (getGlobalSlot ctx name)
@@ -241,6 +287,9 @@ let private resolveVar (ctx: CompileContext) (name: string) (forWrite: bool) =
 
 /// The declared type name of a variable, if any.
 let private declaredTypeName (ctx: CompileContext) name =
+    match staticKey ctx name with
+    | Some key -> (match tryGetName ctx.GlobalTypes key with | true, t -> Some t | _ -> None)
+    | None ->
     if isField ctx name then None
     elif isLocalVariable ctx name || (containsName ctx.Locals name && (tryResolveGlobal ctx name).IsNone) then
         match tryGetName ctx.LocalTypes name with
@@ -268,7 +317,7 @@ let private emitStoreConversion (ctx: CompileContext) (typeName: string option) 
         | None -> if (udtIndex ctx t).IsSome then emit ctx CopyUdt 0
     | None -> ()
 
-let private emitLoadVar (ctx: CompileContext) name =
+let private emitRawLoad (ctx: CompileContext) name =
     match resolveVar ctx name false with
     | FieldLoc ->
         emit ctx (LoadLocal 0) 0
@@ -276,6 +325,62 @@ let private emitLoadVar (ctx: CompileContext) name =
     | GlobalLoc slot -> emit ctx (LoadGlobal slot) 0
     | LocalLoc slot -> emit ctx (LoadLocal slot) 0
     | ConstLoc value -> emitConst ctx value
+
+/// The class of a `Dim x As New Class` variable.
+let private asNewClass (ctx: CompileContext) name =
+    let lookup (d: Dictionary<string, string>) key = match tryGetName d key with | true, c -> Some c | _ -> None
+    match staticKey ctx name with
+    | Some key -> lookup ctx.AsNew key
+    | None ->
+    if isField ctx name then
+        match ctx.ClassName with
+        | Some className -> lookup ctx.AsNew (className + "." + name)
+        | None -> None
+    elif isLocalVariable ctx name then lookup ctx.LocalAsNew name
+    elif ctx.InFunction && containsName ctx.Locals name then None
+    else
+        if ctx.ModuleName <> "" && containsName ctx.Globals (privateKey ctx.ModuleName name) then lookup ctx.AsNew (privateKey ctx.ModuleName name)
+        else lookup ctx.AsNew name
+
+/// `New Class` for VB classes and the built-in Collection and Dictionary.
+let private emitNew (ctx: CompileContext) (className: string) =
+    match tryGetName ctx.ClassIndex className with
+    | true, idx -> emit ctx (NewObj idx) 0
+    | false, _ when Collections.isBuiltinClass className ->
+        emitConst ctx (VString className)
+        emit ctx (CallBuiltin ("new:builtin", 1)) 0
+    | false, _ -> fail ctx (sprintf "User-defined type not defined: %s" className)
+
+let rec private storeRawWith (ctx: CompileContext) name =
+    match resolveVar ctx name true with
+    | FieldLoc ->
+        let temp = ctx.NextLocalSlot
+        ctx.NextLocalSlot <- temp + 1
+        emit ctx (StoreLocal temp) 0
+        emit ctx (LoadLocal 0) 0
+        emit ctx (LoadLocal temp) 0
+        emit ctx (SetMember (name, false)) 0
+    | GlobalLoc slot -> emit ctx (StoreGlobal slot) 0
+    | LocalLoc slot -> emit ctx (StoreLocal slot) 0
+    | ConstLoc _ -> ()
+
+/// Create a `Dim x As New Class` object on first use.
+let private emitEnsureNew (ctx: CompileContext) name =
+    match asNewClass ctx name with
+    | Some className ->
+        emitRawLoad ctx name
+        emitConst ctx VNothing
+        emit ctx IsOp 0
+        let skip = ctx.Instructions.Count
+        emit ctx (JumpIfFalse -1) 0
+        emitNew ctx className
+        storeRawWith ctx name
+        patchJump ctx skip (JumpIfFalse ctx.Instructions.Count)
+    | None -> ()
+
+let private emitLoadVar (ctx: CompileContext) name =
+    emitEnsureNew ctx name
+    emitRawLoad ctx name
 
 /// Store the value on top of the stack into a variable.
 let private storeName (ctx: CompileContext) name =
@@ -313,7 +418,7 @@ let private emitRaise (ctx: CompileContext) number (description: string) =
     emit ctx RaiseErr 0
 
 let private isVariableName (ctx: CompileContext) name =
-    isField ctx name || containsName ctx.Locals name || (tryResolveGlobal ctx name).IsSome
+    (staticKey ctx name).IsSome || isField ctx name || containsName ctx.Locals name || (tryResolveGlobal ctx name).IsSome
 
 let private isModuleName (ctx: CompileContext) name =
     containsSetName ctx.ModuleNames name && not (isVariableName ctx name)
@@ -336,7 +441,7 @@ let rec private mayBeObject (ctx: CompileContext) expr =
     | Ast.Call (Identifier name, _) when not (isVariableName ctx name) && (tryResolveFunction ctx name).IsNone ->
         // Builtins return scalars, except CreateObject/GetObject.
         match normalizeName name with
-        | "createobject" | "getobject" -> true
+        | "createobject" | "getobject" | "iif" | "choose" | "switch" | "callbyname" | "cvar" -> true
         | _ -> false
     | _ -> true
 
@@ -348,6 +453,7 @@ let private staticType (ctx: CompileContext) expr =
     | Literal (Double _) -> Some [ ValueSemantics.DeclaredType.Double ]
     | Literal (String _) -> Some [ ValueSemantics.DeclaredType.String ]
     | Literal (Boolean _) -> Some [ ValueSemantics.DeclaredType.Boolean ]
+    | Literal (Date _) -> Some [ ValueSemantics.DeclaredType.Date ]
     | Identifier name ->
         declaredTypeName ctx name |> Option.bind ValueSemantics.declaredTypeOf |> Option.map List.singleton
     | _ -> None
@@ -360,6 +466,7 @@ let rec private emitRefArgument (ctx: CompileContext) (arg: Expression) (compile
         emit ctx (LoadLocal 0) 0
         emit ctx (MakeRefMember varName) 0
     | Identifier varName when isVariableName ctx varName && not ((tryResolveFunction ctx varName).IsSome && not (isLocalVariable ctx varName) && (tryResolveGlobal ctx varName).IsNone) ->
+        emitEnsureNew ctx varName
         match resolveVar ctx varName true with
         | GlobalLoc slot -> emit ctx (MakeRefGlobal slot) 0
         | LocalLoc slot -> emit ctx (MakeRefLocal slot) 0
@@ -516,7 +623,12 @@ let rec compileExpression (ctx: CompileContext) (expr: Expression) =
     | Literal Null -> emit ctx LoadNull 0
     | Literal Empty -> emit ctx LoadEmpty 0
     | Literal Nothing -> emitConst ctx VNothing
+    | Literal (Date d) -> emitConst ctx (VDate d)
     | Identifier name when isErrName ctx name -> emit ctx LoadErrObject 0
+    | Identifier name when normalizeName name = "erl" && not (isVariableName ctx name) && (tryResolveFunction ctx name).IsNone ->
+        emit ctx LoadErl 0
+    | Identifier name when Builtins.isArgumentlessBuiltin name && not (isVariableName ctx name) && (tryResolveFunction ctx name).IsNone ->
+        emit ctx (CallBuiltin (normalizeName name, 0)) 0
     | Identifier name when not (isVariableName ctx name) && (tryResolveFunction ctx name).IsSome ->
         // A parameterless function used as a value.
         emitCall ctx name [] compileExpression
@@ -534,6 +646,19 @@ let rec compileExpression (ctx: CompileContext) (expr: Expression) =
     | Ast.Call (Identifier name, args) when
         (match ctx.ClassName with Some className -> containsName ctx.FunctionIndex (className + "." + name) | None -> false) ->
         compileExpression ctx (Ast.Call (Member (MeExpr, name), args))
+    | Ast.Call (Identifier name, args) when normalizeName name = "erl" && args.IsEmpty && not (isVariableName ctx name) && (tryResolveFunction ctx name).IsNone ->
+        emit ctx LoadErl 0
+    | Ast.Call (Identifier name, args) when normalizeName name = "callbyname" && not (isVariableName ctx name) && (tryResolveFunction ctx name).IsNone ->
+        match args with
+        | target :: procName :: callType :: rest ->
+            compileExpression ctx target
+            compileExpression ctx procName
+            compileExpression ctx callType
+            emitArguments ctx rest compileExpression
+            emit ctx (CallByNameOp rest.Length) 0
+        | _ ->
+            emitRaise ctx 449 (errorDescription 449)
+            emit ctx LoadEmpty 0
     | Ast.Call (Identifier name, args) when isField ctx name ->
         emit ctx (LoadLocal 0) 0
         emit ctx (GetMember name) 0
@@ -610,10 +735,7 @@ let rec compileExpression (ctx: CompileContext) (expr: Expression) =
     | TypeOfIs (expr, className) ->
         compileExpression ctx expr
         emit ctx (TypeCheck className) 0
-    | NewExpr className ->
-        match tryGetName ctx.ClassIndex className with
-        | true, idx -> emit ctx (NewObj idx) 0
-        | false, _ -> fail ctx (sprintf "User-defined type not defined: %s" className)
+    | NewExpr className -> emitNew ctx className
     | WithDotExpr ->
         match ctx.WithTargetSlot with
         | Some slot -> emit ctx (LoadLocal slot) 0
@@ -706,6 +828,49 @@ let private emitDimensions (ctx: CompileContext) (dimensions: Expression list) =
         | ArrayBound (lo, hi) -> compileExpression ctx lo; compileExpression ctx hi
         | upper -> emitConst ctx (VInteger ctx.OptionBase); compileExpression ctx upper
 
+/// `Let`-assignments to Variant and object variables go through the
+/// default member when the variable holds an object (`r = 5` with r a Range).
+let private letsThroughObject (ctx: CompileContext) name =
+    match declaredTypeName ctx name with
+    | None -> true
+    | Some t ->
+        match ValueSemantics.declaredTypeOf t with
+        | Some dt -> dt = ValueSemantics.DeclaredType.Object
+        | None -> (udtIndex ctx t).IsNone
+
+/// The statement assigning `value` to an assignable expression.
+let private assignmentTo (ctx: CompileContext) (target: Expression) (value: Expression) =
+    match target with
+    | Identifier name -> Assignment (name, value)
+    | Ast.Call (Identifier name, indices) -> IndexedAssignment (name, indices, value)
+    | Member (receiver, name) -> MemberAssignment (receiver, name, value, false)
+    | Ast.Call (Member _, _) -> DefaultAssignment (target, value, false)
+    | Parenthesized inner -> DefaultAssignment (inner, value, false)
+    | _ -> fail ctx "Expected a variable"
+
+let private eventScope (ctx: CompileContext) =
+    match ctx.ClassFields, ctx.ClassName with
+    | Some _, Some className -> className
+    | _ -> ctx.ModuleName
+
+let private tryEventBinding (ctx: CompileContext) name =
+    match tryGetName ctx.WithEventsVars (eventScope ctx + "." + name) with
+    | true, index -> Some index
+    | _ -> None
+
+let private emitArrayReset (ctx: CompileContext) (typeName: string option) =
+    let code =
+        match typeName with
+        | Some t ->
+            match ValueSemantics.declaredTypeOf t with
+            | Some dt -> addConstant ctx (ValueSemantics.defaultOf dt)
+            | None ->
+                match udtIndex ctx t with
+                | Some idx -> -(idx + 1)
+                | None -> System.Int32.MinValue
+        | None -> System.Int32.MinValue
+    emit ctx (ArrayReset code) 0
+
 let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
     match stmt with
     | LocatedStmt (line, inner) ->
@@ -724,13 +889,32 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
         match ctx.ReturnSlotName with
         | Some returnName when normalizeName returnName = normalizeName name && ctx.InFunction ->
             compileTypedValue ctx expr name
+        | _ when (normalizeName name = "date" || normalizeName name = "time") && not (isVariableName ctx name) ->
+            // Setting the system date or time is ignored.
+            compileExpression ctx expr
+            emit ctx Pop 0
         | _ ->
         match resolveVar ctx name true with
         | FieldLoc ->
             emit ctx (LoadLocal 0) 0
             compileLetValue ctx expr false
             emit ctx (SetMember (name, false)) 0
+        | GlobalLoc slot when letsThroughObject ctx name ->
+            emitEnsureNew ctx name
+            compileLetValue ctx expr false
+            emit ctx (LetGlobal slot) 0
+        | LocalLoc slot when letsThroughObject ctx name ->
+            emitEnsureNew ctx name
+            compileLetValue ctx expr false
+            emit ctx (LetLocal slot) 0
         | _ -> compileTypedValue ctx expr name
+
+    | IndexedAssignment (name, (target :: start :: rest as args), valueExpr)
+        when normalizeName name = "mid" && not (isVariableName ctx name) && (tryResolveFunction ctx name).IsNone ->
+        // Mid(target, start[, length]) = value
+        let length = match rest with [ l ] -> l | _ -> MissingArg
+        ignore args
+        compileStatement ctx (assignmentTo ctx target (Ast.Call (Identifier "mid:statement", [ target; start; length; valueExpr ])))
 
     | IndexedAssignment (name, indices, valueExpr) ->
         emitLoadVar ctx name
@@ -740,6 +924,14 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
         compileLetValue ctx valueExpr converts
         emitStoreConversion ctx elementType
         emit ctx (ArraySet indices.Length) 0
+
+    | DefaultAssignment (Ast.Call (Member (receiver, memberName), args), valueExpr, isSet)
+        when not (match receiver with Identifier n -> isErrName ctx n || isModuleName ctx n | _ -> false) && not (hasNamed args) ->
+        // obj.Name(args) = value: Property Let with arguments, or the item's default member.
+        compileExpression ctx receiver
+        emitArguments ctx args compileExpression
+        if isSet then compileExpression ctx valueExpr else compileLetValue ctx valueExpr false
+        emit ctx (SetMemberIndexed (memberName, args.Length)) 0
 
     | DefaultAssignment (target, valueExpr, isSet) ->
         compileExpression ctx target
@@ -765,18 +957,37 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
             emit ctx (SetMember (memberName, isSet)) 0
 
     | Ast.Set (name, expr) ->
+        let binding = tryEventBinding ctx name
+        // The old value, for Class_Terminate once it is unreachable.
+        if ctx.HasTerminate then emitRawLoad ctx name
+        let bindEvents () =
+            match binding with
+            | Some index ->
+                emitRawLoad ctx name
+                if ctx.EventBindings.[index].ClassSink then emit ctx (LoadLocal 0) 0 else emit ctx LoadEmpty 0
+                emit ctx (BindEvents index) 0
+            | None -> ()
         match resolveVar ctx name true with
         | FieldLoc ->
             emit ctx (LoadLocal 0) 0
             compileExpression ctx expr
+            bindEvents ()
             emit ctx (SetMember (name, true)) 0
         | _ ->
             compileExpression ctx expr
+            bindEvents ()
             storeRaw ctx name
+        if ctx.HasTerminate then emit ctx ReleaseCheck 0
 
+    | Declaration (_, StaticDim declarators) when ctx.InFunction ->
+        // Initialised once, when the program starts.
+        ignore declarators
+    | Declaration (vis, StaticDim declarators) -> compileStatement ctx (Declaration (vis, Dim declarators))
     | Declaration (_, Dim declarators) ->
         for d in declarators do
+          if (staticKey ctx d.Name).IsNone then
             let typeName = d.Type |> Option.map (fun t -> t.Name)
+            let moduleLevel = not ctx.InFunction && ctx.ClassFields.IsNone
             match d.ArraySpec with
             | Some spec when not spec.Dimensions.IsEmpty ->
                 emitDimensions ctx spec.Dimensions
@@ -784,11 +995,21 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
                 emitArrayFill ctx typeName
                 storeRaw ctx d.Name
                 addSetName ctx.ArrayVars d.Name |> ignore
-            | Some _ -> addSetName ctx.ArrayVars d.Name |> ignore
+                addSetName ctx.FixedArrays d.Name |> ignore
+            | Some _ ->
+                addSetName ctx.ArrayVars d.Name |> ignore
+                // `Dim a()` is an array without elements (IsArray is True).
+                if moduleLevel then
+                    emit ctx (CallBuiltin ("array:unallocated", 0)) 0
+                    storeRaw ctx d.Name
             | None ->
                 // Procedure-level declarations are initialised in the prologue;
                 // module-level ones once, here.
-                if not ctx.InFunction && ctx.ClassFields.IsNone then
+                if moduleLevel then
+                    if d.IsNew then
+                        emitConst ctx VNothing
+                        storeRaw ctx d.Name
+                    else
                     match typeName with
                     | Some t -> if emitTypedInitial ctx t then storeRaw ctx d.Name
                     | None -> ()
@@ -798,11 +1019,13 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
         storeRaw ctx name
 
     | Declaration (_, ReDim (name, dimensions, preserve)) ->
+        ctx.ImplicitAllowed <- true
         if preserve then emitLoadVar ctx name
         emitDimensions ctx dimensions
         emit ctx (if preserve then ReDimPreserve dimensions.Length else ArrayNew dimensions.Length) 0
         emitArrayFill ctx (declaredTypeName ctx name)
         storeRaw ctx name
+        ctx.ImplicitAllowed <- false
         addSetName ctx.ArrayVars name |> ignore
 
     | IfStmt (condition, thenStmts, elseIfs, elseStmtsOpt) ->
@@ -989,6 +1212,8 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
             emit ctx Return 0
         | None -> emit ctx Halt 0
 
+    | CallStmt (Identifier name, []) when normalizeName name = "stop" && not (isVariableName ctx name) && (tryResolveFunction ctx name).IsNone ->
+        emit ctx StopOp 0
     | CallStmt (Identifier name, args) ->
         compileExpression ctx (Ast.Call (Identifier name, args))
         emit ctx Pop 0
@@ -1008,7 +1233,10 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
 
     | ReturnStmt -> emit ctx ReturnSub 0
 
-    | LabelStmt label -> setName ctx.Labels label ctx.Instructions.Count
+    | LabelStmt label ->
+        setName ctx.Labels label ctx.Instructions.Count
+        if label.Length > 0 && label.Length < 10 && Seq.forall System.Char.IsDigit label then
+            emit ctx (LineLabel (int label)) 0
 
     | OnError ResumeNext -> emit ctx OnErrorResumeNext 0
     | OnError GoToZero -> emit ctx OnErrorGoToZero 0
@@ -1034,10 +1262,47 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
         for stmt in body do compileStatement ctx stmt
         ctx.WithTargetSlot <- outerWith
 
-    | EraseStmt name ->
-        emit ctx LoadEmpty 0
-        storeRaw ctx name
-        ctx.ArrayVars.Remove(normalizeName name) |> ignore
+    | EraseStmt names ->
+        for name in names do
+            if containsSetName ctx.FixedArrays name then
+                // A fixed-size array keeps its bounds; its elements are reset.
+                emitLoadVar ctx name
+                emitArrayReset ctx (declaredTypeName ctx name)
+            else
+                // A dynamic array is deallocated.
+                emit ctx (CallBuiltin ("array:unallocated", 0)) 0
+                storeRaw ctx name
+
+    | StopStmt -> emit ctx StopOp 0
+    | EndStmt -> emit ctx EndOp 0
+
+    | RaiseEventStmt (eventName, args) ->
+        if ctx.ClassFields.IsNone then fail ctx "RaiseEvent is only valid in a class module"
+        let handlers = freshLocal ctx
+        let index = freshLocal ctx
+        emit ctx (LoadLocal 0) 0
+        emit ctx (EventHandlers (normalizeName eventName)) 0
+        emit ctx (StoreLocal handlers) 0
+        emitConst ctx (VInteger 0)
+        emit ctx (StoreLocal index) 0
+        let loopStart = ctx.Instructions.Count
+        emit ctx (LoadLocal index) 0
+        emit ctx (LoadLocal handlers) 0
+        emit ctx ArrayLength 0
+        emit ctx GreaterEqual 0
+        let exitJump = ctx.Instructions.Count
+        emit ctx (JumpIfTrue -1) 0
+        emit ctx (LoadLocal handlers) 0
+        emit ctx (LoadLocal index) 0
+        emit ctx ArrayGetFlat 0
+        for arg in args do emitRefArgument ctx arg compileExpression
+        emit ctx (CallHandler args.Length) 0
+        emit ctx (LoadLocal index) 0
+        emitConst ctx (VInteger 1)
+        emit ctx Add 0
+        emit ctx (StoreLocal index) 0
+        emit ctx (Jump loopStart) 0
+        patchJump ctx exitJump (JumpIfTrue ctx.Instructions.Count)
 
 let patchLabels (ctx: CompileContext) =
     for (label, pc) in ctx.LabelPatches do
@@ -1055,10 +1320,13 @@ let patchLabels (ctx: CompileContext) =
         | false, _ ->
             raise (CompileFailure (sprintf "Label not defined: %s" label, ctx.Instructions.[pc].LineNumber, ctx.ModuleName))
 
+let mutable private visitStatic : VarDeclarator -> unit = ignore
+
 let rec private collectDeclarations (stmt: Statement) (visit: VarDeclarator -> unit) (visitConst: string -> unit) =
     match stmt with
     | LocatedStmt (_, inner) -> collectDeclarations inner visit visitConst
     | Declaration (_, Dim ds) -> for d in ds do visit d
+    | Declaration (_, StaticDim ds) -> for d in ds do visitStatic d
     | Declaration (_, Const (n, _, _)) -> visitConst n
     | IfStmt (_, yes, alternatives, no) ->
         for stmt in yes do collectDeclarations stmt visit visitConst
@@ -1079,8 +1347,12 @@ let rec private collectDeclarations (stmt: Statement) (visit: VarDeclarator -> u
             | None -> ()
     | _ -> ()
 
-let compileFunctionBody (ctx: CompileContext) (name: string) (returnName: string) (paramList: Parameter list) (returnType: TypeRef option) (body: Statement list) =
+let compileFunctionBodyWith (ctx: CompileContext) (isStatic: bool) (name: string) (returnName: string) (paramList: Parameter list) (returnType: TypeRef option) (body: Statement list) =
     let outerLocals = copyNameDictionary ctx.Locals
+    let outerStatics = ctx.StaticLocals
+    let outerAsNew = ctx.LocalAsNew
+    ctx.StaticLocals <- newNameDictionary ()
+    ctx.LocalAsNew <- newNameDictionary ()
     let outerNextLocal = ctx.NextLocalSlot
     let outerReturnSlot = ctx.ReturnSlotName
     let outerClassFields = ctx.ClassFields
@@ -1114,13 +1386,38 @@ let compileFunctionBody (ctx: CompileContext) (name: string) (returnName: string
     | Some t -> setName ctx.LocalTypes returnName t.Name
     | None -> ()
     let declared = ResizeArray<VarDeclarator>()
+    // Static locals live in hidden module variables named "Proc#name".
+    let declareStatic (d: VarDeclarator) =
+        let key = name + "#" + d.Name
+        if not (containsName ctx.Globals key) then
+            ignore (getGlobalSlot ctx key)
+            match d.Type with
+            | Some t -> setName ctx.GlobalTypes key t.Name
+            | None -> ()
+            if d.IsNew then (match d.Type with Some t -> setName ctx.AsNew key t.Name | None -> ())
+            ctx.StaticInits.Add((ctx.ModuleName, key, d))
+        setName ctx.StaticLocals d.Name key
+        match d.ArraySpec with
+        | Some spec ->
+            addSetName ctx.ArrayVars d.Name |> ignore
+            if not spec.Dimensions.IsEmpty then addSetName ctx.FixedArrays d.Name |> ignore
+        | None -> ()
+    let outerVisit = visitStatic
+    visitStatic <- declareStatic
     for stmt in body do
         collectDeclarations stmt (fun d ->
+            if isStatic then declareStatic d
+            else
             ignore (getLocalSlot ctx d.Name)
             declared.Add d
+            if d.IsNew then (match d.Type with Some t -> setName ctx.LocalAsNew d.Name t.Name | None -> ())
+            match d.ArraySpec with
+            | Some spec when not spec.Dimensions.IsEmpty -> addSetName ctx.FixedArrays d.Name |> ignore
+            | _ -> ()
             match d.Type, d.ArraySpec with
             | Some t, _ -> setName ctx.LocalTypes d.Name t.Name
             | _ -> ()) (fun n -> ignore (getLocalSlot ctx n))
+    visitStatic <- outerVisit
 
     let funcIndex = getName ctx.FunctionIndex name
     let startPc = ctx.Instructions.Count
@@ -1153,7 +1450,11 @@ let compileFunctionBody (ctx: CompileContext) (name: string) (returnName: string
     | _ -> ()
     for d in declared do
         match d.Type, d.ArraySpec with
+        | Some _, None when d.IsNew -> initial.[getName ctx.Locals d.Name] <- VNothing
         | Some t, None -> initialise (getName ctx.Locals d.Name) t.Name
+        | _, Some spec when spec.Dimensions.IsEmpty ->
+            emit ctx (CallBuiltin ("array:unallocated", 0)) line
+            emit ctx (StoreLocal (getName ctx.Locals d.Name)) line
         | _ -> ()
 
     for stmt in body do
@@ -1168,6 +1469,8 @@ let compileFunctionBody (ctx: CompileContext) (name: string) (returnName: string
     let localCount = ctx.NextLocalSlot
 
     ctx.Locals <- outerLocals
+    ctx.StaticLocals <- outerStatics
+    ctx.LocalAsNew <- outerAsNew
     ctx.LocalTypes <- outerTypes
     ctx.NextLocalSlot <- outerNextLocal
     ctx.ReturnSlotName <- outerReturnSlot
@@ -1196,6 +1499,9 @@ let compileFunctionBody (ctx: CompileContext) (name: string) (returnName: string
                 for kv in initial do template.[kv.Key] <- kv.Value
                 template
     }
+
+let compileFunctionBody (ctx: CompileContext) (name: string) (returnName: string) (paramList: Parameter list) (returnType: TypeRef option) (body: Statement list) =
+    compileFunctionBodyWith ctx false name returnName paramList returnType body
 
 let private registerFunction (ctx: CompileContext) name (parameters: Parameter list) =
     if containsName ctx.FunctionIndex name then fail ctx (sprintf "Ambiguous name detected: %s" name)
@@ -1241,14 +1547,16 @@ let private registerDeclarations (ctx: CompileContext) (kind: ModuleKind) (tops:
             if containsName ctx.ClassIndex name then fail ctx (sprintf "Ambiguous name detected: %s" name)
             setName ctx.ClassIndex name ctx.Classes.Count
             ctx.Classes.Add({ Name = name; Fields = [||]; Methods = Map.empty; PropertyGetters = Map.empty; PropertyLetters = Map.empty
-                              PropertySetters = Map.empty; IsValueType = false; FieldTypes = [||] })
+                              PropertySetters = Map.empty; IsValueType = false; FieldTypes = [||]; DefaultMember = ""; Implements = [||] })
             for memberDecl in members do
                 match memberDecl with FunctionDef f -> register (name + ".") f | _ -> ()
+            let events = members |> List.choose (function EventDecl (_, eventName, _) -> Some eventName | _ -> None)
+            if not events.IsEmpty then setName ctx.ClassEvents name events
         | TypeDecl (_, name, _) ->
             if containsName ctx.ClassIndex name then fail ctx (sprintf "Ambiguous name detected: %s" name)
             setName ctx.ClassIndex name ctx.Classes.Count
             ctx.Classes.Add({ Name = name; Fields = [||]; Methods = Map.empty; PropertyGetters = Map.empty; PropertyLetters = Map.empty
-                              PropertySetters = Map.empty; IsValueType = true; FieldTypes = [||] })
+                              PropertySetters = Map.empty; IsValueType = true; FieldTypes = [||]; DefaultMember = ""; Implements = [||] })
         | _ -> ()
 
 let private fieldTypeCode (ctx: CompileContext) (typeName: string option) =
@@ -1279,11 +1587,11 @@ let rec compileFunctions (ctx: CompileContext) (topLevel: TopLevel) =
     match topLevel with
     | FunctionDef func ->
         match func with
-        | FunctionDecl (_, name, paramList, returnType, body) -> compileFunctionBody ctx (key name) name paramList returnType body
-        | SubDecl (_, name, paramList, body) -> compileFunctionBody ctx (key name) name paramList None body
-        | PropertyGet (_, name, paramList, returnType, body) -> compileFunctionBody ctx (key (name + "_get")) name paramList returnType body
-        | PropertyLet (_, name, paramList, body) -> compileFunctionBody ctx (key (name + "_let")) name paramList None body
-        | PropertySet (_, name, paramList, body) -> compileFunctionBody ctx (key (name + "_set")) name paramList None body
+        | FunctionDecl (mods, name, paramList, returnType, body) -> compileFunctionBodyWith ctx (List.contains StaticMod mods) (key name) name paramList returnType body
+        | SubDecl (mods, name, paramList, body) -> compileFunctionBodyWith ctx (List.contains StaticMod mods) (key name) name paramList None body
+        | PropertyGet (mods, name, paramList, returnType, body) -> compileFunctionBodyWith ctx (List.contains StaticMod mods) (key (name + "_get")) name paramList returnType body
+        | PropertyLet (mods, name, paramList, body) -> compileFunctionBodyWith ctx (List.contains StaticMod mods) (key (name + "_let")) name paramList None body
+        | PropertySet (mods, name, paramList, body) -> compileFunctionBodyWith ctx (List.contains StaticMod mods) (key (name + "_set")) name paramList None body
     | ClassDecl (_, className, members) ->
         let outerClassFields = ctx.ClassFields
         let outerClassName = ctx.ClassName
@@ -1300,7 +1608,13 @@ let rec compileFunctions (ctx: CompileContext) (topLevel: TopLevel) =
             | TopLevelStatement (LocatedStmt (_, Declaration (_, Dim declarators)))
             | TopLevelStatement (Declaration (_, Dim declarators)) ->
                 for d in declarators do
-                    fields <- (d.Name, (match d.ArraySpec with Some _ -> None | None -> d.Type |> Option.map (fun t -> t.Name))) :: fields
+                    let fieldType =
+                        match d.ArraySpec with
+                        | Some _ -> None
+                        | None -> if d.IsNew then Some "Object" else d.Type |> Option.map (fun t -> t.Name)
+                    fields <- (d.Name, fieldType) :: fields
+                    if d.IsNew then (match d.Type with Some t -> setName ctx.AsNew (className + "." + d.Name) t.Name | None -> ())
+            | WithEventsDecl (_, name, _) -> fields <- (name, Some "Object") :: fields
             | _ -> ()
 
         let fieldSet = newNameSet ()
@@ -1311,9 +1625,10 @@ let rec compileFunctions (ctx: CompileContext) (topLevel: TopLevel) =
             match m with
             | FunctionDef func ->
                 ctx.ClassFields <- Some fieldSet
+                let isStatic = List.contains StaticMod (functionModifiers func)
                 let compileMember (name: string) suffix paramList returnType body =
                     let fullName = className + "." + name + suffix
-                    compileFunctionBody ctx fullName name paramList returnType body
+                    compileFunctionBodyWith ctx isStatic fullName name paramList returnType body
                     getName ctx.FunctionIndex fullName
                 match func with
                 | SubDecl (_, name, paramList, body) ->
@@ -1330,6 +1645,30 @@ let rec compileFunctions (ctx: CompileContext) (topLevel: TopLevel) =
 
         let classIdx = getName ctx.ClassIndex className
         let orderedFields = List.rev fields
+        // `Implements I`: members named I_X answer calls to X (unless the class has its own X).
+        let interfaces = members |> List.choose (function ImplementsDecl i -> Some i | _ -> None)
+        let alias (m: Map<string, int>) =
+            let mutable result = m
+            for i in interfaces do
+                let prefix = normalizeName i + "_"
+                for KeyValue (key, index) in m do
+                    if key.StartsWith prefix then
+                        let plain = key.Substring prefix.Length
+                        if not (Map.containsKey plain result) && not (containsSetName fieldSet plain) then
+                            result <- Map.add plain index result
+            result
+        let methods, getters, letters, setters = alias methods, alias getters, alias letters, alias setters
+        let defaultMember =
+            match tryGetName ctx.DefaultMembers className with
+            | true, name -> normalizeName name
+            | _ ->
+                members |> List.tryPick (function
+                    | FunctionDef f when List.contains DefaultMod (functionModifiers f) ->
+                        match f with
+                        | PropertyGet (_, name, _, _, _) | FunctionDecl (_, name, _, _, _) | SubDecl (_, name, _, _)
+                        | PropertyLet (_, name, _, _) | PropertySet (_, name, _, _) -> Some (normalizeName name)
+                    | _ -> None)
+                |> Option.defaultValue ""
         ctx.Classes.[classIdx] <- {
             Name = className
             Fields = orderedFields |> List.map fst |> List.toArray
@@ -1339,6 +1678,8 @@ let rec compileFunctions (ctx: CompileContext) (topLevel: TopLevel) =
             PropertySetters = setters
             IsValueType = false
             FieldTypes = orderedFields |> List.map (fun (_, t) -> fieldTypeCode ctx t) |> List.toArray
+            DefaultMember = defaultMember
+            Implements = interfaces |> List.toArray
         }
         ctx.ClassFields <- outerClassFields
         ctx.ClassName <- outerClassName
@@ -1379,10 +1720,18 @@ let rec preRegisterGlobals (ctx: CompileContext) (topLevel: TopLevel) =
         | None -> ()
     match topLevel with
     | TopLevelStatement (LocatedStmt (_, stmt)) -> preRegisterGlobals ctx (TopLevelStatement stmt)
-    | TopLevelStatement (Declaration (vis, Dim declarators)) ->
+    | TopLevelStatement (Declaration (vis, (Dim declarators | StaticDim declarators))) ->
         for d in declarators do
-            register vis d.Name (d.Type |> Option.map (fun t -> t.Name))
-            match d.ArraySpec with Some _ -> addSetName ctx.ArrayVars d.Name |> ignore | None -> ()
+            register vis d.Name (if d.IsNew then None else d.Type |> Option.map (fun t -> t.Name))
+            if d.IsNew then
+                let key = if ctx.ModuleName <> "" && declarationVisibilityIsPrivate vis then privateKey ctx.ModuleName d.Name else d.Name
+                match d.Type with Some t -> setName ctx.AsNew key t.Name | None -> ()
+            match d.ArraySpec with
+            | Some spec ->
+                addSetName ctx.ArrayVars d.Name |> ignore
+                if not spec.Dimensions.IsEmpty then addSetName ctx.FixedArrays d.Name |> ignore
+            | None -> ()
+    | WithEventsDecl (vis, name, _) -> register vis name None
     | TopLevelStatement (Declaration (vis, Const (name, _, _))) -> register vis name None
     | TopLevelStatement (Declaration (_, ReDim (name, _, _))) ->
         if (tryResolveGlobal ctx name).IsNone then register None name None
@@ -1410,6 +1759,7 @@ let toProgram (ctx: CompileContext) : BytecodeProgram =
         Functions = ctx.Functions.ToArray()
         Classes = ctx.Classes.ToArray()
         ModuleStarts = ctx.ModuleStarts.ToArray()
+        EventBindings = ctx.EventBindings.ToArray()
     }
 
 /// A module of a project: its name, kind and parsed program.
@@ -1417,6 +1767,8 @@ type CompileModule = {
     Name: string
     Kind: ModuleKind
     Program: Program
+    /// A class module's default member (`Attribute X.VB_UserMemId = 0`).
+    DefaultMember: string option
 }
 
 let private withModule (ctx: CompileContext) (m: CompileModule) action =
@@ -1424,9 +1776,11 @@ let private withModule (ctx: CompileContext) (m: CompileModule) action =
     ctx.CurrentLine <- 0
     ctx.OptionBase <-
         if m.Program.TopLevels |> List.exists (function OptionStmt o -> normalizeName o = "base 1" | _ -> false) then 1 else 0
+    ctx.OptionExplicit <- m.Program.TopLevels |> List.exists (function OptionStmt o -> normalizeName o = "explicit" | _ -> false)
     action ()
     ctx.ModuleName <- ""
     ctx.OptionBase <- 0
+    ctx.OptionExplicit <- false
 
 let private moduleTopLevels (m: CompileModule) =
     match m.Kind with
@@ -1434,10 +1788,37 @@ let private moduleTopLevels (m: CompileModule) =
         // A class module's body is one class named after the module.
         let classMembers, rest =
             m.Program.TopLevels |> List.partition (function
-                | FunctionDef _ | TopLevelStatement _ -> true
+                | FunctionDef _ | TopLevelStatement _ | EventDecl _ | WithEventsDecl _ | ImplementsDecl _ -> true
                 | _ -> false)
         rest @ [ ClassDecl (Some Public, m.Name, classMembers) ]
     | _ -> m.Program.TopLevels
+
+/// Fixed-size array fields (`Private items(10)`) are created by the class's
+/// Class_Initialize, ahead of its own statements.
+let private withFieldInitializers (members: TopLevel list) =
+    let arrayFields =
+        members |> List.collect (function
+            | TopLevelStatement (LocatedStmt (_, Declaration (_, Dim ds)))
+            | TopLevelStatement (Declaration (_, Dim ds)) ->
+                ds |> List.choose (fun d ->
+                    match d.ArraySpec with
+                    | Some spec when not spec.Dimensions.IsEmpty -> Some (Declaration (None, ReDim (d.Name, spec.Dimensions, false)))
+                    | _ -> None)
+            | _ -> [])
+    if arrayFields.IsEmpty then members
+    else
+        let isInitialize f = match f with SubDecl (_, name, [], _) -> normalizeName name = "class_initialize" | _ -> false
+        if members |> List.exists (function FunctionDef f -> isInitialize f | _ -> false) then
+            members |> List.map (function
+                | FunctionDef (SubDecl (mods, name, ps, body)) when normalizeName name = "class_initialize" ->
+                    FunctionDef (SubDecl (mods, name, ps, arrayFields @ body))
+                | other -> other)
+        else members @ [ FunctionDef (SubDecl ([ VisibilityMod Private ], "Class_Initialize", [], arrayFields)) ]
+
+let rec private prepareTopLevels (tls: TopLevel list) =
+    tls |> List.map (function
+        | ClassDecl (vis, name, members) -> ClassDecl (vis, name, withFieldInitializers members)
+        | other -> other)
 
 /// Compile several modules into one program. Module-level code runs in module
 /// order; `ModuleStarts` records where each module's code begins.
@@ -1449,17 +1830,66 @@ let compileModules (hostNames: string seq) (modules: CompileModule list) : Bytec
     let named = modules |> List.filter (fun m -> m.Name <> "")
     for m in named do
         if m.Kind <> ClassModule then addSetName ctx.ModuleNames m.Name |> ignore
-    let tops = modules |> List.map (fun m -> m, moduleTopLevels m)
+    let tops = modules |> List.map (fun m -> m, prepareTopLevels (moduleTopLevels m))
     for m, tls in tops do
         withModule ctx m (fun () -> for tl in tls do preRegisterGlobals ctx tl)
+    for m in modules do
+        match m.Kind, m.DefaultMember with
+        | ClassModule, Some memberName -> setName ctx.DefaultMembers m.Name memberName
+        | _ -> ()
     for m, tls in tops do
         withModule ctx m (fun () -> registerDeclarations ctx m.Kind tls)
     for m, tls in tops do
         withModule ctx m (fun () -> defineTypes ctx tls)
+    ctx.HasTerminate <- ctx.FunctionIndex.Keys |> Seq.exists (fun k -> normalizeName(k).EndsWith ".class_terminate")
+    // WithEvents variables: their handlers are the procedures Variable_Event.
+    let rec bindWithEvents (scope: string) (isClass: bool) (tls: TopLevel list) =
+        for tl in tls do
+            match tl with
+            | WithEventsDecl (_, variable, typeRef) ->
+                let events = match tryGetName ctx.ClassEvents typeRef.Name with | true, e -> e | _ -> []
+                let handlers =
+                    events |> List.choose (fun eventName ->
+                        let procName = variable + "_" + eventName
+                        let key = if scope = "" then procName else scope + "." + procName
+                        match tryGetName ctx.FunctionIndex key with
+                        | true, index -> Some (normalizeName eventName, index)
+                        | _ -> None)
+                setName ctx.WithEventsVars (scope + "." + variable) ctx.EventBindings.Count
+                ctx.EventBindings.Add { Handlers = Map.ofList handlers; ClassSink = isClass }
+            | ClassDecl (_, className, members) -> bindWithEvents className true members
+            | _ -> ()
+    for m, tls in tops do bindWithEvents m.Name false tls
     emit ctx (Jump -1) 0
     for m, tls in tops do
         withModule ctx m (fun () -> for tl in tls do compileFunctions ctx tl)
     patchJump ctx 0 (Jump ctx.Instructions.Count)
+    // Static locals start at their type's default, once.
+    for moduleName, key, d in ctx.StaticInits do
+        let m = modules |> List.tryFind (fun m -> m.Name = moduleName)
+        let init () =
+            let slot = getGlobalSlot ctx key
+            let typeName = d.Type |> Option.map (fun t -> t.Name)
+            match d.ArraySpec with
+            | Some spec when not spec.Dimensions.IsEmpty ->
+                emitDimensions ctx spec.Dimensions
+                emit ctx (ArrayNew spec.Dimensions.Length) 0
+                emitArrayFill ctx typeName
+                emit ctx (StoreGlobal slot) 0
+            | Some _ ->
+                emit ctx (CallBuiltin ("array:unallocated", 0)) 0
+                emit ctx (StoreGlobal slot) 0
+            | None ->
+                if d.IsNew then
+                    emitConst ctx VNothing
+                    emit ctx (StoreGlobal slot) 0
+                else
+                    match typeName with
+                    | Some t -> if emitTypedInitial ctx t then emit ctx (StoreGlobal slot) 0
+                    | None -> ()
+        match m with
+        | Some m -> withModule ctx m init
+        | None -> init ()
     for m, tls in tops do
         withModule ctx m (fun () ->
             ctx.ModuleStarts.Add((ctx.Instructions.Count, m.Name))
@@ -1473,7 +1903,7 @@ let compileModules (hostNames: string seq) (modules: CompileModule list) : Bytec
     toProgram ctx, ctx
 
 let compileWithGlobalNames (names: string seq) (program: Program) : BytecodeProgram =
-    compileModules names [ { Name = ""; Kind = StandardModule; Program = program } ] |> fst
+    compileModules names [ { Name = ""; Kind = StandardModule; Program = program; DefaultMember = None } ] |> fst
 
 let compile (program: Program) : BytecodeProgram =
     compileWithGlobalNames Seq.empty program
@@ -1497,6 +1927,7 @@ let compileSnippet (ctx: CompileContext) (moduleName: string) (body: Choice<Expr
     let start = ctx.Instructions.Count
     try
         try
+            ctx.OptionExplicit <- false
             match body with
             | Choice1Of2 expr ->
                 compileExpression ctx expr

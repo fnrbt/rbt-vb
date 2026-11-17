@@ -481,7 +481,8 @@ let private cases : (string * (unit -> unit)) list = [
                                           member _.CallMethod _ _ = None
                                           member _.CallNamed _ _ _ = None
                                           member _.Enumerate () = None })
-                else None }
+                else None
+            Environ = fun _ -> "" }
         let s = session (projectWith hooks)
         finished "Talk" (s.Run("Talk", [])) VEmpty
         let expected = [ "a 1 b\t 2 "; "MsgBox Continue? 4 Title"; "InputBox Name? T default"; "typed"; "Thing" ]
