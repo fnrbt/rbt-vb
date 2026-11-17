@@ -1323,6 +1323,8 @@ let peventDecl (dialect: Dialect) : Parser<TopLevel> = fun tokens ->
 
 let pWithEventsDecl (dialect: Dialect) : Parser<TopLevel> = fun tokens ->
     let vis = optional parseVisibility
+    // `Dim WithEvents x As C` is the same as `Private WithEvents x As C`.
+    let tokens = match tokens with { Kind = Keyword; Lexeme = "dim" } :: ({ Kind = Keyword; Lexeme = "withevents" } :: _ as rest) -> rest | _ -> tokens
     match (vis .>>. pkeyword "withevents" .>>. pidentifier .>> pkeyword "as" .>>. pTypeRef) tokens with
     | Success ((((visOpt, _), name), typeRef), remaining) ->
         Success (WithEventsDecl (visOpt, name, typeRef), remaining)
@@ -1515,6 +1517,8 @@ let pTopLevel (dialect: Dialect) : Parser<TopLevel> = fun tokens ->
             | "declare" when dialect = VBA -> pdeclare dialect tokens
             | "event" when dialect = VBA -> peventDecl dialect tokens
             | "withevents" when dialect = VBA -> pWithEventsDecl dialect tokens
+            | "dim" when dialect = VBA && (match tokens with _ :: { Kind = Keyword; Lexeme = "withevents" } :: _ -> true | _ -> false) ->
+                pWithEventsDecl dialect tokens
             | _ -> statement ()
         | _ -> statement ()
     | Error (msg, token) -> Error (msg, token)

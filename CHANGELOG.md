@@ -61,14 +61,14 @@ This release adds the language features and built-ins that kept real Excel and W
 ### Class modules
 
 - `Event`, `RaiseEvent` and `WithEvents`:
-  - `Private WithEvents src As Source` in a standard, document or class module connects that module's `src_<Event>` procedures when `Set src = ...` runs.
+  - `Private WithEvents src As Source` (or `Dim WithEvents`) in a standard, document or class module connects that module's `src_<Event>` procedures when `Set src = ...` runs.
   - `RaiseEvent` calls them in order and passes ByRef arguments back, so a `Cancel` argument works.
   - Events of host objects are not delivered.
 - `Implements IShape`: members named `IShape_X` answer calls to `X` through any variable, unless the class has its own `X`. `TypeOf x Is IShape` is True.
 - `Dim x As New Class` creates the object on first use and again after `Set x = Nothing`. This works for module, procedure and class-field variables and for Collection and Dictionary.
 - `Class_Terminate` runs when an object becomes unreachable, at three points:
   - when a procedure returns holding it in a local;
-  - when `Set` overwrites a variable that held it;
+  - when `Set` overwrites a variable that held it, or a Collection, Dictionary or array that may hold it;
   - when a run or a session call ends.
 
   Reachability is checked from module variables, active locals, the stack, object fields, arrays, Collections and Dictionaries. References kept only inside other host objects are not seen. `End` skips Class_Terminate, as in VBA.
@@ -148,8 +148,8 @@ The matrix, objects and sieve gains come mostly from the smaller dispatcher. ben
 
 ### Verification
 
-- Native: `dotnet run --project tests/Rbt.Vb.Tests.fsproj -c Release` passes 60 public-API groups, the value-semantics suite, 45 0.3.0 release groups, 40 new 0.4.0 groups, persistence and the fixtures.
-- Fable 5.27.0 / Node: the same shared suites pass, including all 40 0.4.0 groups.
+- Native: `dotnet run --project tests/Rbt.Vb.Tests.fsproj -c Release` passes 60 public-API groups, the value-semantics suite, 45 0.3.0 release groups, 42 new 0.4.0 groups, persistence and the fixtures.
+- Fable 5.27.0 / Node: the same shared suites pass, including all 42 0.4.0 groups.
 
 ### Not in this release
 

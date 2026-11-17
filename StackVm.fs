@@ -645,12 +645,18 @@ let private hasTerminate (state: VmState) (o: VBObject) =
     let classDef = classOf state o
     not classDef.IsValueType && Map.containsKey "class_terminate" classDef.Methods
 
+/// A value that may hold (or be) an object with a Class_Terminate.
+let private mayHoldTerminable (_: VmState) (value: Value) =
+    match value with
+    | VObject _ -> true
+    | VArray _ -> true
+    | VHostObject h -> (match box h with :? Collections.VbCollection | :? Collections.VbDictionary -> true | _ -> false)
+    | _ -> false
+
 let private frameHoldsTerminable (state: VmState) (frame: StackFrame) =
     let mutable found = false
     for value in frame.Locals do
-        match value with
-        | VObject o when hasTerminate state o -> found <- true
-        | _ -> ()
+        if not found && mayHoldTerminable state value then found <- true
     found
 
 let private executeCold (state: VmState) (instr: Instruction) =
@@ -1067,9 +1073,7 @@ let private executeCold (state: VmState) (instr: Instruction) =
     | ReleaseCheck ->
         let old = pop state
         state.Pc <- state.Pc + 1
-        match old with
-        | VObject o when state.Terminable.Count > 0 && hasTerminate state o -> collectHook state
-        | _ -> ()
+        if state.Terminable.Count > 0 && mayHoldTerminable state old then collectHook state
 
     | CallByNameOp argCount ->
         let args = Array.zeroCreate argCount

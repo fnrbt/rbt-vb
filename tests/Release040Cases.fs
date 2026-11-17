@@ -633,6 +633,31 @@ let private cases : (string * (unit -> unit)) list = [
         if lines <> [ " 1  5 "; " 1 " ] then fail "With member after Debug.Print" [ " 1  5 "; " 1 " ] lines
         let lines = printed "Dim i\nFor i = 1 To 3\nDebug.Print i;\nNext\nDebug.Print \"|\"\nDebug.Print \"a\", \nDebug.Print \"b\""
         if lines <> [ " 1  2  3 |"; "a\tb" ] then fail "Debug.Print ;" [ " 1  2  3 |"; "a\tb" ] lines)
+    "Events, Terminate and Static in a single source", (fun () ->
+        let lines =
+            printed ("Class Ticker\nPublic Event Tick(ByVal n)\nSub Run()\nDim i\nFor i = 1 To 3\nRaiseEvent Tick(i)\nNext\nEnd Sub\nEnd Class\n" +
+                     "Class Res\nPublic Name\nPrivate Sub Class_Terminate()\nDebug.Print \"free \" & Name\nEnd Sub\nFunction Next1()\nStatic n\nn = n + 1\nNext1 = n\nEnd Function\nEnd Class\n" +
+                     "Dim WithEvents t As Ticker\nSub t_Tick(ByVal n)\nDebug.Print \"tick\"; n\nEnd Sub\n" +
+                     "Set t = New Ticker\nt.Run\nDim c, r\nSet c = New Collection\nSet r = New Res\nr.Name = \"a\"\nc.Add r\nSet r = Nothing\nDebug.Print \"kept\"; c.Count\nSet c = Nothing\nDebug.Print \"after\"\n" +
+                     "Dim x, y\nSet x = New Res\nSet y = New Res\nx.Name = \"x\": y.Name = \"y\"\nDebug.Print x.Next1() + y.Next1()")
+        let expected = [ "tick 1 "; "tick 2 "; "tick 3 "; "kept 1 "; "free a"; "after"; " 3 "; "free x"; "free y" ]
+        if lines <> expected then fail "output" expected lines)
+    "More built-in edges", (fun () ->
+        exprs "" [
+            "IsNumeric(\"&HFF\")", VBoolean true
+            "IsNumeric(Empty)", VBoolean true
+            "IsNumeric(\"1e3\")", VBoolean true
+            "IsNumeric(#1/1/2024#)", VBoolean false
+            "IsNull(UCase(Null))", VBoolean true
+            "IsNull(Left(Null, 1))", VBoolean true
+            "IsNull(Len(Null))", VBoolean true
+            "Trim(vbTab & \" a \")", str (string '\t' + " a")
+            "TypeName(Array())", str "Variant()"
+            "UBound(Array())", VInteger -1 ]
+        errNumber "Dim x" "x = Sqr(-1)" 5
+        errNumber "Dim x" "x = Log(0)" 5
+        errNumber "Dim x" "x = Left(\"abc\", -1)" 5
+        errNumber "Dim x" "x = WeekdayName(8)" 5)
     // ── 8. Host-visible API ──
     "Bytecode round-trips the new values and metadata", (fun () ->
 #if FABLE_COMPILER
