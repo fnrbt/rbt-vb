@@ -349,6 +349,8 @@ let private cases : (string * (unit -> unit)) list = [
         vba source "s" (VString "3.5")
         vba source "b" (VBoolean true)
         vba source "d" (VDouble 2.0))
+    "ReDim with an As clause", (fun () ->
+        vba "Dim a() As Long, result\nReDim a(3) As Long\nresult = a(2) + UBound(a)" "result" (VInteger 3))
     "Typed parameters and locals", (fun () ->
         vba "Dim result\nFunction F(ByVal n As Integer) As Long\nDim t As Long\nt = n\nF = t * 2\nEnd Function\nresult = F(2.5)" "result" (VInteger 4))
     "Integer and Long overflow raise error 6", (fun () ->

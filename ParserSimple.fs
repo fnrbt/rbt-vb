@@ -451,7 +451,12 @@ let predim : Parser<Statement> = fun tokens ->
     | Success ((pres, name), remaining) ->
         match pDimensions false remaining with
         | Success (dimensions, remaining2) ->
-            Success (Declaration (None, ReDim (name, dimensions, pres)), remaining2)
+            // `ReDim a(n) As T`: the element type comes from the Dim; the clause is accepted.
+            let remaining3 =
+                match remaining2 with
+                | { Kind = Keyword; Lexeme = "as"; PrecedingNewline = false } :: { Kind = Ast.Identifier } :: rest -> rest
+                | _ -> remaining2
+            Success (Declaration (None, ReDim (name, dimensions, pres)), remaining3)
         | Error (msg, token) -> Error (msg, token)
     | Error (msg, token) -> Error (msg, token)
 

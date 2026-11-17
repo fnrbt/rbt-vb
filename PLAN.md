@@ -291,3 +291,10 @@ Measurements use the pre-existing Debug assembly versus the updated Debug assemb
 | String loop | 640377 | 104633 | 1.0425 | 1.1475 |
 
 A separate WeakReference measurement confirmed arrays in popped operand slots and returned procedure frames are collectible while the VM state remains alive. The measurement scripts were temporary and removed after recording these results.
+
+
+## 0.3.0 status
+
+The 0.3.0 scope is complete. It covers silent wrong results, VB error numbers and `Resume`, declared types with overflow, the host bridge (default members, Let-coercion, For Each, error 438, host errors, named and omitted arguments) and the project/session embedding API. Each item has a regression in `tests/ReleaseCases.fs`, which runs on .NET and Fable. See CHANGELOG.md for details and docs/embedding.md for the API.
+
+Items deferred to 0.4.0 are listed under "Not in this release" in CHANGELOG.md. They include Date/Format, Collection/Dictionary, more built-ins, class events/Implements, Static, `Dim As New` and Option Explicit enforcement.
