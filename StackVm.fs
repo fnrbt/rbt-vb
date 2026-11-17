@@ -295,7 +295,11 @@ let inline pushFrameFor (state: VmState) (returnAddress: int) (localsCount: int)
     let locals =
         if functionIndex >= 0 then
             let template = state.Program.Functions.[functionIndex].InitialLocals
-            if template.Length > 0 then Array.copy template else Array.create (max localsCount 1) VEmpty
+            if template.Length > 0 then
+                let locals = Array.zeroCreate template.Length
+                Array.blit template 0 locals 0 template.Length
+                locals
+            else Array.create (max localsCount 1) VEmpty
         else Array.create (max localsCount 1) VEmpty
     state.CallStack.[state.Csp] <- newFrameWith returnAddress locals state.Sp state.GoSubSp functionIndex
     state.Csp <- state.Csp + 1
@@ -402,16 +406,6 @@ let private executeCold (state: VmState) (instr: Instruction) =
         push state VNull
         state.Pc <- state.Pc + 1
 
-    | Divide ->
-        let right = ValueSemantics.scalar (pop state)
-        let left = ValueSemantics.scalar (pop state)
-        if left = VNull || right = VNull then push state VNull
-        else
-            let r = valueToDouble right
-            if r = 0.0 then raiseVbError 11
-            push state (VDouble (valueToDouble left / r))
-        state.Pc <- state.Pc + 1
-
     | IntDivide ->
         let right = ValueSemantics.scalar (pop state)
         let left = ValueSemantics.scalar (pop state)
@@ -424,19 +418,6 @@ let private executeCold (state: VmState) (instr: Instruction) =
             push state (VInteger (l / r))
         state.Pc <- state.Pc + 1
 
-    | Modulus ->
-        let right = ValueSemantics.scalar (pop state)
-        let left = ValueSemantics.scalar (pop state)
-        let result =
-            if left = VNull || right = VNull then VNull
-            else
-                let divisor = valueToInt right
-                if divisor = 0 then raiseVbError 11
-                if divisor = -1 then VInteger 0
-                else VInteger (valueToInt left % divisor)
-        push state result
-        state.Pc <- state.Pc + 1
-
     | Power ->
         let right = ValueSemantics.scalar (pop state)
         let left = ValueSemantics.scalar (pop state)
@@ -444,30 +425,6 @@ let private executeCold (state: VmState) (instr: Instruction) =
             match left, right with
             | VNull, _ | _, VNull -> VNull
             | _ -> VDouble (valueToDouble left ** valueToDouble right)
-        push state result
-        state.Pc <- state.Pc + 1
-
-    | And ->
-        let right = ValueSemantics.scalar (pop state)
-        let left = ValueSemantics.scalar (pop state)
-        let result =
-            match left, right with
-            | VNull, VNull -> VNull
-            | VNull, value | value, VNull -> if valueToBool value then VNull else VBoolean false
-            | VInteger l, VInteger r -> VInteger (l &&& r)
-            | _ -> VBoolean (valueToBool left && valueToBool right)
-        push state result
-        state.Pc <- state.Pc + 1
-
-    | Or ->
-        let right = ValueSemantics.scalar (pop state)
-        let left = ValueSemantics.scalar (pop state)
-        let result =
-            match left, right with
-            | VNull, VNull -> VNull
-            | VNull, value | value, VNull -> if valueToBool value then VBoolean true else VNull
-            | VInteger l, VInteger r -> VInteger (l ||| r)
-            | _ -> VBoolean (valueToBool left || valueToBool right)
         push state result
         state.Pc <- state.Pc + 1
 
@@ -492,18 +449,6 @@ let private executeCold (state: VmState) (instr: Instruction) =
         let left = pop state
         if left = VNull || right = VNull then push state VNull
         else push state (VBoolean (not (valueToBool left) || valueToBool right))
-        state.Pc <- state.Pc + 1
-
-    | Not ->
-        let value = ValueSemantics.scalar (pop state)
-        match value with
-        | VNull -> push state VNull
-        | VInteger i -> push state (VInteger (~~~i))
-        | _ -> push state (VBoolean (not (valueToBool value)))
-        state.Pc <- state.Pc + 1
-
-    | Negate ->
-        push state (ValueSemantics.negateValue (pop state))
         state.Pc <- state.Pc + 1
 
     | IsOp ->
@@ -568,20 +513,6 @@ let private executeCold (state: VmState) (instr: Instruction) =
         push state (VArray { Data = data; LowerBounds = bounds; Lengths = lengths })
         state.Pc <- state.Pc + 1
 
-    | ArrayGetFlat ->
-        let index = valueToInt (pop state)
-        match pop state with
-        | VArray a when index >= 0 && index < a.Data.Length -> push state a.Data.[index]
-        | _ -> raiseVbError 9
-        state.Pc <- state.Pc + 1
-
-    | ArrayLength ->
-        match pop state with
-        | VArray a -> push state (VInteger a.Data.Length)
-        | VString s -> push state (VInteger s.Length)
-        | _ -> raiseVbError 13
-        state.Pc <- state.Pc + 1
-
     | ForEachPrepare ->
         match pop state with
         | VArray _ as array -> push state array
@@ -610,26 +541,6 @@ let private executeCold (state: VmState) (instr: Instruction) =
         | VArray a ->
             for i in 0 .. a.Data.Length - 1 do
                 if a.Data.[i] = VEmpty then a.Data.[i] <- newInstance state classIdx
-        | _ -> ()
-        state.Pc <- state.Pc + 1
-
-    | LetValue ->
-        match peek state with
-        | VHostObject hostObj ->
-            // Let-coercion reads the default property; an object without one
-            // is kept so host objects assigned without Set still work.
-            let value =
-                match hostObj.GetMember "" with
-                | Some v -> Some v
-                | None ->
-                    match hostObj.GetMember "_Default" with
-                    | Some v -> Some v
-                    | None -> hostObj.GetMember "Value"
-            match value with
-            | Some v ->
-                ignore (pop state)
-                push state (match v with VHostObject _ -> ValueSemantics.scalar v | _ -> v)
-            | None -> ()
         | _ -> ()
         state.Pc <- state.Pc + 1
 
@@ -1123,6 +1034,102 @@ let executeOneInstruction (state: VmState) =
     | MakeRefGlobal slot ->
         push state (VRef (state.Globals, slot))
         state.Pc <- state.Pc + 1
+    | Divide ->
+        let right = ValueSemantics.scalar (pop state)
+        let left = ValueSemantics.scalar (pop state)
+        if left = VNull || right = VNull then push state VNull
+        else
+            let r = valueToDouble right
+            if r = 0.0 then raiseVbError 11
+            push state (VDouble (valueToDouble left / r))
+        state.Pc <- state.Pc + 1
+
+    | Modulus ->
+        let right = ValueSemantics.scalar (pop state)
+        let left = ValueSemantics.scalar (pop state)
+        let result =
+            if left = VNull || right = VNull then VNull
+            else
+                let divisor = valueToInt right
+                if divisor = 0 then raiseVbError 11
+                if divisor = -1 then VInteger 0
+                else VInteger (valueToInt left % divisor)
+        push state result
+        state.Pc <- state.Pc + 1
+
+    | And ->
+        let right = ValueSemantics.scalar (pop state)
+        let left = ValueSemantics.scalar (pop state)
+        let result =
+            match left, right with
+            | VNull, VNull -> VNull
+            | VNull, value | value, VNull -> if valueToBool value then VNull else VBoolean false
+            | VInteger l, VInteger r -> VInteger (l &&& r)
+            | _ -> VBoolean (valueToBool left && valueToBool right)
+        push state result
+        state.Pc <- state.Pc + 1
+
+    | Or ->
+        let right = ValueSemantics.scalar (pop state)
+        let left = ValueSemantics.scalar (pop state)
+        let result =
+            match left, right with
+            | VNull, VNull -> VNull
+            | VNull, value | value, VNull -> if valueToBool value then VBoolean true else VNull
+            | VInteger l, VInteger r -> VInteger (l ||| r)
+            | _ -> VBoolean (valueToBool left || valueToBool right)
+        push state result
+        state.Pc <- state.Pc + 1
+
+    | Not ->
+        let value = ValueSemantics.scalar (pop state)
+        match value with
+        | VNull -> push state VNull
+        | VInteger i -> push state (VInteger (~~~i))
+        | _ -> push state (VBoolean (not (valueToBool value)))
+        state.Pc <- state.Pc + 1
+
+    | Negate ->
+        match state.Stack.[state.Sp - 1] with
+        | VDouble d -> state.Stack.[state.Sp - 1] <- VDouble (-d)
+        | VInteger i when i <> System.Int32.MinValue -> state.Stack.[state.Sp - 1] <- VInteger (-i)
+        | _ -> push state (ValueSemantics.negateValue (pop state))
+        state.Pc <- state.Pc + 1
+
+    | ArrayGetFlat ->
+        let index = valueToInt (pop state)
+        match pop state with
+        | VArray a when index >= 0 && index < a.Data.Length -> push state a.Data.[index]
+        | _ -> raiseVbError 9
+        state.Pc <- state.Pc + 1
+
+    | ArrayLength ->
+        match pop state with
+        | VArray a -> push state (VInteger a.Data.Length)
+        | VString s -> push state (VInteger s.Length)
+        | _ -> raiseVbError 13
+        state.Pc <- state.Pc + 1
+
+    | LetValue ->
+        match peek state with
+        | VHostObject hostObj ->
+            // Let-coercion reads the default property; an object without one
+            // is kept so host objects assigned without Set still work.
+            let value =
+                match hostObj.GetMember "" with
+                | Some v -> Some v
+                | None ->
+                    match hostObj.GetMember "_Default" with
+                    | Some v -> Some v
+                    | None -> hostObj.GetMember "Value"
+            match value with
+            | Some v ->
+                ignore (pop state)
+                push state (match v with VHostObject _ -> ValueSemantics.scalar v | _ -> v)
+            | None -> ()
+        | _ -> ()
+        state.Pc <- state.Pc + 1
+
     | _ -> executeCold state instr
 
 /// Location of the instruction at `pc` in the current frame.
@@ -1196,7 +1203,8 @@ let runSlice (state: VmState) (budget: int) =
         let chunk = min remaining 8192
         let mutable executed = 0
         try
-            while executed < chunk && state.Pc < state.Program.Code.Length do
+            let code = state.Program.Code
+            while executed < chunk && state.Pc < code.Length do
                 executeOneInstruction state
                 executed <- executed + 1
         with ex ->
