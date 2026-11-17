@@ -284,7 +284,7 @@ and ppostfix : Parser<Expression> = fun tokens ->
     | Success (expr, remaining) ->
         let rec loop acc remaining =
             match remaining with
-            | { Kind = Dot; PrecedingNewline = false } :: tail ->
+            | { Kind = Dot; Lexeme = "."; PrecedingNewline = false } :: tail ->
                 match pidentifierOrKeyword tail with
                 | Success (name, remaining2) -> loop (Member (acc, name)) remaining2
                 | Error (msg, token) -> Error (msg, token)
@@ -430,6 +430,11 @@ let pVarDeclarator (dialect: Dialect) : Parser<VarDeclarator> = fun tokens ->
             | VBA, { Kind = Keyword; Lexeme = "as" } :: tail ->
                 match pTypeRef tail with
                 | Success (typeRef, next) ->
+                    // `As String * 10`: the fixed length is not kept.
+                    let next =
+                        match next with
+                        | { Kind = Operator; Lexeme = "*"; PrecedingNewline = false } :: { Kind = (Number | Ast.Identifier); PrecedingNewline = false } :: rest -> rest
+                        | _ -> next
                     Success ({ Name = name; ArraySpec = arraySpec; Type = Some typeRef; IsNew = false }, next)
                 | Error (msg, token) -> Error (msg, token)
             | _ -> Success ({ Name = name; ArraySpec = arraySpec; Type = None; IsNew = false }, rest)
@@ -1231,6 +1236,7 @@ let pfunction (dialect: Dialect) : Parser<Function> = fun tokens ->
                         match remaining2 with
                         | { Kind = Keyword; Lexeme = "as" } :: _ ->
                             match (pkeyword "as" >>. pTypeRef) remaining2 with
+                            | Success (_, { Kind = LParen; PrecedingNewline = false } :: { Kind = RParen } :: rem) -> (None, rem)
                             | Success (tr, rem) -> (Some tr, rem)
                             | Error _ -> (None, remaining2)
                         | _ -> (None, remaining2)
@@ -1270,6 +1276,7 @@ let pfunction (dialect: Dialect) : Parser<Function> = fun tokens ->
                                 match remaining3 with
                                 | { Kind = Keyword; Lexeme = "as" } :: _ ->
                                     match (pkeyword "as" >>. pTypeRef) remaining3 with
+                                    | Success (_, { Kind = LParen; PrecedingNewline = false } :: { Kind = RParen } :: rem) -> (None, rem)
                                     | Success (tr, rem) -> (Some tr, rem)
                                     | Error _ -> (None, remaining3)
                                 | _ -> (None, remaining3)

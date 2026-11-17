@@ -14,6 +14,45 @@ There are two levels:
   list for a macro picker, named-procedure calls, an Immediate window, and
   cooperative execution in slices with cancellation.
 
+## Values
+
+`Values.Value` is the VB Variant. Besides Integer/Long (`VInteger`), Double
+(`VDouble`), String, Boolean, Empty, Null, Nothing, arrays and objects it has:
+
+- `VDate serial`, a **Date**: an OLE Automation date, the number of days
+  since 1899-12-30 with the time of day as the fraction. These are Excel's
+  serial numbers (1900 date system) for every date from 1900-03-01 on, so a
+  host stores a date cell's serial unchanged and returns it as `VDate`.
+  `TypeName` is "Date", `VarType` 7.
+- `VCurrency units`, a **Currency**: a 64-bit count of 1/10000 units
+  (`CCur(1.5)` is `VCurrency 15000L`). VarType 6.
+- `VError number`, an **Error** value (`CVErr(2042)` is Excel's #N/A).
+  `IsError` is True, VarType 10.
+
+The `Api.VbDate` module converts dates for hosts:
+
+```fsharp
+VbDate.ofParts 2024 1 31 13 45 0      // VDate 45322.5729...
+VbDate.ofDateTime DateTime.Now        // VDate (the DateTime's Kind is ignored)
+VbDate.ofSerial 45322.0               // an Excel serial as a Date
+VbDate.tryToSerial value              // Some serial for a Date or a number
+VbDate.tryToParts value               // Some (year, month, day, hour, minute, second)
+VbDate.tryToDateTime value            // Some DateTime (Kind Unspecified)
+```
+
+A spreadsheet host returns `VbDate.ofSerial serial` for cells formatted as
+dates (and numbers for other cells), and accepts `VDate` when a script
+writes a cell: store the serial and give the cell a date format. Scripts
+then get VBA's behaviour: `Range("A1") + 7` is a Date, `Format(Range("A1"),
+"yyyy-mm-dd")` and `Year(Range("A1"))` work, and `CStr` prints "1/31/2024".
+
+Text conversions use invariant **en-US** conventions: CStr and Format write
+"." decimals, "," thousands, "$" currency, `m/d/yyyy` dates and 12-hour
+times with AM/PM; CDate and date literals read m/d/y (and ISO yyyy-mm-dd)
+and English month and day names. Doubles print with 15 significant digits,
+as VBA does (`CStr(0.1 + 0.2)` is "0.3"). Decimal (`CDec`, `As Decimal`) is
+a Double.
+
 ## Host objects
 
 ```fsharp
@@ -33,6 +72,10 @@ type IHostObject =
   returns `None`, the engine tries `CallMethod name [||]`.
 - `CallMethod name args` for `obj.Name(args)` and `obj.Name args`. When it
   returns `None`, the engine tries `GetMember name` and indexes its result.
+- **Assigning to a variable that holds an object** goes through the object's
+  default member, as in VBA: after `Set r = Range("A1")`, `r = 5` calls
+  `SetMember "" 5` on the Range (0.3.0 replaced the variable). Variables
+  declared with a scalar type, and `Set`, are unaffected.
 - **Default member**, the empty name `""`:
   - `obj(args)` calls `CallMethod "" args`, then `"_Default"`, then `"Item"`.
   - Reading the object as a value (Let-coercion: `x = Range("A1")`,
@@ -61,7 +104,11 @@ type IHostObject =
 
 `HostObject(typeName)` is an abstract base class with defaults for every member
 (no members, positional `CallNamed`, not enumerable). Override only what you
-need:
+need. It also has `SetIndexed name args value` for `obj(args) = value` (name
+"") and `obj.Name(args) = value`: return true when the object stores the
+value itself (as a dictionary does), or false, the default, for the usual
+behaviour of calling `CallMethod name args` and then `SetMember ""` on the
+result:
 
 ```fsharp
 type CellRange(sheet: Sheet, address: string) =
@@ -100,15 +147,22 @@ type RuntimeHooks = {
     MsgBox: string -> int -> string -> int                  // prompt, buttons, title -> vbOK..vbNo
     InputBox: string -> string -> string -> string option   // prompt, title, default -> text / None = Cancel
     CreateObject: string -> Value option                    // progId -> object / None = error 429
+    Environ: string -> string                               // Environ("NAME") -> value / "" when unknown
 }
 ```
 
 `Api.defaultHooks` keeps the console behaviour: it prints, `MsgBox` returns
 vbOK (1), `InputBox` reads a line on .NET and returns the default under Fable,
-and `CreateObject` raises 429. Pass hooks with `RunOptions.withHooks` or
+`CreateObject` raises 429, and `Environ` returns "". Pass hooks with `RunOptions.withHooks` or
 `ProjectOptions.withHooks`, or call `session.SetHooks`. The hooks are
 synchronous. A browser host that needs an asynchronous dialog can make the
 hook return a placeholder and drive execution in slices.
+
+`CreateObject("Scripting.Dictionary")` is served by the engine before the
+hook is asked, and so are `New Collection`, `New Dictionary` and
+`New Scripting.Dictionary`. They are `HostObject`s
+(`Collections.VbCollection`, `Collections.VbDictionary`) that a host can
+also create, pass in and inspect (`Count`, `Items`, `Keys`, `Item`).
 
 `Debug.Print` follows VBA formatting: `;` joins items, numbers get a sign
 position and a trailing space, and `,` inserts a tab.
@@ -138,8 +192,27 @@ ModuleSource.parseHeader : string -> ModuleHeader         // VB_Name, attributes
 - Public module-level variables are shared by all modules. Private ones are
   per module and readable from the host as `"Module.Name"`.
 - A *class* module is compiled as a class named after the module, with
-  fields, methods, `Property Get/Let/Set` and `Class_Initialize`. Events and
-  `Implements` are not supported yet.
+  fields, methods, `Property Get/Let/Set` (with arguments), `Class_Initialize`,
+  `Class_Terminate`, `Event`/`RaiseEvent`, `Implements` and a default member
+  (`Attribute Value.VB_UserMemId = 0` inside the member, as exported .cls
+  files have it; VBScript's `Public Default` also works).
+- `Private WithEvents src As Source` in a standard, document or class module
+  connects that module's `src_<Event>` procedures when `Set src = ...` runs;
+  `RaiseEvent Changed(...)` in Source calls them, ByRef arguments included.
+  Events of host objects are not delivered.
+- `Implements IShape`: members named `IShape_Area` answer calls to `Area`
+  (a class's own member of the same name wins), and `TypeOf x Is IShape` is
+  True.
+- **Class_Terminate** runs once an instance is unreachable: after a
+  procedure returns holding it in a local, after `Set` overwrites a variable
+  that held it, and when a run or a session call ends. Reachability is
+  checked from module variables, the active procedures' locals, the stack,
+  object fields, arrays, Collections and Dictionaries; references kept only
+  inside other host objects do not count. `End` does not run it.
+- `Static` locals and `Static Sub/Function` keep their values between calls
+  (one copy per procedure; in class modules it is shared by all instances).
+- `Option Explicit` is enforced at compile time ("Variable not defined: x",
+  with its line). Immediate-window code is exempt.
 - A *document* module (ThisWorkbook, Sheet1) compiles like a standard module,
   but its procedures are reachable only by qualified name.
 
@@ -170,7 +243,7 @@ session.Execute(statements, ?moduleName) : Result<unit, VbFailure>
 session.Immediate(line, ?moduleName) : Result<unit, VbFailure>             // "?expr", "Print expr" or statements
 
 // Drive it:
-session.Step(maxInstructions: int) : ExecutionStatus     // Running | Finished of Value | Failed of VbFailure
+session.Step(maxInstructions: int) : ExecutionStatus     // Running | Finished of Value | Failed of VbFailure | Paused of Location
 session.RunToEnd(?maxInstructions) : ExecutionStatus
 session.Cancel()                                          // next Step fails with error 18
 session.Location : Location option                        // { Line; Procedure; Module } while paused
@@ -193,6 +266,13 @@ session.TryGetGlobal(name) / session.SetGlobal(name, value) / session.SetHooks(h
   default, or Missing.
 - After `Failed`, `Finished`, or a cancellation the session is idle again and
   keeps its module state.
+- **Stop** makes `Step` and `RunToEnd` return `Paused location` (the line of
+  the Stop statement); `Step`/`RunToEnd` again continues after it. Outside a
+  session (`runSource`, `execute`) Stop does nothing.
+- **End** finishes the execution with `Finished Empty` and resets module
+  state as VBA does: module variables return to their initial values (the
+  module-level code runs again) and host globals are restored. Class_Terminate
+  does not run for the discarded objects.
 
 ### Cooperative execution in a browser
 
@@ -202,6 +282,7 @@ let rec pump () =
     | Running -> showLine session.Location; window.setTimeout(pump, 0) |> ignore
     | Finished value -> done value
     | Failed failure -> showError (VbFailure.format failure)
+    | Paused location -> showBreakpoint location   // Stop; resume with pump ()
 session.Call("Module1.Main", []) |> ignore
 pump ()
 // Stop button:
@@ -231,5 +312,6 @@ The single-source API raises `StackVm.VbRuntimeException`, which carries
 `RunError.RuntimeError message` with the formatted text.
 
 Run-time error numbers include 3, 5, 6, 7, 9, 11, 13, 18, 20, 28, 35, 91, 94,
-424, 429, 438, 440, 448, 449, 450, 451, and any number passed to `Err.Raise`.
-`Erl` returns 0, because numeric line labels are not supported.
+424, 429, 438, 440, 448, 449, 450, 451, 457, 32811, and any number passed to
+`Err.Raise`. `Erl` is the last numeric line label (`30 x = 1 / 0`) reached in
+the procedure that failed, or 0.

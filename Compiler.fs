@@ -899,6 +899,10 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
             emit ctx (LoadLocal 0) 0
             compileLetValue ctx expr false
             emit ctx (SetMember (name, false)) 0
+        | _ when containsSetName ctx.ArrayVars name && (match declaredTypeName ctx name with Some t -> (udtIndex ctx t).IsNone | None -> false) ->
+            // `arr = Split(...)` replaces a typed dynamic array.
+            compileExpression ctx expr
+            storeRaw ctx name
         | GlobalLoc slot when letsThroughObject ctx name ->
             emitEnsureNew ctx name
             compileLetValue ctx expr false
@@ -919,7 +923,11 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
     | IndexedAssignment (name, indices, valueExpr) ->
         emitLoadVar ctx name
         for index in indices do compileExpression ctx index
-        let elementType = declaredTypeName ctx name
+        // Elements of typed arrays convert; `d(k) = v` on an object does not.
+        let elementType =
+            if containsSetName ctx.ArrayVars name then declaredTypeName ctx name
+            else None
+        let elementType = elementType |> Option.filter (fun t -> ValueSemantics.declaredTypeOf t <> Some ValueSemantics.DeclaredType.Object)
         let converts = match elementType with Some t -> (ValueSemantics.declaredTypeOf t).IsSome | None -> false
         compileLetValue ctx valueExpr converts
         emitStoreConversion ctx elementType

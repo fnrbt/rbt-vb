@@ -621,6 +621,16 @@ let private cases : (string * (unit -> unit)) list = [
         if ValueSemantics.toString (VCurrency 9223372036854775807L) <> "922337203685477.5807" then fail "max currency" "922337203685477.5807" (ValueSemantics.toString (VCurrency 9223372036854775807L))
         exprs "Dim c As Currency\nc = 922337203685477#" [ "c > 0", VBoolean true ])
 
+    "Common macro idioms", (fun () ->
+        exprs "Dim arr() As String, d As Object, k, n, parts\narr = Split(\"a,b,c\", \",\")\nSet d = CreateObject(\"Scripting.Dictionary\")\nFor Each k In Split(\"a b a c a\")\nIf d.Exists(k) Then d(k) = d(k) + 1 Else d.Add k, 1\nNext\nWith d\nn = .Count\nEnd With\nFunction Parts() As String()\nParts = Split(\"x y\")\nEnd Function\nparts = Parts()" [
+            "UBound(arr)", VInteger 2
+            "arr(1)", str "b"
+            "d(\"a\")", VInteger 3
+            "n", VInteger 3
+            "UBound(parts)", VInteger 1
+            "d.Keys()(1)", str "b" ]
+        let lines = printed "Dim c As New Collection\nc.Add 5\nWith c\nDebug.Print .Count; .Item(1)\nEnd With\nDebug.Print c _\n    .Count"
+        if lines <> [ " 1  5 "; " 1 " ] then fail "With member after Debug.Print" [ " 1  5 "; " 1 " ] lines)
     // ── 8. Host-visible API ──
     "Bytecode round-trips the new values and metadata", (fun () ->
 #if FABLE_COMPILER

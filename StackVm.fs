@@ -101,6 +101,8 @@ type VmState = {
     /// Mark epoch for finding unreachable Terminable objects.
     mutable MarkEpoch: int
     Marks: Dictionary<obj, int>
+    /// Lowercased member names, so class-member lookups do not allocate.
+    LowerNames: Dictionary<string, string>
 }
 
 /// Raised by `Stop` to end the current slice.
@@ -285,6 +287,7 @@ let emptyStateWithHooks (hooks: RuntimeHooks) (constants: Value array) (program:
         Terminable = ResizeArray()
         MarkEpoch = 0
         Marks = Dictionary<obj, int>(HashIdentity.Reference)
+        LowerNames = Dictionary<string, string>()
     }
 
 let emptyState (constants: Value array) (program: BytecodeProgram) : VmState =
@@ -339,10 +342,39 @@ let inline popFrame (state: VmState) : StackFrame =
     state.GoSubSp <- frame.GoSubBase
     frame
 
+/// Field dictionaries ignore case on .NET, so `obj.Name` finds field "name"
+/// without lowercasing; under Fable keys are lowercase.
+let newFieldDictionary () =
+#if FABLE_COMPILER
+    Dictionary<string, Value>()
+#else
+    Dictionary<string, Value>(System.StringComparer.OrdinalIgnoreCase)
+#endif
+
+let inline private fieldKey (name: string) =
+#if FABLE_COMPILER
+    name.ToLowerInvariant()
+#else
+    name
+#endif
+
+/// The lowercase form of a member name (class maps are keyed lowercase).
+let private lowerName (state: VmState) (name: string) =
+#if FABLE_COMPILER
+    name.ToLowerInvariant()
+#else
+    match state.LowerNames.TryGetValue name with
+    | true, lower -> lower
+    | _ ->
+        let lower = name.ToLowerInvariant()
+        if state.LowerNames.Count < 4096 then state.LowerNames.[name] <- lower
+        lower
+#endif
+
 /// A new instance of a class or user-defined type with its declared field defaults.
 let rec newInstance (state: VmState) (classIdx: int) =
     let classDef = state.Program.Classes.[classIdx]
-    let fields = Dictionary<string, Value>()
+    let fields = newFieldDictionary ()
     for i in 0 .. classDef.Fields.Length - 1 do
         let code = if i < classDef.FieldTypes.Length then classDef.FieldTypes.[i] else 0
         fields.[classDef.Fields.[i].ToLowerInvariant()] <-
@@ -354,7 +386,7 @@ let rec newInstance (state: VmState) (classIdx: int) =
 let rec private copyValueType (state: VmState) (value: Value) =
     match value with
     | VObject o when state.Program.Classes.[o.ClassIndex].IsValueType ->
-        let fields = Dictionary<string, Value>()
+        let fields = newFieldDictionary ()
         for kv in o.Fields do fields.[kv.Key] <- copyValueType state kv.Value
         VObject { o with Fields = fields }
     | VArray a ->
@@ -520,7 +552,7 @@ let rec private callMethod (state: VmState) (name: string) (argCount: int) =
     match receiver with
     | VObject vbObj ->
         let classDef = classOf state vbObj
-        let key = name.ToLowerInvariant()
+        let key = lowerName state name
         match classCallable classDef key with
         | Some funcIdx ->
             let funcDef = state.Program.Functions.[funcIdx]
@@ -568,11 +600,12 @@ let rec private callMethod (state: VmState) (name: string) (argCount: int) =
 let private setMember (state: VmState) (obj: Value) (name: string) (value: Value) (isSet: bool) =
     match obj with
     | VObject vbObj ->
-        let key = name.ToLowerInvariant()
-        if vbObj.Fields.ContainsKey key then
-            vbObj.Fields.[key] <- value
+        let field = fieldKey name
+        if vbObj.Fields.ContainsKey field then
+            vbObj.Fields.[field] <- value
             state.Pc <- state.Pc + 1
         else
+            let key = lowerName state name
             let classDef = classOf state vbObj
             let handlers = if isSet then classDef.PropertySetters else classDef.PropertyLetters
             match Map.tryFind key handlers with
@@ -591,7 +624,7 @@ let private setMember (state: VmState) (obj: Value) (name: string) (value: Value
 let private setMemberIndexed (state: VmState) (obj: Value) (name: string) (args: Value array) (value: Value) =
     match obj with
     | VObject vbObj ->
-        let key = name.ToLowerInvariant()
+        let key = lowerName state name
         let classDef = classOf state vbObj
         match Map.tryFind key classDef.PropertyLetters |> Option.orElse (Map.tryFind key classDef.PropertySetters) with
         | Some funcIdx -> enterWithArgs state funcIdx obj (Array.append args [| value |])
@@ -827,7 +860,7 @@ let private executeCold (state: VmState) (instr: Instruction) =
         match receiver with
         | VObject vbObj ->
             let classDef = state.Program.Classes.[vbObj.ClassIndex]
-            let key = name.ToLowerInvariant()
+            let key = lowerName state name
             match classCallable classDef key with
             | Some funcIdx ->
                 let funcDef = state.Program.Functions.[funcIdx]
@@ -1254,14 +1287,15 @@ let executeOneInstruction (state: VmState) =
         let obj = pop state
         match obj with
         | VObject vbObj ->
-            let key = name.ToLowerInvariant()
-            match vbObj.Fields.TryGetValue key with
+            let field = fieldKey name
+            match vbObj.Fields.TryGetValue field with
             | true, value ->
                 match operation with
-                | MakeRefMember _ -> push state (VFieldRef (vbObj, key))
+                | MakeRefMember _ -> push state (VFieldRef (vbObj, field))
                 | _ -> push state value
                 state.Pc <- state.Pc + 1
             | false, _ ->
+                let key = lowerName state name
                 let classDef = state.Program.Classes.[vbObj.ClassIndex]
                 match Map.tryFind key classDef.PropertyGetters with
                 | Some funcIdx -> ignore (enterFunction state funcIdx obj (state.Pc + 1))

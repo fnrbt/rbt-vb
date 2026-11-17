@@ -162,6 +162,7 @@ let tokenize (source: string) =
     let tokens = ResizeArray<Token>()
     let mutable state = initialState
     let mutable precedingNewline = false
+    let mutable afterContinuation = false
     let mutable finished = false
     while not finished do
         let (nextState, hadNewline) = skipWhitespaceTracking state precedingNewline
@@ -172,6 +173,7 @@ let tokenize (source: string) =
         let col = state.Column
         let add kind lexeme =
             tokens.Add { Kind = kind; Lexeme = lexeme; Line = line; Column = col; PrecedingNewline = nl }
+            afterContinuation <- false
 
         match c with
         | '\000' -> finished <- true
@@ -201,6 +203,7 @@ let tokenize (source: string) =
                 state <- advance afterCr
                 // The physical newline is not a logical statement separator.
                 precedingNewline <- nl
+                afterContinuation <- true
             else
                 let kind = if isKeyword then Ast.Keyword else Ast.Identifier
                 add kind lexeme
@@ -218,7 +221,15 @@ let tokenize (source: string) =
         | ',' -> add Comma ","; state <- advance state; precedingNewline <- false
         | ':' -> add Colon ":"; state <- advance state; precedingNewline <- false
         | ';' -> add Semicolon ";"; state <- advance state; precedingNewline <- false
-        | '.' -> add Dot "."; state <- advance state; precedingNewline <- false
+        | '.' ->
+            // `Debug.Print .Count` in a With block: a dot after a space starts
+            // a With member (" ."), unless the line was continued.
+            let spaced =
+                state.Position > 0 && (state.Source.[state.Position - 1] = ' ' || state.Source.[state.Position - 1] = '\t')
+                && not afterContinuation && not nl
+            add Dot (if spaced then " ." else ".")
+            state <- advance state
+            precedingNewline <- false
         | '=' -> add Eq "="; state <- advance state; precedingNewline <- false
         | '+' -> add Operator "+"; state <- advance state; precedingNewline <- false
         | '-' -> add Operator "-"; state <- advance state; precedingNewline <- false

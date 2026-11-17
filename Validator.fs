@@ -159,6 +159,9 @@ let validateVBScript (program: Program) : ValidationError list =
         | GoSubStmt _ -> errors.Add(error "VBScript does not support GoSub")
         | ReturnStmt -> errors.Add(error "VBScript does not support Return")
         | LabelStmt _ -> errors.Add(error "VBScript does not support labels")
+        | Declaration (_, StaticDim _) -> errors.Add(error "VBScript does not support Static")
+        | RaiseEventStmt _ -> errors.Add(error "VBScript does not support RaiseEvent")
+        | EndStmt -> errors.Add(error "VBScript does not support End")
         | _ -> ()
     and checkTopLevel (tl: TopLevel) =
         match tl with
