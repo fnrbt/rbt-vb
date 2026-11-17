@@ -5,6 +5,7 @@ let main _ =
     let suites = [
         "public API", RegressionCases.runAll
         "value semantics", SemanticCases.run
+        "0.3.0 release", ReleaseCases.runAll
 #if !FABLE_COMPILER
         "persistence", PersistenceCases.run
         "existing fixtures", FixtureCases.run

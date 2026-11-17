@@ -148,6 +148,10 @@ let validateVBScript (program: Program) : ValidationError list =
         | CallStmt (target, arguments) ->
             checkExpression target
             for arg in arguments do checkExpression arg
+        | ResumeStmt _ -> errors.Add(error "VBScript does not support Resume")
+        | DefaultAssignment (target, value, _) ->
+            checkExpression target
+            checkExpression value
         | GoToStmt _ -> errors.Add(error "VBScript does not support GoTo")
         | GoSubStmt _ -> errors.Add(error "VBScript does not support GoSub")
         | ReturnStmt -> errors.Add(error "VBScript does not support Return")

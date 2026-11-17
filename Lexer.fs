@@ -70,12 +70,37 @@ let private skipLineComment (state: LexerState) =
         st <- advance st
     st
 
+let private isHexDigit c = isDigit c || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+
+let private isTypeSuffix c = c = '&' || c = '%' || c = '#' || c = '!' || c = '@'
+
+/// Decimal, exponent and type-suffix literals: 12, 1.5, 1E3, 2.5E-3, 5&, 5#.
 let private lexNumber (state: LexerState) =
     let mutable st = state
     while isDigit (peek st) || peek st = '.' do
         st <- advance st
+    if (peek st = 'e' || peek st = 'E') &&
+       (isDigit (peekN st 1) || ((peekN st 1 = '+' || peekN st 1 = '-') && isDigit (peekN st 2))) then
+        st <- advance st
+        if peek st = '+' || peek st = '-' then st <- advance st
+        while isDigit (peek st) do st <- advance st
+    if isTypeSuffix (peek st) && not (isAlphaNumeric (peekN st 1)) && peekN st 1 <> '"' then
+        st <- advance st
     let lexeme = state.Source.Substring(state.Position, st.Position - state.Position)
     (lexeme, st)
+
+/// `&H1F`, `&O17` (optionally with a `&` / `%` type suffix).
+let private tryLexRadix (state: LexerState) =
+    let marker = peekN state 1
+    let isHex = marker = 'h' || marker = 'H'
+    let isOct = marker = 'o' || marker = 'O'
+    let digitOk c = if isHex then isHexDigit c else c >= '0' && c <= '7'
+    if (isHex || isOct) && digitOk (peekN state 2) then
+        let mutable st = advance (advance state)
+        while digitOk (peek st) do st <- advance st
+        if (peek st = '&' || peek st = '%') && not (isAlphaNumeric (peekN st 1)) then st <- advance st
+        Some (state.Source.Substring(state.Position, st.Position - state.Position), st)
+    else None
 
 let private lexString (state: LexerState) =
     let stateAfterOpenQuote = advance state
@@ -107,6 +132,8 @@ let private lexIdentifier (state: LexerState) =
     while isAlphaNumeric (peek st) do
         st <- advance st
     let lexeme = state.Source.Substring(state.Position, st.Position - state.Position)
+    // `Left$`, `name$`, `count%`: the type-declaration character is dropped.
+    let st = if (peek st = '$' || peek st = '%') && lexeme <> "_" then advance st else st
     let lower = lexeme.ToLower()
     let isKeyword = Set.contains lower keywords
     // Normalize keyword lexemes to lowercase for consistent pattern matching
@@ -196,7 +223,15 @@ let tokenize (source: string) =
                 add Operator ">"
                 state <- advance state
             precedingNewline <- false
-        | '&' -> add Operator "&"; state <- advance state; precedingNewline <- false
+        | '&' ->
+            match tryLexRadix state with
+            | Some (lexeme, newState) ->
+                add Number lexeme
+                state <- newState
+            | None ->
+                add Operator "&"
+                state <- advance state
+            precedingNewline <- false
         | _ -> add Operator (string c); state <- advance state; precedingNewline <- false
     tokens.Add { Kind = EOF; Lexeme = ""; Line = state.Line; Column = state.Column; PrecedingNewline = precedingNewline }
     resizeArrayToList tokens

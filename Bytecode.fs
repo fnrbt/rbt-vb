@@ -80,6 +80,20 @@ type Opcode =
     | MakeRefLocal of int
     | MakeRefGlobal of int
     | Halt
+    // 0.3.0
+    | Coerce of int               // ValueSemantics.DeclaredType code
+    | LetValue                    // Let-coercion: read a host object's default property
+    | ForEachPrepare              // collection -> array snapshot
+    | Resume of int               // 0 = Resume (retry), 1 = Resume Next
+    | ResumeLabel of int
+    | OnErrorGoToMinusOne
+    | LoadErrObject
+    | LoadErrSource
+    | SetDefault                  // obj = value through the default member
+    | CopyUdt                     // copy a user-defined type value
+    | ArrayFill of int            // fill Empty elements with constant
+    | ArrayFillNew of int         // fill Empty elements with new instances of a class
+    | CallMethodNamed of string * string array  // method, argument names ("" = positional)
 
 type Instruction = {
     Opcode: Opcode
@@ -96,6 +110,10 @@ type FunctionDef = {
     ByRefParams: bool array
     Code: Instruction array
     StartPC: int
+    Module: string
+    ParamNames: string array
+    /// Initial local slots (typed defaults), or empty for all-Empty locals.
+    InitialLocals: Value array
 }
 
 type ClassDef = {
@@ -105,6 +123,10 @@ type ClassDef = {
     PropertyGetters: Map<string, int>
     PropertyLetters: Map<string, int>
     PropertySetters: Map<string, int>
+    IsValueType: bool
+    /// Per field: 0 Variant, > 0 a ValueSemantics.DeclaredType code, < 0 a
+    /// nested user-defined type -(classIndex + 1).
+    FieldTypes: int array
 }
 
 type BytecodeProgram = {
@@ -115,6 +137,8 @@ type BytecodeProgram = {
     GlobalNames: string array
     Functions: FunctionDef array
     Classes: ClassDef array
+    /// Start pc of each module's module-level code in the main region, in order.
+    ModuleStarts: (int * string) array
 }
 
 // Structural validation protects the runtime from malformed bytecode; it is not a sandbox.
@@ -132,7 +156,14 @@ let validate (program: BytecodeProgram) =
     for f in program.Functions do
         check (f.ParamsCount >= 0 && f.LocalsCount > f.ParamsCount && f.LocalsCount <= 1000000) "function locals"
         check (not (isNull f.ByRefParams) && f.ByRefParams.Length = f.ParamsCount && validTarget f.StartPC) "function metadata"
+        check (not (isNull f.InitialLocals) && (f.InitialLocals.Length = 0 || f.InitialLocals.Length = f.LocalsCount)) "function initial locals"
+        for v in f.InitialLocals do
+            match v with
+            | VInteger _ | VDouble _ | VString _ | VBoolean _ | VEmpty | VNothing -> ()
+            | _ -> failwith "Invalid bytecode: runtime value in initial locals"
     for c in program.Classes do
+        check (not (isNull c.FieldTypes) && c.FieldTypes.Length <= c.Fields.Length) "class fields"
+        for code in c.FieldTypes do check (code >= -program.Classes.Length && code <= 64) "field type"
         for m in [c.Methods; c.PropertyGetters; c.PropertyLetters; c.PropertySetters] do
             for KeyValue(_, index) in m do
                 check (index >= 0 && index < program.Functions.Length) "class member"
@@ -141,10 +172,13 @@ let validate (program: BytecodeProgram) =
         | LoadConst i -> check (i >= 0 && i < program.Constants.Length) "constant slot"
         | LoadGlobal i | StoreGlobal i | MakeRefGlobal i -> check (i >= 0 && i < program.Globals) "global slot"
         | LoadLocal i | StoreLocal i | MakeRefLocal i -> check (i >= 0 && i < 1000000) "local slot"
-        | Jump i | JumpIfFalse i | JumpIfTrue i | GoSub i | OnErrorGoToLabel i | Statement i -> check (validTarget i) "target"
+        | Jump i | JumpIfFalse i | JumpIfTrue i | GoSub i | OnErrorGoToLabel i | ResumeLabel i | Statement i -> check (validTarget i) "target"
+        | ArrayFill i -> check (i >= 0 && i < program.Constants.Length) "constant slot"
+        | ArrayFillNew i -> check (i >= 0 && i < program.Classes.Length) "class"
         | Call (i, n) -> check (i >= 0 && i < program.Functions.Length && n >= 0 && n <= program.Functions.[i].ParamsCount) "call"
         | NewObj i -> check (i >= 0 && i < program.Classes.Length) "class"
         | ArrayNew n | ArrayGet n | ArraySet n | ReDimPreserve n | MakeRefArray n -> check (n > 0 && n <= 32) "array rank"
+        | CallMethodNamed (_, names) -> check (not (isNull names) && names.Length <= 1024) "argument count"
         | CallMethod (_, n) | CallDefault n | CallBuiltin (_, n) -> check (n >= 0 && n <= 1024) "argument count"
         | _ -> ()
 
@@ -182,6 +216,6 @@ let validate (program: BytecodeProgram) =
     for pc in 0 .. program.Code.Length - 1 do
         match program.Code.[pc].Opcode with
         | Jump target when pc = 0 && starts.Length > 0 -> check (target = mainStart) "entry point"
-        | Jump target | JumpIfFalse target | JumpIfTrue target | GoSub target | OnErrorGoToLabel target | Statement target ->
+        | Jump target | JumpIfFalse target | JumpIfTrue target | GoSub target | OnErrorGoToLabel target | ResumeLabel target | Statement target ->
             check (regions.[pc] = regions.[target]) "cross-region target"
         | _ -> ()

@@ -69,6 +69,8 @@ and Expression =
     | MeExpr
     | TypeOfIs of Expression * string
     | WithDotExpr
+    | MissingArg                 // omitted argument: F(1, , 3)
+    | NamedArg of string * Expression  // name:=value
 
 type VarDeclarator = {
     Name: string
@@ -94,6 +96,7 @@ type Parameter = {
 type OnErrorAction =
     | ResumeNext
     | GoToZero
+    | GoToMinusOne
     | GoToLabel of string       // VBA only
 
 type CaseTest =
@@ -125,6 +128,14 @@ type Statement =
     | OnError of OnErrorAction
     | WithStmt of Expression * Statement list
     | EraseStmt of string
+    | ResumeStmt of ResumeTarget
+    /// `target = value` through the default member, e.g. `ws.Range("A1") = 5`.
+    | DefaultAssignment of Expression * Expression * bool // isSet
+
+and ResumeTarget =
+    | ResumeRetry
+    | ResumeNextStatement
+    | ResumeAtLabel of string
 
 and DoCondition = {
     Condition: Expression

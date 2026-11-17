@@ -7,6 +7,7 @@
     <ProjectReference Include="../Rbt.Vb.fsproj" />
     <Compile Include="RegressionCases.fs" />
     <Compile Include="SemanticCases.fs" />
+    <Compile Include="ReleaseCases.fs" />
     <Compile Include="PersistenceCases.fs" />
     <Compile Include="FixtureCases.fs" />
     <Compile Include="Program.fs" />

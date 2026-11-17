@@ -114,9 +114,28 @@ let pidentifier : Parser<string> = fun tokens ->
     | [] -> Error ("Expected identifier but reached EOF", { Kind = Ast.EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
 
 let private numberLiteral (text: string) =
-    match System.Int32.TryParse text with
-    | true, value -> Literal (Integer value)
-    | _ -> Literal (Double (float text))
+    if text.StartsWith "&" then
+        let isLong = text.EndsWith "&" && text.Length > 2
+        let body = text.Substring(2).TrimEnd('&', '%')
+        let radix = if text.[1] = 'h' || text.[1] = 'H' then 16 else 8
+        let mutable value = 0.0
+        for c in body do
+            let digit = if c >= '0' && c <= '9' then int c - int '0' else int (System.Char.ToUpperInvariant c) - int 'A' + 10
+            value <- value * float radix + float digit
+        if value > 4294967295.0 then failwithf "Overflow in literal %s" text
+        // Without a & suffix, values that fit 16 bits are Integers (&HFFFF = -1).
+        let signed =
+            if not isLong && value <= 65535.0 then (if value >= 32768.0 then value - 65536.0 else value)
+            elif value >= 2147483648.0 then value - 4294967296.0
+            else value
+        Literal (Integer (int signed))
+    else
+        let suffix = text.[text.Length - 1]
+        let body = if System.Char.IsDigit suffix || suffix = '.' then text else text.Substring(0, text.Length - 1)
+        let isFloat = suffix = '#' || suffix = '!' || suffix = '@'
+        match System.Int32.TryParse body with
+        | true, value when not isFloat -> Literal (Integer value)
+        | _ -> Literal (Double (float body))
 
 let pnumber : Parser<Expression> = fun tokens ->
     match tokens with
@@ -211,6 +230,38 @@ and pprimary : Parser<Expression> = fun tokens ->
     | head :: _ -> Error (sprintf "Expected expression but got %A ('%s')" head.Kind head.Lexeme, head)
     | [] -> Error ("Expected expression but reached EOF", { Kind = Ast.EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
 
+/// One call argument: `expr` or `name:=expr`.
+and pargument : Parser<Expression> = fun tokens ->
+    match tokens with
+    | { Kind = (Ast.Identifier | Keyword); Lexeme = name } :: { Kind = Colon } :: { Kind = Eq; PrecedingNewline = false } :: rest ->
+        match pexpression rest with
+        | Success (value, next) -> Success (NamedArg (name, value), next)
+        | Error (msg, token) -> Error (msg, token)
+    | _ -> pexpression tokens
+
+/// `(a, , c)`: an argument list in which arguments may be omitted.
+and pargList : Parser<Expression list> = fun tokens ->
+    match tokens with
+    | { Kind = LParen } :: { Kind = RParen } :: rest -> Success ([], rest)
+    | { Kind = LParen } :: rest ->
+        let rec loop acc toks =
+            let item, afterItem =
+                match toks with
+                | { Kind = Comma } :: _ | { Kind = RParen } :: _ -> Success (MissingArg, toks), toks
+                | _ -> pargument toks, toks
+            match item with
+            | Error (msg, token) -> Error (msg, token)
+            | Success (arg, next) ->
+                ignore afterItem
+                match next with
+                | { Kind = Comma } :: tail -> loop (arg :: acc) tail
+                | { Kind = RParen } :: tail -> Success (List.rev (arg :: acc), tail)
+                | head :: _ -> Error ("Expected ',' or ')' in argument list", head)
+                | [] -> Error ("Expected ')' but reached EOF", { Kind = EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
+        loop [] rest
+    | head :: _ -> Error ("Expected '('", head)
+    | [] -> Error ("Expected '(' but reached EOF", { Kind = EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
+
 /// Postfix loop: handles .name (member access) and (args) (call/index)
 and ppostfix : Parser<Expression> = fun tokens ->
     match pprimary tokens with
@@ -222,7 +273,7 @@ and ppostfix : Parser<Expression> = fun tokens ->
                 | Success (name, remaining2) -> loop (Member (acc, name)) remaining2
                 | Error (msg, token) -> Error (msg, token)
             | { Kind = LParen; PrecedingNewline = false } :: _ ->
-                match (between (ptoken LParen) (ptoken RParen) (sepBy (ptoken Comma) pexpression)) remaining with
+                match pargList remaining with
                 | Success (args, remaining2) -> loop (Call (acc, args)) remaining2
                 | Error (msg, token) -> Error (msg, token)
             | _ -> Success (acc, remaining)
@@ -550,6 +601,8 @@ let rec psetStmtFull : Parser<Statement> = fun tokens ->
                         Success (Set (name, value), remaining3)
                     | Ast.Call (Identifier name, indices) ->
                         Success (IndexedAssignment (name, indices, value), remaining3)
+                    | Ast.Call _ ->
+                        Success (DefaultAssignment (expr, value, true), remaining3)
                     | _ -> Error ("Expected identifier or member after Set", List.head remaining)
                 | Error (msg, token) -> Error (msg, token)
             | head :: _ -> Error ("Expected '=' after Set target", head)
@@ -571,20 +624,48 @@ and pSubCallNoParens : Parser<Statement> = fun tokens ->
         | { PrecedingNewline = true } :: _ -> Error ("New line", List.head remaining)
         | [] -> Error ("No args", { Kind = Ast.EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
         | _ ->
-            match pexpression remaining with
+            let isDebugPrint =
+                match target with
+                | Member (Identifier objectName, memberName) ->
+                    objectName.ToLowerInvariant() = "debug" && memberName.ToLowerInvariant() = "print"
+                | _ -> false
+            let atEnd rem =
+                match rem with
+                | { Kind = EOF } :: _ | { Kind = Colon } :: _ | { PrecedingNewline = true } :: _ | [] -> true
+                | { Kind = Keyword; Lexeme = "else" } :: _ -> true
+                | _ -> false
+            if isDebugPrint then
+                // Debug.Print items separated by ';' (no space) or ',' (tab).
+                let rec items acc rem =
+                    if atEnd rem then Success (List.rev acc, rem)
+                    else
+                        match rem with
+                        | { Kind = Semicolon } :: tail -> items acc tail
+                        | { Kind = Comma } :: tail -> items (Literal (String "\t") :: acc) tail
+                        | _ ->
+                            match pexpression rem with
+                            | Success (item, next) -> items (item :: acc) next
+                            | Error (msg, token) -> Error (msg, token)
+                match items [] remaining with
+                | Success (args, rest) -> Success (ExpressionStmt (Ast.Call (target, args)), rest)
+                | Error (msg, token) -> Error (msg, token)
+            else
+            let firstArg =
+                match remaining with
+                | { Kind = Comma } :: _ -> Success (MissingArg, remaining)
+                | _ -> pargument remaining
+            match firstArg with
             | Success (firstArg, remaining2) ->
                 let rec parseMoreArgs acc rem =
                     match rem with
                     | { Kind = Comma } :: tail ->
                         match tail with
                         | { Kind = Comma } :: _ ->
-                            parseMoreArgs (Literal Empty :: acc) tail
-                        | { Kind = EOF } :: _
-                        | { Kind = Colon } :: _
-                        | { PrecedingNewline = true } :: _ ->
-                            (List.rev (Literal Empty :: acc), tail)
+                            parseMoreArgs (MissingArg :: acc) tail
+                        | _ when atEnd tail ->
+                            (List.rev (MissingArg :: acc), tail)
                         | _ ->
-                            match pexpression tail with
+                            match pargument tail with
                             | Success (arg, rem2) -> parseMoreArgs (arg :: acc) rem2
                             | Error _ -> (List.rev acc, rem)
                     | _ -> (List.rev acc, rem)
@@ -859,6 +940,8 @@ and pOnError (dialect: Dialect) : Parser<Statement> = fun tokens ->
             match tail with
             | { Kind = Number; Lexeme = "0" } :: tail2 ->
                 Success (OnError GoToZero, tail2)
+            | { Kind = Operator; Lexeme = "-" } :: { Kind = Number; Lexeme = "1" } :: tail2 ->
+                Success (OnError GoToMinusOne, tail2)
             | _ when dialect = VBA ->
                 match pidentifier tail with
                 | Success (label, remaining2) -> Success (OnError (GoToLabel label), remaining2)
@@ -876,6 +959,17 @@ and pwithStmt (dialect: Dialect) : Parser<Statement> = fun tokens ->
         | Success (body, remaining2) -> Success (WithStmt (expr, body), remaining2)
         | Error (msg, token) -> Error (msg, token)
     | Error (msg, token) -> Error (msg, token)
+
+and presumeStmt : Parser<Statement> = fun tokens ->
+    match tokens with
+    | { Kind = Keyword; Lexeme = "resume" } :: rest ->
+        match rest with
+        | { Kind = Keyword; Lexeme = "next"; PrecedingNewline = false } :: tail -> Success (ResumeStmt ResumeNextStatement, tail)
+        | { Kind = Number; Lexeme = "0"; PrecedingNewline = false } :: tail -> Success (ResumeStmt ResumeRetry, tail)
+        | { Kind = Ast.Identifier; Lexeme = label; PrecedingNewline = false } :: tail -> Success (ResumeStmt (ResumeAtLabel label), tail)
+        | _ -> Success (ResumeStmt ResumeRetry, rest)
+    | head :: _ -> Error ("Expected Resume", head)
+    | [] -> Error ("Expected Resume", { Kind = EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false })
 
 and peraseStmt : Parser<Statement> = fun tokens ->
     match (pkeyword "erase" >>. pidentifier) tokens with
@@ -961,6 +1055,7 @@ and ptargetAssignment : Parser<Statement> = fun tokens ->
                 | Identifier name -> Success (Assignment (name, value), remaining2)
                 | Member (objExpr, memberName) -> Success (MemberAssignment (objExpr, memberName, value, false), remaining2)
                 | Ast.Call (Identifier name, indices) -> Success (IndexedAssignment (name, indices, value), remaining2)
+                | Ast.Call _ -> Success (DefaultAssignment (expr, value, false), remaining2)
                 | headExpr -> Error (sprintf "Expected assignable target but got %A" headExpr, List.head remaining)
             | Error (msg, token) -> Error (msg, token)
         | head :: _ -> Error ("Expected assignment", head)
@@ -996,6 +1091,7 @@ and pstatementAfterColons (dialect: Dialect) : Parser<Statement> = fun tokens ->
                 | "on" -> pOnError dialect tokens
                 | "with" -> pwithStmt dialect tokens
                 | "erase" -> peraseStmt tokens
+                | "resume" -> presumeStmt tokens
                 | "redim" -> predim tokens
                 | "dim" -> pdim dialect tokens
                 | "const" -> pconst dialect tokens
@@ -1238,6 +1334,11 @@ let poption : Parser<TopLevel> = fun tokens ->
         when option.Lexeme.ToLowerInvariant() = "compare" && not option.PrecedingNewline &&
              not value.PrecedingNewline && (value.Lexeme.ToLowerInvariant() = "text" || value.Lexeme.ToLowerInvariant() = "binary") ->
         Success (OptionStmt ("compare " + value.Lexeme.ToLowerInvariant()), tail)
+    | Success (_, option :: { Kind = Number; Lexeme = ("0" | "1") as value } :: tail)
+        when option.Lexeme.ToLowerInvariant() = "base" && not option.PrecedingNewline ->
+        Success (OptionStmt ("base " + value), tail)
+    | Success (_, { Kind = Keyword; Lexeme = "private" } :: m :: tail) when m.Lexeme.ToLowerInvariant() = "module" ->
+        Success (OptionStmt "private module", tail)
     | Success (_, option :: tail) when option.Lexeme.ToLowerInvariant() = "compare" ->
         Error ("Expected Text or Binary after Option Compare", List.head tail)
     | Success (_, { Kind = Keyword; Lexeme = lexeme } :: tail)
@@ -1345,6 +1446,28 @@ let private parseSource dialect source =
         | Error (msg, token) -> Result.Error (sprintf "Parse error at line %d, column %d: %s" token.Line token.Column msg)
     with ex ->
         Result.Error (sprintf "Parse error: %s" ex.Message)
+
+/// Parse returning (message, line, column) on failure.
+let parseDetailed (dialect: Dialect) (source: string) : Result<Program, string * int * int> =
+    try
+        match pprogram dialect (Lexer.tokenize source) with
+        | Success (program, { Kind = EOF } :: _) -> Ok program
+        | Success (_, token :: _) -> Result.Error ("Expected end of input", token.Line, token.Column)
+        | Success (_, []) -> Result.Error ("Expected end of input", 0, 0)
+        | Error (msg, token) -> Result.Error (msg, token.Line, token.Column)
+    with ex ->
+        Result.Error (ex.Message, 0, 0)
+
+/// Parse a standalone expression (for an Immediate window `?expr`).
+let parseExpression (source: string) : Result<Expression, string * int * int> =
+    try
+        match pexpression (Lexer.tokenize source) with
+        | Success (expr, { Kind = EOF } :: _) -> Ok expr
+        | Success (_, token :: _) -> Result.Error ("Expected end of expression", token.Line, token.Column)
+        | Success (_, []) -> Ok (Literal Empty)
+        | Error (msg, token) -> Result.Error (msg, token.Line, token.Column)
+    with ex ->
+        Result.Error (ex.Message, 0, 0)
 
 /// Strict mode: parse only complete input with the selected dialect grammar.
 let parse_dialect (dialect: Dialect) (source: string) : Result<Program, string> =

@@ -54,6 +54,8 @@ type private Probe() =
                 calls.Add(Array.copy args)
                 Some VEmpty
             else None
+        member this.CallNamed name args _ = (this :> IHostObject).CallMethod name args
+        member _.Enumerate () = None
 
 let private cases : (string * (unit -> unit)) list = [
     "C01 incomplete declaration rejects the whole input", (fun () ->

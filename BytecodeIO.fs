@@ -9,7 +9,7 @@ open Values
 open Bytecode
 
 let magic = 0x46_56_42_43   // "FVBC"
-let version = 2
+let version = 3
 
 #if FABLE_COMPILER
 let serialize (_: BytecodeProgram) : byte[] = failwith "bytecode serialization is native-only"
@@ -130,6 +130,19 @@ let private writeOpcode (w: BinaryWriter) (op: Opcode) =
     | MakeRefLocal i -> t 61; w.Write i
     | MakeRefGlobal i -> t 62; w.Write i
     | Halt -> t 63
+    | Coerce n -> t 68; w.Write n
+    | LetValue -> t 69
+    | ForEachPrepare -> t 70
+    | Resume n -> t 71; w.Write n
+    | ResumeLabel n -> t 72; w.Write n
+    | OnErrorGoToMinusOne -> t 73
+    | LoadErrObject -> t 74
+    | LoadErrSource -> t 75
+    | SetDefault -> t 76
+    | CopyUdt -> t 77
+    | ArrayFill n -> t 78; w.Write n
+    | ArrayFillNew n -> t 79; w.Write n
+    | CallMethodNamed (name, names) -> t 80; w.Write name; w.Write names.Length; (for n in names do w.Write n)
 
 let private readOpcode (r: BinaryReader) : Opcode =
     let i () = r.ReadInt32()
@@ -203,6 +216,23 @@ let private readOpcode (r: BinaryReader) : Opcode =
     | 65 -> ArrayGetFlat
     | 66 -> MakeRefArray (i())
     | 67 -> MakeRefMember (s())
+    | 68 -> Coerce (i())
+    | 69 -> LetValue
+    | 70 -> ForEachPrepare
+    | 71 -> Resume (i())
+    | 72 -> ResumeLabel (i())
+    | 73 -> OnErrorGoToMinusOne
+    | 74 -> LoadErrObject
+    | 75 -> LoadErrSource
+    | 76 -> SetDefault
+    | 77 -> CopyUdt
+    | 78 -> ArrayFill (i())
+    | 79 -> ArrayFillNew (i())
+    | 80 ->
+        let name = s()
+        let count = i()
+        if count < 0 || count > 1024 then failwith "Invalid argument count"
+        CallMethodNamed (name, Array.init count (fun _ -> s()))
     | t -> failwithf "bad opcode tag %d" t
 
 let private writeArray (w: BinaryWriter) (writeItem: 'a -> unit) (xs: 'a array) =
@@ -245,14 +275,20 @@ let serialize (prog: BytecodeProgram) : byte[] =
         w.Write f.LocalsCount
         writeArray w (fun (b: bool) -> w.Write b) f.ByRefParams
         writeArray w (writeInstr w) f.Code
-        w.Write f.StartPC) prog.Functions
+        w.Write f.StartPC
+        w.Write f.Module
+        writeArray w (fun (n: string) -> w.Write n) f.ParamNames
+        writeArray w (writeValue w) f.InitialLocals) prog.Functions
     writeArray w (fun (c: ClassDef) ->
         w.Write c.Name
         writeArray w (fun (s: string) -> w.Write s) c.Fields
         writeMap w c.Methods
         writeMap w c.PropertyGetters
         writeMap w c.PropertyLetters
-        writeMap w c.PropertySetters) prog.Classes
+        writeMap w c.PropertySetters
+        w.Write c.IsValueType
+        writeArray w (fun (code: int) -> w.Write code) c.FieldTypes) prog.Classes
+    writeArray w (fun ((pc: int), (name: string)) -> w.Write pc; w.Write name) prog.ModuleStarts
     w.Flush()
     ms.ToArray()
 
@@ -276,7 +312,10 @@ let deserialize (bytes: byte[]) : BytecodeProgram =
             let byref = readArray r (fun () -> r.ReadBoolean())
             let fcode = readArray r (fun () -> readInstr r)
             let start = r.ReadInt32()
-            { Name = name; ParamsCount = p; LocalsCount = l; ByRefParams = byref; Code = fcode; StartPC = start })
+            let moduleName = readString r
+            let paramNames = readArray r (fun () -> readString r)
+            let initialLocals = readArray r (fun () -> readValue r)
+            { Name = name; ParamsCount = p; LocalsCount = l; ByRefParams = byref; Code = fcode; StartPC = start; Module = moduleName; ParamNames = paramNames; InitialLocals = initialLocals })
     let classes =
         readArray r (fun () ->
             let name = readString r
@@ -285,11 +324,14 @@ let deserialize (bytes: byte[]) : BytecodeProgram =
             let getters = readMap r
             let letters = readMap r
             let setters = readMap r
+            let isValueType = r.ReadBoolean()
+            let fieldTypes = readArray r (fun () -> r.ReadInt32())
             { Name = name; Fields = fields; Methods = methods
-              PropertyGetters = getters; PropertyLetters = letters; PropertySetters = setters })
+              PropertyGetters = getters; PropertyLetters = letters; PropertySetters = setters; IsValueType = isValueType; FieldTypes = fieldTypes })
+    let moduleStarts = readArray r (fun () -> let pc = r.ReadInt32() in pc, readString r)
     if ms.Position <> ms.Length then failwith "Trailing bytecode data"
     let program = { TextCompare = textCompare; Code = code; Constants = constants; Globals = globals; GlobalNames = globalNames
-                    Functions = functions; Classes = classes }
+                    Functions = functions; Classes = classes; ModuleStarts = moduleStarts }
     validate program
     program
 #endif
