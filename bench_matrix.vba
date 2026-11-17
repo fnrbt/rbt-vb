@@ -9,7 +9,7 @@ Function CreateMatrix(size As Long, seed As Long) As Variant
   Dim val As Long
   val = seed
   For i = 0 To size * size - 1
-    val = (val * 1103515245 + 12345) Mod 65536
+    val = (val * 25173 + 13849) Mod 65536
     mat(i) = val Mod 100
   Next
   CreateMatrix = mat

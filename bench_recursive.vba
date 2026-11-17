@@ -74,7 +74,7 @@ Dim seed As Long
 seed = 42
 Dim k As Long
 For k = 0 To ARR_SIZE - 1
-  seed = (seed * 1103515245 + 12345) Mod 65536
+  seed = (seed * 25173 + 13849) Mod 65536
   data(k) = seed
 Next
 

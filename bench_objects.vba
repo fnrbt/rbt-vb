@@ -50,16 +50,16 @@ Dim seed As Long
 seed = 12345
 For i = 0 To NUM_PARTICLES - 1
   Set particles(i) = New Particle
-  seed = (seed * 1103515245 + 12345) Mod 65536
+  seed = (seed * 25173 + 13849) Mod 65536
   Dim px As Double
   px = (seed Mod 1000)
-  seed = (seed * 1103515245 + 12345) Mod 65536
+  seed = (seed * 25173 + 13849) Mod 65536
   Dim py As Double
   py = (seed Mod 500)
-  seed = (seed * 1103515245 + 12345) Mod 65536
+  seed = (seed * 25173 + 13849) Mod 65536
   Dim pvx As Double
   pvx = (seed Mod 200) - 100
-  seed = (seed * 1103515245 + 12345) Mod 65536
+  seed = (seed * 25173 + 13849) Mod 65536
   Dim pvy As Double
   pvy = (seed Mod 200) - 100
   particles(i).Init px, py, pvx, pvy, 1.0
