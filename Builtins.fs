@@ -55,6 +55,16 @@ let randomize (seed: float) =
     let mixed = (((hi &&& 0xFFFFL) ^^^ (hi >>> 16)) <<< 8) &&& 0xFFFF00L
     rndSeed <- (rndSeed &&& 0xFFL) ||| mixed
 
+/// Text of a `Debug.Print x;` waiting for the rest of its line.
+let mutable private pendingPrint = ""
+
+/// Print a `Debug.Print x;` line that nothing completed (at the end of a run).
+let flushPendingPrint (hooks: RuntimeHooks) =
+    if pendingPrint <> "" then
+        let text = pendingPrint
+        pendingPrint <- ""
+        hooks.Print text
+
 let rec private typeName = function
     | VInteger n when n >= -32768 && n <= 32767 -> "Integer"
     | VInteger _ -> "Long"
@@ -344,9 +354,11 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
             sb.Append(printable args.[i]) |> ignore
         hooks.Print (sb.ToString())
         VEmpty
-    | "debug.print" ->
+    | "debug.print" | "debug.print;" ->
         // Numbers print with a sign position and a trailing space, as in VBA.
-        let sb = StringBuilder()
+        // A trailing ';' or ',' keeps the text for the next Debug.Print.
+        let sb = StringBuilder(pendingPrint)
+        pendingPrint <- ""
         for i in 0 .. argc - 1 do
             match scalar args.[i] with
             | VInteger number -> sb.Append((if number >= 0 then " " else "") + string number + " ") |> ignore
@@ -355,7 +367,8 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
                 sb.Append((if text.StartsWith "-" then "" else " ") + text + " ") |> ignore
             | VBoolean b -> sb.Append(if b then "True" else "False") |> ignore
             | _ -> sb.Append(printable args.[i]) |> ignore
-        hooks.Print (sb.ToString())
+        if name = "debug.print;" then pendingPrint <- sb.ToString()
+        else hooks.Print (sb.ToString())
         VEmpty
     | "ismissing" ->
         argCount args 1 1

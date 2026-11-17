@@ -1752,6 +1752,7 @@ let run (state: VmState) =
         state.Paused <- false
     state.Paused <- false
     if not state.EndRequested then finalizeObjects state
+    Builtins.flushPendingPrint state.Hooks
 
 let private setInitialGlobals (state: VmState) (globals: seq<string * Value>) =
     for name, value in globals do

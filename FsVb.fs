@@ -112,6 +112,7 @@ let executeWith (hooks: RuntimeHooks) (instructionLimit: int option) (globals: s
                 Number = 17; Description = "Instruction limit exceeded"; Source = state.ProjectName
                 Line = (let line, _, _ = StackVm.currentLocation state in line); Procedure = ""; Module = "" })
         if not state.EndRequested then StackVm.finalizeObjects state
+        Builtins.flushPendingPrint state.Hooks
     state
 
 let tryGetGlobal (name: string) (state: StackVm.VmState) =
@@ -663,6 +664,7 @@ type Session private (project: Project, ctx: Compiler.CompileContext, state: Sta
                         else
                             // Objects the module state no longer reaches are terminated.
                             (try StackVm.collectUnreachable state with _ -> ())
+                            Builtins.flushPendingPrint state.Hooks
                             reset ()
                             Finished value
                     elif state.Paused then

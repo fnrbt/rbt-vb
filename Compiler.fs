@@ -685,9 +685,9 @@ let rec compileExpression (ctx: CompileContext) (expr: Expression) =
         | _ -> emit ctx LoadEmpty 0
     | Ast.Call (Member (Identifier objName, methodName), args) when normalizeName objName = "debug" && not (isVariableName ctx objName) ->
         match normalizeName methodName with
-        | "print" ->
+        | "print" | "print;" ->
             emitArguments ctx args compileExpression
-            emit ctx (CallBuiltin ("debug.print", List.length args)) 0
+            emit ctx (CallBuiltin ("debug." + normalizeName methodName, List.length args)) 0
         | _ ->
             // Debug.Assert and friends: evaluate the arguments, no effect.
             for arg in args do

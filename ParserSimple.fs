@@ -688,6 +688,15 @@ and pSubCallNoParens : Parser<Statement> = fun tokens ->
                             match pexpression rem with
                             | Success (item, next) -> items (item :: acc) next
                             | Error (msg, token) -> Error (msg, token)
+                // A trailing ';' or ',' continues the line at the next Debug.Print.
+                let rec lastSeparator (toks: Token list) (previous: Token option) =
+                    if atEnd toks then previous
+                    else match toks with t :: tail -> lastSeparator tail (Some t) | [] -> previous
+                let continues =
+                    match lastSeparator remaining None with
+                    | Some { Kind = (Semicolon | Comma) } -> true
+                    | _ -> false
+                let target = if continues then (match target with Member (o, _) -> Member (o, "Print;") | t -> t) else target
                 match items [] remaining with
                 | Success (args, rest) -> Success (ExpressionStmt (Ast.Call (target, args)), rest)
                 | Error (msg, token) -> Error (msg, token)

@@ -630,7 +630,9 @@ let private cases : (string * (unit -> unit)) list = [
             "UBound(parts)", VInteger 1
             "d.Keys()(1)", str "b" ]
         let lines = printed "Dim c As New Collection\nc.Add 5\nWith c\nDebug.Print .Count; .Item(1)\nEnd With\nDebug.Print c _\n    .Count"
-        if lines <> [ " 1  5 "; " 1 " ] then fail "With member after Debug.Print" [ " 1  5 "; " 1 " ] lines)
+        if lines <> [ " 1  5 "; " 1 " ] then fail "With member after Debug.Print" [ " 1  5 "; " 1 " ] lines
+        let lines = printed "Dim i\nFor i = 1 To 3\nDebug.Print i;\nNext\nDebug.Print \"|\"\nDebug.Print \"a\", \nDebug.Print \"b\""
+        if lines <> [ " 1  2  3 |"; "a\tb" ] then fail "Debug.Print ;" [ " 1  2  3 |"; "a\tb" ] lines)
     // ── 8. Host-visible API ──
     "Bytecode round-trips the new values and metadata", (fun () ->
 #if FABLE_COMPILER
