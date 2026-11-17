@@ -29,6 +29,9 @@ let validateVBScript (program: Program) : ValidationError list =
             checkExpression target
             for arg in args do checkExpression arg
         | Member (receiver, _) -> checkExpression receiver
+        | NamedArg (name, value) ->
+            errors.Add(error (sprintf "VBScript does not support named arguments (argument '%s')" name))
+            checkExpression value
         | _ -> ()
 
     let checkCaseTest test =

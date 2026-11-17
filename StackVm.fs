@@ -611,14 +611,6 @@ let private executeCold (state: VmState) (instr: Instruction) =
             state.Pc <- state.Pc + 1
         | other -> objectError other
 
-    | CallDefault argCount ->
-        let args = Array.zeroCreate argCount
-        for i in argCount - 1 .. -1 .. 0 do
-            args.[i] <- ValueSemantics.dereference (pop state)
-        let target = ValueSemantics.dereference (pop state)
-        push state (defaultCall target args)
-        state.Pc <- state.Pc + 1
-
     | TypeCheck className ->
         let obj = pop state
         match obj with
@@ -1128,6 +1120,26 @@ let executeOneInstruction (state: VmState) =
                 push state (match v with VHostObject _ -> ValueSemantics.scalar v | _ -> v)
             | None -> ()
         | _ -> ()
+        state.Pc <- state.Pc + 1
+
+    | CallDefault 1 when (match state.Stack.[state.Sp - 2], state.Stack.[state.Sp - 1] with
+                          | VArray a, VInteger _ -> a.Lengths.Length = 1
+                          | _ -> false) ->
+        let index = match pop state with VInteger i -> i | _ -> 0
+        match pop state with
+        | VArray a ->
+            let offset = index - a.LowerBounds.[0]
+            if offset < 0 || offset >= a.Lengths.[0] then raiseVbError 9
+            push state a.Data.[offset]
+        | _ -> ()
+        state.Pc <- state.Pc + 1
+
+    | CallDefault argCount ->
+        let args = Array.zeroCreate argCount
+        for i in argCount - 1 .. -1 .. 0 do
+            args.[i] <- ValueSemantics.dereference (pop state)
+        let target = ValueSemantics.dereference (pop state)
+        push state (defaultCall target args)
         state.Pc <- state.Pc + 1
 
     | _ -> executeCold state instr
