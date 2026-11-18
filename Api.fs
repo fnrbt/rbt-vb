@@ -543,8 +543,16 @@ module private ProjectInternals =
                 Error { Detail = ""; Kind = Compile; Number = 0; Description = first.Message; Source = options.ProjectName
                         Line = 0; Column = 0; Procedure = ""; Module = m.Name }
 
-    let compileFailure (options: ProjectOptions) message line moduleName =
-        { Detail = ""; Kind = Compile; Number = 0; Description = message; Source = options.ProjectName
+    /// VBA's compile errors whose text names nothing ("Variable not defined"): the compiler's name after
+    /// the colon goes to Detail. ("Ambiguous name detected: X" is VBA's text with the name.)
+    let private namelessMessages = [ "Variable not defined"; "Named argument not found"; "Label not defined" ]
+
+    let compileFailure (options: ProjectOptions) (message: string) line moduleName =
+        let description, detail =
+            match namelessMessages |> List.tryFind (fun m -> message.StartsWith(m + ": ")) with
+            | Some m -> m, message.Substring(m.Length + 2)
+            | None -> message, ""
+        { Detail = detail; Kind = Compile; Number = 0; Description = description; Source = options.ProjectName
           Line = line; Column = 0; Procedure = ""; Module = moduleName }
 
     /// `Attribute Value.VB_UserMemId = 0` makes Value a class's default member.

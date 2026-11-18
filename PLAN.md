@@ -29,7 +29,7 @@ Phases 2 and 3 can proceed independently after the harness. Phase 4 needs the pa
 
 ## Phase 1 — Regression infrastructure
 
-Primary scope: a dedicated test project, `FsVb.fs`, existing `test*.vbs` / `test*.vba`, `.forge/actions.lua`, `.forge/publish`.
+Primary scope: a dedicated test project, `Api.fs`, existing `test*.vbs` / `test*.vba`, `.forge/actions.lua`, `.forge/publish`.
 
 - [x] Add an isolated test harness that executes source through `runSource`, checks globals and host-observed side effects, and asserts parse/validation/runtime errors.
 - [x] Keep stdout-dependent tests isolated; prefer a test host object for observable calls rather than globally redirecting console output.

@@ -2,7 +2,7 @@
 
 Rbt.Vb compiles VBA / VBScript to bytecode and runs it on a stack VM. The same
 F# sources build for .NET and, through Fable, for JavaScript. This page
-describes the host API in `FsVb.fs` (module `Rbt.Vb.Api`, auto-opened) and the
+describes the host API in `Api.fs` (module `Rbt.Vb.Api`, auto-opened) and the
 host-object contract in `Values.fs`.
 
 There are two levels:

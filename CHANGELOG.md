@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.2 — 2026-11-18
+
+- Compile errors whose VBA text names nothing ("Variable not defined", "Named argument not found", "Label not defined") have VBA's text as their Description, and the name in Detail; it was appended to the text ("Variable not defined: y"). Matches Excel 2019 (rbt-office's compile parity cases: 22 of 22).
+- The host API's source file is `Api.fs` (it was `FsVb.fs`, from the project's first name); its module is `Rbt.Vb.Api` as before.
+
 ## 0.8.1 — 2026-11-18
 
 - Early binding follows default members: arguments given to a member without parameters go to its result's default member (`ActiveDocument.Paragraphs(1)` is a Paragraph, `ps(1)` for `ps As Paragraphs` too), as the library's DISPID 0 says (a `default` sixth field of a member line). 0.8.0 took `Paragraphs(1)` for the collection and reported its members as missing.

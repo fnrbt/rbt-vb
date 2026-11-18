@@ -22,7 +22,7 @@
     <Compile Include="Compiler.fs" />
     <Compile Include="TypeCheck.fs" />
     <Compile Include="StackVm.fs" />
-    <Compile Include="FsVb.fs" />
+    <Compile Include="Api.fs" />
   </ItemGroup>
 
   <!-- Ship the F# sources under fable/ so Fable can compile this library from

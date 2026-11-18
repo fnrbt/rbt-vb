@@ -572,7 +572,8 @@ let private cases : (string * (unit -> unit)) list = [
         | Error (RunError.RuntimeError message) when message.Contains "Variable not defined: y" && message.Contains "line 4" -> ()
         | other -> fail "Option Explicit" "compile error at line 4" other
         match Project.compile ProjectOptions.vba [ ModuleSource.standard "M" "Option Explicit\nSub A()\n    Dim i As Long\n    For j = 1 To 2\n    Next\nEnd Sub" ] with
-        | Error [ f ] when f.Kind = Compile && f.Line = 4 && f.Description.Contains "j" -> ()
+        // (VBA's text names nothing; the variable is the failure's Detail.)
+        | Error [ f ] when f.Kind = Compile && f.Line = 4 && f.Description = "Variable not defined" && f.Detail = "j" -> ()
         | other -> fail "project Option Explicit" "line 4" other
         // Declared names, ReDim, constants and host globals are fine.
         vba "Option Explicit\nDim result\nConst K = 2\nSub A()\nReDim arr(2)\narr(1) = K\nresult = arr(1) + Len(vbCrLf)\nEnd Sub\nA" "result" (VLong 4))
