@@ -27,7 +27,7 @@ let private arrayBound upper (args: Value array) =
     if dimension < 1 || dimension > array.Lengths.Length then raiseVbError 9
     let index = dimension - 1
     let lower = array.LowerBounds.[index]
-    VInteger (if upper then lower + array.Lengths.[index] - 1 else lower)
+    VLong (if upper then lower + array.Lengths.[index] - 1 else lower)
 
 // ── Rnd: VBA's 24-bit generator, so seeded sequences match VBA ──
 
@@ -67,7 +67,9 @@ let flushPendingPrint (hooks: RuntimeHooks) =
 
 let rec private typeName = function
     | VInteger n when n >= -32768 && n <= 32767 -> "Integer"
-    | VInteger _ -> "Long"
+    | VInteger _ | VLong _ -> "Long"
+    | VSingle _ -> "Single"
+    | VByte _ -> "Byte"
     | VDouble _ -> "Double"
     | VString _ -> "String"
     | VBoolean _ -> "Boolean"
@@ -90,8 +92,10 @@ let varType value =
     | VEmpty -> 0
     | VNull -> 1
     | VInteger n when n >= -32768 && n <= 32767 -> 2
-    | VInteger _ -> 3
+    | VInteger _ | VLong _ -> 3
+    | VSingle _ -> 4
     | VDouble _ -> 5
+    | VByte _ -> 17
     | VCurrency _ -> 6
     | VDate _ -> 7
     | VString _ -> 8
@@ -199,18 +203,46 @@ let private hexDigits (value: int64) (radix: int) =
             v <- v / int64 radix
         text
 
-/// Hex/Oct of a whole number: negative Integers use 16 bits, Longs 32.
+/// Hex/Oct of a whole number: negative Integers (and Bytes and Booleans) use
+/// 16 bits, Longs 32 and other types 64, as 64-bit VBA does.
 let private radixText (value: Value) (radix: int) =
     match scalar value with
     | VNull -> VNull
     | VEmpty -> VString "0"
     | v ->
-        let n = toInteger v
-        let unsigned =
-            if n >= 0 then int64 n
-            elif n >= -32768 && (match v with VInteger _ | VBoolean _ -> true | _ -> false) then int64 n + 65536L
-            else int64 n + 4294967296L
-        VString (hexDigits unsigned radix)
+        let n =
+            match v with
+            | VInteger _ | VLong _ | VByte _ | VBoolean _ -> int64 (toInteger v)
+            | other ->
+                let x = Math.Round(toNumber other, 0, MidpointRounding.ToEven)
+                if Double.IsNaN x || Math.Abs x >= 9.2233720368547758E18 then raiseVbError 6
+                int64 x
+        let text =
+            if n >= 0L then hexDigits n radix
+            else
+                match v with
+                | VInteger i when i >= -32768 -> hexDigits (n + 65536L) radix
+                | VBoolean _ -> hexDigits (n + 65536L) radix
+                | VInteger _ | VLong _ -> hexDigits (n + 4294967296L) radix
+                | _ ->
+                    // 64-bit two's complement, digit by digit.
+                    let bits = if radix = 16 then 4 else 3
+                    let mask = uint64 (radix - 1)
+                    let digits = "0123456789ABCDEF"
+                    let mutable u = uint64 n
+                    let mutable out = ""
+                    let mutable count = 0
+                    while count < 64 do
+                        out <- string digits.[int (u &&& mask)] + out
+                        u <- u >>> bits
+                        count <- count + bits
+                    if radix = 8 then
+                        // 64 bits are 22 octal digits; the top digit holds one bit.
+                        out.TrimStart('0')
+                    else out
+        VString text
+
+let private lenOf (value: Value) = (toString value).Length
 
 // ── Dates ──
 
@@ -292,8 +324,9 @@ let dateDiff (interval: string) (first: float) (second: float) (firstDay: int) (
         | "n" -> floorDiv64 (totalSeconds second) 60L - floorDiv64 (totalSeconds first) 60L
         | "s" -> totalSeconds second - totalSeconds first
         | _ -> raiseVbError 5
-    if result > 2147483647L || result < -2147483648L then raiseVbError 6
-    VInteger (int result)
+    // A Long; a difference beyond the Long range is a Double.
+    if result > 2147483647L || result < -2147483648L then VDouble (float result)
+    else VLong (int result)
 
 let datePart (interval: string) (serial: float) (firstDay: int) (firstWeek: int) =
     let y, m, d, h, n, s = DateCore.components serial
@@ -361,8 +394,9 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
         pendingPrint <- ""
         for i in 0 .. argc - 1 do
             match scalar args.[i] with
-            | VInteger number -> sb.Append((if number >= 0 then " " else "") + string number + " ") |> ignore
-            | (VDouble _ | VCurrency _) as number ->
+            | VInteger number | VLong number -> sb.Append((if number >= 0 then " " else "") + string number + " ") |> ignore
+            | VByte number -> sb.Append(" " + string number + " ") |> ignore
+            | (VDouble _ | VCurrency _ | VSingle _) as number ->
                 let text = toString number
                 sb.Append((if text.StartsWith "-" then "" else " ") + text + " ") |> ignore
             | VBoolean b -> sb.Append(if b then "True" else "False") |> ignore
@@ -370,20 +404,21 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
         if name = "debug.print;" then pendingPrint <- sb.ToString()
         else hooks.Print (sb.ToString())
         VEmpty
+    | "for:start" -> forCounterStart (raw 0) (raw 1) (raw 2)
     | "ismissing" ->
         argCount args 1 1
         VBoolean (match dereference args.[0] with VUndefined -> true | _ -> false)
     | "rgb" ->
         argCount args 3 3
         let channel i = max 0 (min 255 (n i))
-        VInteger (channel 0 + channel 1 * 256 + channel 2 * 65536)
+        VLong (channel 0 + channel 1 * 256 + channel 2 * 65536)
     | "qbcolor" ->
         argCount args 1 1
         let colors = [| 0x000000; 0x800000; 0x008000; 0x808000; 0x000080; 0x800080; 0x008080; 0xC0C0C0
                         0x808080; 0xFF0000; 0x00FF00; 0xFFFF00; 0x0000FF; 0xFF00FF; 0x00FFFF; 0xFFFFFF |]
         let index = n 0
         if index < 0 || index > 15 then raiseVbError 5
-        VInteger colors.[index]
+        VLong colors.[index]
     | "createobject" ->
         argCount args 1 2
         let progId = s 0
@@ -407,8 +442,8 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
     | "beep" -> VEmpty
 
     // String functions
-    | "len" -> if isNull 0 then VNull else VInteger (s(0).Length)
-    | "lenb" -> if isNull 0 then VNull else VInteger (2 * s(0).Length)
+    | "len" -> if isNull 0 then VNull else VLong (lenOf (arg 0))
+    | "lenb" -> if isNull 0 then VNull else VLong (2 * lenOf (arg 0))
     | "left" ->
         argCount args 2 2
         let count = n 1
@@ -462,11 +497,11 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
                 if not numericStart then 1, s 0, s 1, defaultTextCompare
                 else (if has 0 then n 0 else 1), s 1, s 2, textMode 3
             if start < 1 then raiseVbError 5
-            if start > text.Length then VInteger 0
-            elif needle.Length = 0 then VInteger start
+            if start > text.Length then VLong 0
+            elif needle.Length = 0 then VLong start
             else
                 let index = indexOf mode text needle (start - 1)
-                VInteger (if index < 0 then 0 else index + 1)
+                VLong (if index < 0 then 0 else index + 1)
     | "instrrev" ->
         argCount args 2 4
         match arg 0, arg 1 with
@@ -477,11 +512,11 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
             let start = if has 2 then n 2 else -1
             if start = 0 || start < -1 then raiseVbError 5
             let start = if start = -1 then text.Length else start
-            if text.Length = 0 || start > text.Length then VInteger 0
-            elif find.Length = 0 then VInteger start
+            if text.Length = 0 || start > text.Length then VLong 0
+            elif find.Length = 0 then VLong start
             else
                 let index = lastIndexOf (textMode 3) text find start
-                VInteger (if index < 0 then 0 else index + 1)
+                VLong (if index < 0 then 0 else index + 1)
     | "replace" ->
         argCount args 3 6
         if isNull 0 then VNull
@@ -509,7 +544,11 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
     | "asc" | "ascw" | "ascb" ->
         let str = s 0
         if str.Length = 0 then raiseVbError 5
-        VInteger (int str.[0])
+        let code = int str.[0]
+        match name with
+        | "ascb" -> VByte (byte (code &&& 255))
+        | "ascw" -> VInteger (if code > 32767 then code - 65536 else code)
+        | _ -> VInteger (if code > 32767 then code - 65536 else code)
     | "chr" | "chrb" ->
         let code = n 0
         if code < -32768 || code > 65535 then raiseVbError 5
@@ -587,17 +626,17 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
 
     // Type conversion
     | "cint" -> VInteger (roundedInteger -32768.0 32767.0 (arg 0))
-    | "clng" -> VInteger (toInteger (arg 0))
+    | "clng" -> VLong (toInteger (arg 0))
     | "clnglng" | "clngptr" -> toLongLong (arg 0)
     | "int" -> floorValue (arg 0)
     | "fix" -> truncateValue (arg 0)
     | "cdbl" | "cdec" -> VDouble (d 0)
-    | "csng" -> VDouble (float (float32 (d 0)))
+    | "csng" -> toSingleValue (arg 0)
     | "ccur" -> VCurrency (toCurrencyUnits (arg 0))
     | "cdate" | "cvdate" -> VDate (toDate (arg 0))
     | "cstr" -> VString (s 0)
     | "cbool" -> VBoolean (toBool (arg 0))
-    | "cbyte" -> VInteger (roundedInteger 0.0 255.0 (arg 0))
+    | "cbyte" -> VByte (byte (roundedInteger 0.0 255.0 (arg 0)))
     | "cvar" -> arg 0
     | "cverr" -> argCount args 1 1; VError (n 0)
 
@@ -606,7 +645,7 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
     | "isempty" -> VBoolean (match arg 0 with VEmpty -> true | _ -> false)
     | "isnumeric" ->
         match arg 0 with
-        | VInteger _ | VDouble _ | VCurrency _ | VBoolean _ | VEmpty -> VBoolean true
+        | VInteger _ | VLong _ | VSingle _ | VByte _ | VDouble _ | VCurrency _ | VBoolean _ | VEmpty -> VBoolean true
         | VString text -> VBoolean (tryParseNumber text).IsSome
         | _ -> VBoolean false
     | "isarray" -> VBoolean (match arg 0 with VArray _ -> true | _ -> false)
@@ -619,7 +658,7 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
     | "iserror" -> VBoolean (match raw 0 with VError _ | VUndefined -> true | _ -> false)
     | "typename" ->
         VString (typeName (arg 0))
-    | "vartype" -> VInteger (varType (arg 0))
+    | "vartype" -> VLong (varType (arg 0))
 
     // Choices
     | "iif" ->
@@ -646,19 +685,12 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
         result
 
     // Math
-    | "abs" ->
-        match arg 0 with
-        | VInteger i when i <> Int32.MinValue -> VInteger (abs i)
-        | VDouble v -> VDouble (abs v)
-        | VCurrency c -> VCurrency (abs c)
-        | VNull -> VNull
-        | _ -> VDouble (abs (d 0))
+    | "abs" -> absValue (arg 0)
     | "sgn" ->
         match arg 0 with
-        | VInteger i -> VInteger (sign i)
-        | VCurrency c -> VInteger (sign c)
         | VNull -> VNull
-        | _ -> VInteger (sign (d 0))
+        | VCurrency c -> VInteger (sign c)
+        | v -> VInteger (sign (toNumber v))
     | "sqr" ->
         let x = d 0
         if x < 0.0 then raiseVbError 5
@@ -672,7 +704,7 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
     | "cos" -> VDouble (Math.Cos(d 0))
     | "tan" -> VDouble (Math.Tan(d 0))
     | "atn" -> VDouble (Math.Atan(d 0))
-    | "rnd" -> VDouble (rnd (if has 0 then Some (d 0) else None))
+    | "rnd" -> single (rnd (if has 0 then Some (d 0) else None))
     | "randomize" ->
         randomize (if has 0 then d 0 else float DateTime.Now.TimeOfDay.TotalSeconds)
         VEmpty
@@ -682,7 +714,9 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
         if decimals < 0 || decimals > 22 then raiseVbError 5
         match arg 0 with
         | VNull -> VNull
-        | VInteger i -> VInteger i
+        | (VInteger _ | VLong _ | VByte _) as whole -> whole
+        | VBoolean b -> VInteger (if b then -1 else 0)
+        | VSingle f -> VSingle (toSingle (Math.Round(float f, min decimals 15, MidpointRounding.ToEven)))
         | VCurrency c ->
             if decimals >= 4 then VCurrency c
             else
@@ -701,7 +735,7 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
     | "now" -> VDate (nowSerial ())
     | "date" -> VDate (Math.Floor (nowSerial ()))
     | "time" -> VDate (let now = nowSerial () in now - Math.Floor now)
-    | "timer" -> VDouble (float (DateTime.Now.TimeOfDay.TotalSeconds))
+    | "timer" -> single (Math.Round(DateTime.Now.TimeOfDay.TotalSeconds, 2))
     | "year" -> dateOrNull 0 (fun serial -> let y, _, _, _, _, _ = DateCore.components serial in VInteger y)
     | "month" -> dateOrNull 0 (fun serial -> let _, m, _, _, _, _ = DateCore.components serial in VInteger m)
     | "day" -> dateOrNull 0 (fun serial -> let _, _, day, _, _, _ = DateCore.components serial in VInteger day)
@@ -764,7 +798,7 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
         argCount args 1 5
         let buttons = if has 1 then n 1 else 0
         let title = if has 2 then s 2 else ""
-        VInteger (hooks.MsgBox (s 0) buttons title)
+        VLong (hooks.MsgBox (s 0) buttons title)
     | "inputbox" ->
         argCount args 1 7
         let title = if has 1 then s 1 else ""
@@ -824,7 +858,7 @@ let private vbConstants =
         "vbUpperCase", 1; "vbLowerCase", 2; "vbProperCase", 3; "vbWide", 4; "vbNarrow", 8
         "vbKatakana", 16; "vbHiragana", 32; "vbUnicode", 64; "vbFromUnicode", 128
         "vbMethod", 1; "vbGet", 2; "vbLet", 4; "vbSet", 8 ] do
-        add name (VInteger number)
+        add name (VLong number)
     table
 
 /// The value of a built-in `vb*` constant (case-insensitive).

@@ -70,7 +70,7 @@ type VbCollection() =
 
     override this.GetMember name =
         match name.ToLowerInvariant() with
-        | "count" -> Some (VInteger items.Count)
+        | "count" -> Some (VLong items.Count)
         | _ -> None
 
     override this.CallMethod name args =
@@ -88,7 +88,7 @@ type VbCollection() =
             if args.Length <> 1 then raiseVbError 450
             this.Remove args.[0]
             Some VEmpty
-        | "count" when args.Length = 0 -> Some (VInteger items.Count)
+        | "count" when args.Length = 0 -> Some (VLong items.Count)
         | _ -> None
 
     override this.CallNamed name args names =
@@ -151,7 +151,9 @@ type VbDictionary() =
     let keyOf (value: Value) =
         match dereference value with
         | VString text -> KString (if compareMode = 0 then text else lowerKey text)
-        | VInteger n -> KNumber (float n)
+        | VInteger n | VLong n -> KNumber (float n)
+        | VByte n -> KNumber (float n)
+        | VSingle f -> KNumber (float f)
         | VDouble d | VDate d -> KNumber d
         | VCurrency c -> KNumber (float c / 10000.0)
         | VBoolean b -> KNumber (if b then -1.0 else 0.0)
@@ -237,8 +239,8 @@ type VbDictionary() =
 
     override this.GetMember name =
         match name.ToLowerInvariant() with
-        | "count" -> Some (VInteger index.Count)
-        | "comparemode" -> Some (VInteger compareMode)
+        | "count" -> Some (VLong index.Count)
+        | "comparemode" -> Some (VLong compareMode)
         | "keys" -> Some (VbDictionary.Array this.Keys)
         | "items" -> Some (VbDictionary.Array this.Items)
         | "removeall" -> this.RemoveAll(); Some VEmpty
@@ -259,8 +261,8 @@ type VbDictionary() =
         | "removeall" -> need 0; this.RemoveAll(); Some VEmpty
         | "keys" -> need 0; Some (VbDictionary.Array this.Keys)
         | "items" -> need 0; Some (VbDictionary.Array this.Items)
-        | "count" -> need 0; Some (VInteger index.Count)
-        | "comparemode" -> need 0; Some (VInteger compareMode)
+        | "count" -> need 0; Some (VLong index.Count)
+        | "comparemode" -> need 0; Some (VLong compareMode)
         | _ -> None
 
     override this.CallNamed name args names =

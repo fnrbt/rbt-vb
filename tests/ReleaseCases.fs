@@ -33,7 +33,7 @@ let private expr expression expected = vba ("Dim result\nresult = " + expression
 
 /// The Err.Number an unhandled-by-default statement raises, caught by Resume Next.
 let private errNumber setup statement expected =
-    vba (sprintf "Dim result\n%s\nOn Error Resume Next\n%s\nresult = Err.Number" setup statement) "result" (VInteger expected)
+    vba (sprintf "Dim result\n%s\nOn Error Resume Next\n%s\nresult = Err.Number" setup statement) "result" (VLong expected)
 
 let private runtimeFailure options source =
     match runSource options source with
@@ -236,11 +236,11 @@ let private cases : (string * (unit -> unit)) list = [
     // ── 1. Silent wrong results ──
     "Enum members and qualified access", (fun () ->
         let source = "Enum Color\n  Red\n  Green = 5\n  Blue\nEnd Enum\nDim a, b, c\na = Red\nb = Blue\nc = Color.Green + Color.Blue"
-        vba source "a" (VInteger 0)
-        vba source "b" (VInteger 6)
-        vba source "c" (VInteger 11))
+        vba source "a" (VLong 0)
+        vba source "b" (VLong 6)
+        vba source "c" (VLong 11))
     "Enum used inside a procedure", (fun () ->
-        vba "Enum E\n  One = 1\n  Two\nEnd Enum\nDim result\nFunction F()\nF = E.Two * 10\nEnd Function\nresult = F()" "result" (VInteger 20))
+        vba "Enum E\n  One = 1\n  Two\nEnd Enum\nDim result\nFunction F()\nF = E.Two * 10\nEnd Function\nresult = F()" "result" (VLong 20))
     "Type fields store and copy by value", (fun () ->
         let source = "Type Pt\n  X As Long\n  Y As Long\nEnd Type\nDim p As Pt, q As Pt, result, copied\np.X = 3\np.Y = 4\nresult = p.X + p.Y\nq = p\nq.X = 10\ncopied = p.X"
         vba source "result" (VInteger 7)
@@ -255,7 +255,7 @@ let private cases : (string * (unit -> unit)) list = [
         vba source "b" (VInteger 3)
         vba source "c" (VBoolean true)
         vba source "d" (VBoolean false)
-        vba source "e" (VInteger 0))
+        vba source "e" (VLong 0))
     "Omitted and named arguments to procedures", (fun () ->
         let source = "Dim a, b, c\nFunction F(x, Optional y = 10, Optional z = 100)\nF = x + y + z\nEnd Function\na = F(1, , 3)\nb = F(z:=1, x:=2)\nCall Sub1(b:=2, a:=1)\nSub Sub1(a, b)\nc = a * 10 + b\nEnd Sub"
         vba source "a" (VInteger 14)
@@ -266,9 +266,9 @@ let private cases : (string * (unit -> unit)) list = [
     "Hex, octal, exponent and suffix literals", (fun () ->
         for expression, expected in [
             "&HFF", VInteger 255; "&H1f", VInteger 31; "&O17", VInteger 15; "&HFFFF", VInteger -1
-            "&HFFFF&", VInteger 65535; "&H8000&", VInteger 32768; "&HFFFFFFFF", VInteger -1
-            "1E3", VDouble 1000.0; "2.5E-1", VDouble 0.25; "5&", VInteger 5; "5#", VDouble 5.0; "5!", VDouble 5.0
-            "5@", VDouble 5.0; "TypeName(5#)", VString "Double"; "&HFF + 1", VInteger 256; "Left$(\"abc\", 2)", VString "ab" ] do
+            "&HFFFF&", VLong 65535; "&H8000&", VLong 32768; "&HFFFFFFFF", VLong -1
+            "1E3", VDouble 1000.0; "2.5E-1", VDouble 0.25; "5&", VLong 5; "5#", VDouble 5.0; "5!", VSingle 5.0f
+            "5@", VCurrency 50000L; "TypeName(5#)", VString "Double"; "&HFF + 1", VInteger 256; "Left$(\"abc\", 2)", VString "ab" ] do
             expr expression expected)
     "Nested With blocks keep their own targets", (fun () ->
         let source = "Class C\nPublic A\nPublic B\nEnd Class\nDim o1, o2, r1, r2\nSet o1 = New C\nSet o2 = New C\nWith o1\n  .A = 1\n  With o2\n    .A = 2\n  End With\n  .B = 3\nEnd With\nr1 = o1.A + o1.B\nr2 = o2.A"
@@ -279,11 +279,11 @@ let private cases : (string * (unit -> unit)) list = [
         vba "Dim result\nFunction Arr()\nArr = Array(10, 20)\nEnd Function\nresult = Arr()(1)" "result" (VInteger 20))
     "vb constants", (fun () ->
         for expression, expected in [
-            "vbCrLf = Chr(13) & Chr(10)", VBoolean true; "Len(vbTab & vbCr & vbLf & vbNewLine)", VInteger 5
-            "vbNullString = \"\"", VBoolean true; "Asc(vbNullChar)", VInteger 0; "vbTrue", VInteger -1; "vbFalse", VInteger 0
-            "vbTextCompare", VInteger 1; "vbBinaryCompare", VInteger 0; "vbObjectError", VInteger -2147221504
-            "vbString", VInteger 8; "vbArray", VInteger 8192; "vbYesNoCancel", VInteger 3; "vbOKOnly", VInteger 0
-            "vbNo", VInteger 7; "vbInformation + vbExclamation + vbCritical + vbQuestion", VInteger 160
+            "vbCrLf = Chr(13) & Chr(10)", VBoolean true; "Len(vbTab & vbCr & vbLf & vbNewLine)", VLong 5
+            "vbNullString = \"\"", VBoolean true; "Asc(vbNullChar)", VInteger 0; "vbTrue", VLong -1; "vbFalse", VLong 0
+            "vbTextCompare", VLong 1; "vbBinaryCompare", VLong 0; "vbObjectError", VLong -2147221504
+            "vbString", VLong 8; "vbArray", VLong 8192; "vbYesNoCancel", VLong 3; "vbOKOnly", VLong 0
+            "vbNo", VLong 7; "vbInformation + vbExclamation + vbCritical + vbQuestion", VLong 160
             "VarType(\"x\") = vbString", VBoolean true ] do
             expr expression expected)
     "Arguments evaluate left to right", (fun () ->
@@ -291,9 +291,9 @@ let private cases : (string * (unit -> unit)) list = [
     "Recursive call result passed ByRef", (fun () ->
         vba "Dim result\nFunction Ack(m, n)\nIf m = 0 Then\nAck = n + 1\nElseIf n = 0 Then\nAck = Ack(m - 1, 1)\nElse\nAck = Ack(m - 1, Ack(m, n - 1))\nEnd If\nEnd Function\nresult = Ack(2, 3)" "result" (VInteger 9))
     "RGB and QBColor", (fun () ->
-        expr "RGB(255, 0, 0)" (VInteger 255)
-        expr "RGB(1, 2, 3)" (VInteger (1 + 2 * 256 + 3 * 65536))
-        expr "QBColor(12)" (VInteger 0x0000FF))
+        expr "RGB(255, 0, 0)" (VLong 255)
+        expr "RGB(1, 2, 3)" (VLong (1 + 2 * 256 + 3 * 65536))
+        expr "QBColor(12)" (VLong 0x0000FF))
 
     // ── 2. Error handling ──
     "Resume Next continues after the failing statement", (fun () ->
@@ -302,7 +302,7 @@ let private cases : (string * (unit -> unit)) list = [
         vba "Dim result, d\nSub P()\nOn Error GoTo H\nd = 0\nresult = 10 / d\nExit Sub\nH:\nd = 2\nResume\nEnd Sub\nP" "result" (VDouble 5.0))
     "Resume label and Err cleared", (fun () ->
         vba "Dim result, n\nSub P()\nOn Error GoTo H\nErr.Raise 5\nresult = \"skipped\"\nDone:\nn = Err.Number\nExit Sub\nH:\nresult = \"handled\"\nResume Done\nEnd Sub\nP" "result" (VString "handled")
-        vba "Dim result, n\nSub P()\nOn Error GoTo H\nErr.Raise 5\nDone:\nn = Err.Number\nExit Sub\nH:\nResume Done\nEnd Sub\nP" "n" (VInteger 0))
+        vba "Dim result, n\nSub P()\nOn Error GoTo H\nErr.Raise 5\nDone:\nn = Err.Number\nExit Sub\nH:\nResume Done\nEnd Sub\nP" "n" (VLong 0))
     "Resume without error is error 20", (fun () -> errNumber "Sub P()\nResume Next\nEnd Sub" "P" 20)
     "Run-time error numbers", (fun () ->
         errNumber "Dim x" "x = 1 / 0" 11
@@ -325,7 +325,7 @@ let private cases : (string * (unit -> unit)) list = [
         expr "TypeName(Err)" (VString "ErrObject")
         vba "Dim n, s, d\nOn Error Resume Next\nErr.Raise vbObjectError + 1, \"MySource\", \"My message\"\nn = Err.Number - vbObjectError\ns = Err.Source\nd = Err.Description" "s" (VString "MySource")
         vba "Dim s\nOn Error Resume Next\nDim x\nx = 1 / 0\ns = Err.Source & \"|\" & Err.Description" "s" (VString "VBAProject|Division by zero")
-        vba "Dim n\nOn Error Resume Next\nErr.Number = 7\nn = Err\nErr.Clear\nn = n + Err.Number" "n" (VInteger 7)
+        vba "Dim n\nOn Error Resume Next\nErr.Number = 7\nn = Err\nErr.Clear\nn = n + Err.Number" "n" (VLong 7)
         vba "Dim n\nOn Error Resume Next\nErr.Raise 13\nIf Err Then n = Err.Description" "n" (VString "Type mismatch"))
     "Runtime errors carry the source line", (fun () ->
         let message = runtimeFailure RunOptions.vba "Dim x\nSub Inner()\nx = 1\nx = x / 0\nEnd Sub\nInner"
@@ -333,26 +333,26 @@ let private cases : (string * (unit -> unit)) list = [
         contains message "line 4"
         contains message "Inner")
     "On Error GoTo -1 allows a second handler", (fun () ->
-        vba "Dim result\nOn Error GoTo H1\nErr.Raise 5\nH1:\nOn Error GoTo -1\nOn Error GoTo H2\nErr.Raise 6\nresult = 0\nGoTo Done\nH2:\nresult = Err.Number\nDone:" "result" (VInteger 6))
+        vba "Dim result\nOn Error GoTo H1\nErr.Raise 5\nH1:\nOn Error GoTo -1\nOn Error GoTo H2\nErr.Raise 6\nresult = 0\nGoTo Done\nH2:\nresult = Err.Number\nDone:" "result" (VLong 6))
 
     // ── 3. Declared types ──
     "Declared types start at their defaults", (fun () ->
         let source = "Dim i As Integer, l As Long, d As Double, s As String, b As Boolean, v, o As Object, r1, r2, r3\nr1 = TypeName(i) & TypeName(l) & TypeName(d) & TypeName(s) & TypeName(b) & TypeName(v)\nr2 = (o Is Nothing)\nFunction F() As String\nEnd Function\nr3 = TypeName(F())"
-        vba source "r1" (VString "IntegerIntegerDoubleStringBooleanEmpty")
+        vba source "r1" (VString "IntegerLongDoubleStringBooleanEmpty")
         vba source "r2" (VBoolean true)
         vba source "r3" (VString "String"))
     "Assignments convert to the declared type", (fun () ->
         let source = "Dim i As Integer, j As Long, k As Long, s As String, b As Boolean, d As Double\ni = 7.6\nj = 6.5\nk = \"12\"\ns = 3.5\nb = 1\nd = 2"
         vba source "i" (VInteger 8)
-        vba source "j" (VInteger 6)
-        vba source "k" (VInteger 12)
+        vba source "j" (VLong 6)
+        vba source "k" (VLong 12)
         vba source "s" (VString "3.5")
         vba source "b" (VBoolean true)
         vba source "d" (VDouble 2.0))
     "ReDim with an As clause", (fun () ->
-        vba "Dim a() As Long, result\nReDim a(3) As Long\nresult = a(2) + UBound(a)" "result" (VInteger 3))
+        vba "Dim a() As Long, result\nReDim a(3) As Long\nresult = a(2) + UBound(a)" "result" (VLong 3))
     "Typed parameters and locals", (fun () ->
-        vba "Dim result\nFunction F(ByVal n As Integer) As Long\nDim t As Long\nt = n\nF = t * 2\nEnd Function\nresult = F(2.5)" "result" (VInteger 4))
+        vba "Dim result\nFunction F(ByVal n As Integer) As Long\nDim t As Long\nt = n\nF = t * 2\nEnd Function\nresult = F(2.5)" "result" (VLong 4))
     "Integer and Long overflow raise error 6", (fun () ->
         errNumber "Dim l As Long" "l = 2147483647\nl = l + 1" 6
         errNumber "Dim i As Integer" "i = 32767\ni = i + 1" 6
@@ -374,7 +374,7 @@ let private cases : (string * (unit -> unit)) list = [
         sheet.Cells.["R1C1"] <- VString "x"
         sheet.Cells.["R1C2"] <- VString "yz"
         let result = run (sheetOptions sheet) "Dim a, b, c, d, e, f, g, r\na = Range(\"A1\")\nb = Range(\"A1\") + 1\nIf Cells(1, 1) = \"x\" Then c = True\nd = d & Cells(1, 2) & Cells(1, 1)\ne = Len(Cells(1, 2))\nSet r = Range(\"A1\")\nf = TypeName(r)\ng = CDbl(Range(\"A1\")) / 2\nMsgBox Range(\"A1\")"
-        for name, expected in [ "a", VInteger 41; "b", VInteger 42; "c", VBoolean true; "d", VString "yzx"; "e", VInteger 2; "f", VString "Range"; "g", VDouble 20.5 ] do
+        for name, expected in [ "a", VInteger 41; "b", VInteger 42; "c", VBoolean true; "d", VString "yzx"; "e", VLong 2; "f", VString "Range"; "g", VDouble 20.5 ] do
             let actual = globalOf name result
             if actual <> expected then fail name expected actual)
     "Host calls as arguments to host methods", (fun () ->
@@ -388,11 +388,11 @@ let private cases : (string * (unit -> unit)) list = [
     "For Each over a host collection", (fun () ->
         vbaWith (sheetOptions (Sheet())) "Dim x, total\nFor Each x In ActiveSheet\ntotal = total + x\nNext" "total" (VInteger 6))
     "Unknown host members raise 438", (fun () ->
-        vbaWith (sheetOptions (Sheet())) "Dim n\nOn Error Resume Next\nDim v\nv = ActiveSheet.NoSuchThing\nn = Err.Number" "n" (VInteger 438)
-        vbaWith (sheetOptions (Sheet())) "Dim n\nOn Error Resume Next\nActiveSheet.NoSuchThing = 1\nn = Err.Number" "n" (VInteger 438)
-        vbaWith (sheetOptions (Sheet())) "Dim n\nOn Error Resume Next\nActiveSheet.NoSuchMethod 1, 2\nn = Err.Number" "n" (VInteger 438))
+        vbaWith (sheetOptions (Sheet())) "Dim n\nOn Error Resume Next\nDim v\nv = ActiveSheet.NoSuchThing\nn = Err.Number" "n" (VLong 438)
+        vbaWith (sheetOptions (Sheet())) "Dim n\nOn Error Resume Next\nActiveSheet.NoSuchThing = 1\nn = Err.Number" "n" (VLong 438)
+        vbaWith (sheetOptions (Sheet())) "Dim n\nOn Error Resume Next\nActiveSheet.NoSuchMethod 1, 2\nn = Err.Number" "n" (VLong 438))
     "Host errors carry their number", (fun () ->
-        vbaWith (sheetOptions (Sheet())) "Dim n, d\nOn Error GoTo H\nRange(\"A1\").Fail\nExit Sub\nH:\nn = Err.Number\nd = Err.Description" "n" (VInteger 1004))
+        vbaWith (sheetOptions (Sheet())) "Dim n, d\nOn Error GoTo H\nRange(\"A1\").Fail\nExit Sub\nH:\nn = Err.Number\nd = Err.Description" "n" (VLong 1004))
     "Host constants as plain globals", (fun () ->
         vbaWith (sheetOptions (Sheet())) "Dim n\nn = xlUp" "n" (VInteger -4162))
 
@@ -413,24 +413,24 @@ let private cases : (string * (unit -> unit)) list = [
         let s = session (projectWith defaultHooks)
         finished "Inc" (s.Run("Module1.Inc", [])) VEmpty
         finished "Inc" (s.Run("Inc", [])) VEmpty
-        if s.TryGetGlobal "Counter" <> Some (VInteger 2) then fail "Counter" 2 (s.TryGetGlobal "Counter")
-        if s.TryGetGlobal "Module1.hidden" <> Some (VInteger 2) then fail "hidden" 2 (s.TryGetGlobal "Module1.hidden")
-        finished "Twice" (s.Run("Module2.Twice", [ VInteger 21 ])) (VInteger 42)
+        if s.TryGetGlobal "Counter" <> Some (VLong 2) then fail "Counter" 2 (s.TryGetGlobal "Counter")
+        if s.TryGetGlobal "Module1.hidden" <> Some (VLong 2) then fail "hidden" 2 (s.TryGetGlobal "Module1.hidden")
+        finished "Twice" (s.Run("Module2.Twice", [ VInteger 21 ])) (VLong 42)
         finished "UseOther" (s.Run("Module2.UseOther", [])) VEmpty
-        if s.TryGetGlobal "Counter" <> Some (VInteger 4) then fail "Counter" 4 (s.TryGetGlobal "Counter")
+        if s.TryGetGlobal "Counter" <> Some (VLong 4) then fail "Counter" 4 (s.TryGetGlobal "Counter")
         finished "WithArgs" (s.Run("WithArgs", [ VInteger 1 ])) VEmpty
-        if s.TryGetGlobal "Counter" <> Some (VInteger 6) then fail "Counter default" 6 (s.TryGetGlobal "Counter")
+        if s.TryGetGlobal "Counter" <> Some (VLong 6) then fail "Counter default" 6 (s.TryGetGlobal "Counter")
         finished "UseClass" (s.Run("UseClass", [])) VEmpty
-        if s.TryGetGlobal "Counter" <> Some (VInteger 9) then fail "Counter class" 9 (s.TryGetGlobal "Counter"))
+        if s.TryGetGlobal "Counter" <> Some (VLong 9) then fail "Counter class" 9 (s.TryGetGlobal "Counter"))
     "Immediate window evaluates and executes", (fun () ->
         let s = session (projectWith defaultHooks)
         finished "?1+1" (s.RunImmediate "?1 + 1") (VInteger 2)
         finished "x = 5" (s.RunImmediate "x = 5 : y = x * 2") VEmpty
         finished "?x" (s.RunImmediate "? x + y") (VInteger 15)
         finished "call" (s.RunImmediate "Inc") VEmpty
-        finished "?Counter" (s.RunImmediate "Print Counter") (VInteger 1)
-        finished "?Twice" (s.RunImmediate "?Module2.Twice(4)") (VInteger 8)
-        finished "module context" (s.RunImmediate("?Helper()", "Module2")) (VInteger 100)
+        finished "?Counter" (s.RunImmediate "Print Counter") (VLong 1)
+        finished "?Twice" (s.RunImmediate "?Module2.Twice(4)") (VLong 8)
+        finished "module context" (s.RunImmediate("?Helper()", "Module2")) (VLong 100)
         match s.RunImmediate "?1 +" with
         | Failed f when f.Kind = Syntax -> ()
         | other -> fail "syntax error" "Failed" other)
@@ -462,7 +462,7 @@ let private cases : (string * (unit -> unit)) list = [
         match s.Step 1000 with
         | Failed f when f.Number = 18 -> ()
         | other -> fail "Cancel" "error 18" other
-        finished "after cancel" (s.Run("Module2.Twice", [ VInteger 1 ])) (VInteger 2)
+        finished "after cancel" (s.Run("Module2.Twice", [ VInteger 1 ])) (VLong 2)
         match s.Run("Forever", [], 5000) with
         | Running -> s.Cancel(); ignore (s.Step 1)
         | other -> fail "limit" Running other)
@@ -487,7 +487,7 @@ let private cases : (string * (unit -> unit)) list = [
         finished "Talk" (s.Run("Talk", [])) VEmpty
         let expected = [ "a 1 b\t 2 "; "MsgBox Continue? 4 Title"; "InputBox Name? T default"; "typed"; "Thing" ]
         if List.ofSeq output <> expected then fail "hook output" expected (List.ofSeq output)
-        if s.TryGetGlobal "Counter" <> Some (VInteger 6) then fail "MsgBox result" 6 (s.TryGetGlobal "Counter"))
+        if s.TryGetGlobal "Counter" <> Some (VLong 6) then fail "MsgBox result" 6 (s.TryGetGlobal "Counter"))
     "Project syntax and compile errors are structured", (fun () ->
         match Project.compile ProjectOptions.vba [ ModuleSource.standard "Bad" "Sub A()\nx = 1 + * 2\nEnd Sub" ] with
         | Error [ f ] when f.Kind = Syntax && f.Line = 2 && f.Module = "Bad" -> ()

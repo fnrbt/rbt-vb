@@ -112,75 +112,75 @@ let valueToInt = ValueSemantics.toInteger
 let valueToDouble = ValueSemantics.toNumber
 let valueToString = ValueSemantics.toString
 let valueToBool = ValueSemantics.toBool
-let numericBinOp = ValueSemantics.numericBinOp
-let numericCmp = ValueSemantics.numericCmp
 
-let vbLikeMatch (pattern: string) (text: string) : bool =
-    let classContains (chars: string) (ch: char) =
-        let target = System.Char.ToLowerInvariant ch
-        let mutable found = false
-        let mutable i = 0
-        while not found && i < chars.Length do
-            if System.Char.ToLowerInvariant chars.[i] = target then
-                found <- true
-            i <- i + 1
-        found
+type private LikeToken =
+    | LikeStar
+    | LikeAny
+    | LikeDigit
+    /// A bracket class: ranges (lo, hi), negated with `!`; `[]` matches nothing.
+    | LikeClass of (char * char) list * bool
+    | LikeEmpty
+    | LikeChar of char
 
-    let tokenMatches pi ti =
-        if pi >= pattern.Length || ti >= text.Length then
-            ValueNone
+/// `text Like pattern`: `*`, `?`, `#`, `[a-c]`, `[!a-c]`, `[]`; case-sensitive
+/// unless Option Compare Text.
+let vbLikeMatchWith (textMode: bool) (pattern: string) (text: string) : bool =
+    let fold (c: char) = if textMode then System.Char.ToLowerInvariant c else c
+    let tokens = ResizeArray<LikeToken>()
+    let mutable i = 0
+    while i < pattern.Length do
+        match pattern.[i] with
+        | '*' -> tokens.Add LikeStar; i <- i + 1
+        | '?' -> tokens.Add LikeAny; i <- i + 1
+        | '#' -> tokens.Add LikeDigit; i <- i + 1
+        | '[' ->
+            let close = pattern.IndexOf(']', i + 1)
+            if close < 0 then raiseVbError 93
+            let inner = pattern.Substring(i + 1, close - i - 1)
+            if inner = "" then tokens.Add LikeEmpty
+            else
+                let negate = inner.[0] = '!' && inner.Length > 1
+                let body = if negate then inner.Substring 1 else inner
+                let ranges = ResizeArray<char * char>()
+                let mutable j = 0
+                while j < body.Length do
+                    if j + 2 < body.Length && body.[j + 1] = '-' then
+                        let lo = body.[j]
+                        let hi = body.[j + 2]
+                        if hi < lo then raiseVbError 93
+                        ranges.Add((lo, hi))
+                        j <- j + 3
+                    else
+                        ranges.Add((body.[j], body.[j]))
+                        j <- j + 1
+                tokens.Add (LikeClass (List.ofSeq ranges, negate))
+            i <- close + 1
+        | c -> tokens.Add (LikeChar c); i <- i + 1
+    let inClass (ranges: (char * char) list) (c: char) =
+        ranges |> List.exists (fun (lo, hi) ->
+            (c >= lo && c <= hi) || (textMode && (let f = fold c in f >= fold lo && f <= fold hi)))
+    let tokenCount = tokens.Count
+    // Backtracking match from token t and text position p.
+    let rec matchAt t p =
+        if t = tokenCount then p = text.Length
         else
-            match pattern.[pi] with
-            | '*' -> ValueSome pi
-            | '?' -> ValueSome (pi + 1)
-            | '#' ->
-                if System.Char.IsDigit(text.[ti]) then ValueSome (pi + 1) else ValueNone
-            | '[' ->
-                let mutable endBracket = pi + 1
-                while endBracket < pattern.Length && pattern.[endBracket] <> ']' do
-                    endBracket <- endBracket + 1
-                if endBracket >= pattern.Length then
-                    ValueNone
-                else
-                    let innerStart = pi + 1
-                    let negate = innerStart < endBracket && pattern.[innerStart] = '!'
-                    let charsStart = if negate then innerStart + 1 else innerStart
-                    let charsLength = endBracket - charsStart
-                    let chars = if charsLength <= 0 then "" else pattern.Substring(charsStart, charsLength)
-                    let found = classContains chars text.[ti]
-                    let matches = if negate then not found else found
-                    if matches then ValueSome (endBracket + 1) else ValueNone
-            | c ->
-                if System.Char.ToLowerInvariant c = System.Char.ToLowerInvariant text.[ti] then
-                    ValueSome (pi + 1)
-                else
-                    ValueNone
+            match tokens.[t] with
+            | LikeStar ->
+                let mutable q = p
+                let mutable found = false
+                while not found && q <= text.Length do
+                    if matchAt (t + 1) q then found <- true
+                    q <- q + 1
+                found
+            | LikeEmpty -> matchAt (t + 1) p
+            | _ when p >= text.Length -> false
+            | LikeAny -> matchAt (t + 1) (p + 1)
+            | LikeDigit -> System.Char.IsDigit text.[p] && matchAt (t + 1) (p + 1)
+            | LikeClass (ranges, negate) -> (inClass ranges text.[p] <> negate) && matchAt (t + 1) (p + 1)
+            | LikeChar c -> fold c = fold text.[p] && matchAt (t + 1) (p + 1)
+    matchAt 0 0
 
-    let mutable pi = 0
-    let mutable ti = 0
-    let mutable starPi = -1
-    let mutable starTextNext = -1
-    let mutable matched = true
-    while matched && ti < text.Length do
-        if pi < pattern.Length && pattern.[pi] = '*' then
-            starPi <- pi
-            pi <- pi + 1
-            starTextNext <- ti
-        else
-            match tokenMatches pi ti with
-            | ValueSome nextPi ->
-                pi <- nextPi
-                ti <- ti + 1
-            | ValueNone ->
-                if starPi >= 0 then
-                    pi <- starPi + 1
-                    starTextNext <- starTextNext + 1
-                    ti <- starTextNext
-                else
-                    matched <- false
-    while matched && pi < pattern.Length && pattern.[pi] = '*' do
-        pi <- pi + 1
-    matched && pi >= pattern.Length
+let vbLikeMatch (pattern: string) (text: string) : bool = vbLikeMatchWith false pattern text
 
 let private clearError (state: VmState) =
     state.LastErrorNumber <- 0
@@ -188,18 +188,24 @@ let private clearError (state: VmState) =
     state.LastErrorSource <- ""
     state.LastErl <- 0
 
+/// Err.Clear: Erl keeps the line of the last error.
+let private clearErrKeepErl (state: VmState) =
+    let erl = state.LastErl
+    clearError state
+    state.LastErl <- erl
+
 /// The `Err` object of a VM state.
 type ErrObject(state: VmState) =
     interface IHostObject with
         member _.TypeName = "ErrObject"
         member _.GetMember name =
             match name.ToLowerInvariant() with
-            | "" | "number" -> Some (VInteger state.LastErrorNumber)
+            | "" | "number" -> Some (VLong state.LastErrorNumber)
             | "description" -> Some (VString state.LastErrorDescription)
             | "source" -> Some (VString state.LastErrorSource)
             | "helpfile" -> Some (VString "")
             | "helpcontext" | "lastdllerror" -> Some (VInteger 0)
-            | "clear" -> clearError state; Some VEmpty
+            | "clear" -> clearErrKeepErl state; Some VEmpty
             | _ -> None
         member _.SetMember name value =
             match name.ToLowerInvariant() with
@@ -212,7 +218,7 @@ type ErrObject(state: VmState) =
             let arg i = if i < args.Length then ValueSemantics.dereference args.[i] else VUndefined
             let text i = match arg i with VUndefined | VEmpty -> None | v -> Some (valueToString v)
             match name.ToLowerInvariant() with
-            | "clear" -> clearError state; Some VEmpty
+            | "clear" -> clearErrKeepErl state; Some VEmpty
             | "raise" ->
                 if args.Length < 1 then raiseVbError 449
                 let number = valueToInt (arg 0)
@@ -222,7 +228,7 @@ type ErrObject(state: VmState) =
                     | None when number = state.LastErrorNumber && state.LastErrorDescription <> "" -> state.LastErrorDescription
                     | None -> errorDescription number
                 raise (VbError { Number = number; Description = description; Source = defaultArg (text 1) "" })
-            | "" | "number" when args.Length = 0 -> Some (VInteger state.LastErrorNumber)
+            | "" | "number" when args.Length = 0 -> Some (VLong state.LastErrorNumber)
             | _ -> None
         member this.CallNamed name args _ = (this :> IHostObject).CallMethod name args
         member _.Enumerate () = None
@@ -668,16 +674,10 @@ let private executeCold (state: VmState) (instr: Instruction) =
         push state VNull
         state.Pc <- state.Pc + 1
 
-    | IntDivide ->
-        let right = ValueSemantics.scalar (pop state)
-        let left = ValueSemantics.scalar (pop state)
-        if left = VNull || right = VNull then push state VNull
-        else
-            let r = valueToInt right
-            if r = 0 then raiseVbError 11
-            let l = valueToInt left
-            if l = System.Int32.MinValue && r = -1 then raiseVbError 6
-            push state (VInteger (l / r))
+    | IntDivide | IntDivideChecked ->
+        let right = pop state
+        let left = pop state
+        push state (ValueSemantics.integerDivideWith (match instr.Opcode with IntDivideChecked -> true | _ -> false) false left right)
         state.Pc <- state.Pc + 1
 
     | Power ->
@@ -690,27 +690,11 @@ let private executeCold (state: VmState) (instr: Instruction) =
         push state result
         state.Pc <- state.Pc + 1
 
-    | Xor ->
-        let right = ValueSemantics.scalar (pop state)
-        let left = ValueSemantics.scalar (pop state)
-        match left, right with
-        | VNull, _ | _, VNull -> push state VNull
-        | VInteger l, VInteger r -> push state (VInteger (l ^^^ r))
-        | _ -> push state (VBoolean (valueToBool left <> valueToBool right))
-        state.Pc <- state.Pc + 1
-
-    | Eqv ->
-        let right = ValueSemantics.scalar (pop state)
-        let left = ValueSemantics.scalar (pop state)
-        if left = VNull || right = VNull then push state VNull
-        else push state (VBoolean (valueToBool left = valueToBool right))
-        state.Pc <- state.Pc + 1
-
-    | Imp ->
-        let right = ValueSemantics.scalar (pop state)
-        let left = ValueSemantics.scalar (pop state)
-        if left = VNull || right = VNull then push state VNull
-        else push state (VBoolean (not (valueToBool left) || valueToBool right))
+    | Xor | Eqv | Imp ->
+        let right = pop state
+        let left = pop state
+        let op = match instr.Opcode with Xor -> ValueSemantics.LXor | Eqv -> ValueSemantics.LEqv | _ -> ValueSemantics.LImp
+        push state (ValueSemantics.logicalWith op left right)
         state.Pc <- state.Pc + 1
 
     | IsOp ->
@@ -733,7 +717,7 @@ let private executeCold (state: VmState) (instr: Instruction) =
         let left = pop state
         let text = valueToString left
         let pattern = valueToString right
-        push state (VBoolean (vbLikeMatch pattern text))
+        push state (VBoolean (vbLikeMatchWith state.Program.TextCompare pattern text))
         state.Pc <- state.Pc + 1
 
     | (ArrayNew rank | ReDimPreserve rank) as opcode ->
@@ -959,7 +943,7 @@ let private executeCold (state: VmState) (instr: Instruction) =
         state.Pc <- target
 
     | LoadErrNumber ->
-        push state (VInteger state.LastErrorNumber)
+        push state (VLong state.LastErrorNumber)
         state.Pc <- state.Pc + 1
 
     | LoadErrDescription ->
@@ -975,7 +959,7 @@ let private executeCold (state: VmState) (instr: Instruction) =
         state.Pc <- state.Pc + 1
 
     | ClearErr ->
-        clearError state
+        clearErrKeepErl state
         push state VEmpty
         state.Pc <- state.Pc + 1
 
@@ -992,7 +976,7 @@ let private executeCold (state: VmState) (instr: Instruction) =
         state.Pc <- state.Pc + 1
 
     | LoadErl ->
-        push state (VInteger state.LastErl)
+        push state (VLong state.LastErl)
         state.Pc <- state.Pc + 1
 
     | StopOp ->
@@ -1180,19 +1164,25 @@ let executeOneInstruction (state: VmState) =
     | Add ->
         let right = pop state
         let left = pop state
-        push state (ValueSemantics.addValues left right)
+        push state (ValueSemantics.addWith false left right)
         state.Pc <- state.Pc + 1
 
-    | Subtract ->
+    | AddChecked ->
         let right = pop state
         let left = pop state
-        push state (ValueSemantics.subtractValues left right)
+        push state (ValueSemantics.addWith true left right)
         state.Pc <- state.Pc + 1
 
-    | Multiply ->
+    | Subtract | SubtractChecked ->
         let right = pop state
         let left = pop state
-        push state (ValueSemantics.multiplyValues left right)
+        push state (ValueSemantics.subtractWith (match instr.Opcode with SubtractChecked -> true | _ -> false) left right)
+        state.Pc <- state.Pc + 1
+
+    | Multiply | MultiplyChecked ->
+        let right = pop state
+        let left = pop state
+        push state (ValueSemantics.multiplyWith (match instr.Opcode with MultiplyChecked -> true | _ -> false) left right)
         state.Pc <- state.Pc + 1
 
     | Concat ->
@@ -1217,14 +1207,14 @@ let executeOneInstruction (state: VmState) =
         let left = pop state
         let result =
             match left, right with
-            | VInteger l, VInteger r ->
+            | (VInteger l | VLong l), (VInteger r | VLong r) ->
                 VBoolean (match opcode with
                           | Equal -> l = r | NotEqual -> l <> r
                           | LessThan -> l < r | LessEqual -> l <= r
                           | GreaterThan -> l > r | _ -> l >= r)
-            | (VDouble _ | VInteger _), (VDouble _ | VInteger _) ->
-                let l = match left with VDouble d -> d | VInteger i -> float i | _ -> 0.0
-                let r = match right with VDouble d -> d | VInteger i -> float i | _ -> 0.0
+            | (VDouble _ | VInteger _ | VLong _), (VDouble _ | VInteger _ | VLong _) ->
+                let l = match left with VDouble d -> d | VInteger i | VLong i -> float i | _ -> 0.0
+                let r = match right with VDouble d -> d | VInteger i | VLong i -> float i | _ -> 0.0
                 VBoolean (match opcode with
                           | Equal -> l = r | NotEqual -> l <> r
                           | LessThan -> l < r | LessEqual -> l <= r
@@ -1277,9 +1267,26 @@ let executeOneInstruction (state: VmState) =
             | ArraySet _ -> objectError other
             | _ -> raiseVbError 13
 
+    | CoerceParams pairs ->
+        let locals = state.CallStack.[state.Csp - 1].Locals
+        let mutable k = 0
+        while k < pairs.Length do
+            let slot = pairs.[k]
+            let code = pairs.[k + 1]
+            match locals.[slot] with
+            | VRef _ | VFieldRef _ | VUndefined -> ()
+            | VLong _ when code = 2 -> ()
+            | VDouble _ when code = 4 -> ()
+            | VString _ when code = 6 -> ()
+            | VBoolean _ when code = 7 -> ()
+            | VInteger i when code = 1 && i >= -32768 && i <= 32767 -> ()
+            | value -> locals.[slot] <- ValueSemantics.coerceTo (enum<ValueSemantics.DeclaredType> code) value
+            k <- k + 2
+        state.Pc <- state.Pc + 1
+
     | Coerce code ->
         match state.Stack.[state.Sp - 1] with
-        | VInteger _ when code = 2 -> ()
+        | VLong _ when code = 2 -> ()
         | VDouble _ when code = 4 -> ()
         | VInteger i when code = 1 && i >= -32768 && i <= 32767 -> ()
         | _ ->
@@ -1384,66 +1391,46 @@ let executeOneInstruction (state: VmState) =
     | MakeRefGlobal slot ->
         push state (VRef (state.Globals, slot))
         state.Pc <- state.Pc + 1
-    | Divide ->
-        let right = ValueSemantics.scalar (pop state)
-        let left = ValueSemantics.scalar (pop state)
-        if left = VNull || right = VNull then push state VNull
-        else
-            let r = valueToDouble right
-            if r = 0.0 then raiseVbError 11
-            push state (VDouble (valueToDouble left / r))
+    | Divide | DivideChecked ->
+        let right = pop state
+        let left = pop state
+        push state (ValueSemantics.divideWith (match instr.Opcode with DivideChecked -> true | _ -> false) left right)
         state.Pc <- state.Pc + 1
 
-    | Modulus ->
-        let right = ValueSemantics.scalar (pop state)
-        let left = ValueSemantics.scalar (pop state)
-        let result =
-            if left = VNull || right = VNull then VNull
-            else
-                let divisor = valueToInt right
-                if divisor = 0 then raiseVbError 11
-                if divisor = -1 then VInteger 0
-                else VInteger (valueToInt left % divisor)
-        push state result
+    | Modulus | ModulusChecked ->
+        let right = pop state
+        let left = pop state
+        push state (ValueSemantics.integerDivideWith (match instr.Opcode with ModulusChecked -> true | _ -> false) true left right)
         state.Pc <- state.Pc + 1
 
     | And ->
-        let right = ValueSemantics.scalar (pop state)
-        let left = ValueSemantics.scalar (pop state)
-        let result =
-            match left, right with
-            | VNull, VNull -> VNull
-            | VNull, value | value, VNull -> if valueToBool value then VNull else VBoolean false
-            | VInteger l, VInteger r -> VInteger (l &&& r)
-            | _ -> VBoolean (valueToBool left && valueToBool right)
-        push state result
+        let right = pop state
+        let left = pop state
+        match left, right with
+        | VBoolean l, VBoolean r -> push state (VBoolean (l && r))
+        | _ -> push state (ValueSemantics.logicalWith ValueSemantics.LAnd left right)
         state.Pc <- state.Pc + 1
 
     | Or ->
-        let right = ValueSemantics.scalar (pop state)
-        let left = ValueSemantics.scalar (pop state)
-        let result =
-            match left, right with
-            | VNull, VNull -> VNull
-            | VNull, value | value, VNull -> if valueToBool value then VBoolean true else VNull
-            | VInteger l, VInteger r -> VInteger (l ||| r)
-            | _ -> VBoolean (valueToBool left || valueToBool right)
-        push state result
+        let right = pop state
+        let left = pop state
+        match left, right with
+        | VBoolean l, VBoolean r -> push state (VBoolean (l || r))
+        | _ -> push state (ValueSemantics.logicalWith ValueSemantics.LOr left right)
         state.Pc <- state.Pc + 1
 
     | Not ->
-        let value = ValueSemantics.scalar (pop state)
-        match value with
-        | VNull -> push state VNull
-        | VInteger i -> push state (VInteger (~~~i))
-        | _ -> push state (VBoolean (not (valueToBool value)))
+        match pop state with
+        | VBoolean b -> push state (VBoolean (not b))
+        | value -> push state (ValueSemantics.notValue value)
         state.Pc <- state.Pc + 1
 
-    | Negate ->
+    | Negate | NegateChecked ->
         match state.Stack.[state.Sp - 1] with
         | VDouble d -> state.Stack.[state.Sp - 1] <- VDouble (-d)
-        | VInteger i when i <> System.Int32.MinValue -> state.Stack.[state.Sp - 1] <- VInteger (-i)
-        | _ -> push state (ValueSemantics.negateValue (pop state))
+        | VInteger i when i > -32768 && i <= 32767 -> state.Stack.[state.Sp - 1] <- VInteger (-i)
+        | VLong i when i <> System.Int32.MinValue -> state.Stack.[state.Sp - 1] <- VLong (-i)
+        | _ -> push state (ValueSemantics.negateWith (match instr.Opcode with NegateChecked -> true | _ -> false) (pop state))
         state.Pc <- state.Pc + 1
 
     | ArrayGetFlat ->
@@ -1557,10 +1544,12 @@ let dispatchError (state: VmState) (ex: exn) =
     state.LastErrorNumber <- info.Number
     state.LastErrorDescription <- info.Description
     state.LastErrorSource <- source
-    state.LastErl <- state.CallStack.[state.Csp - 1].LineLabel
     let mutable handled = false
     while not handled do
         let frame = state.CallStack.[state.Csp - 1]
+        // Erl is the line reached in the procedure that handles the error
+        // (the line of the call when the error came from a callee).
+        state.LastErl <- frame.LineLabel
         match frame.ErrorMode with
         | ResumeNextMode when not frame.HandlerActive ->
             while state.Sp > frame.StatementSp do ignore (pop state)

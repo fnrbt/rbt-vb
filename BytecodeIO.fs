@@ -9,7 +9,7 @@ open Values
 open Bytecode
 
 let magic = 0x46_56_42_43   // "FVBC"
-let version = 4
+let version = 5
 
 #if FABLE_COMPILER
 let serialize (_: BytecodeProgram) : byte[] = failwith "bytecode serialization is native-only"
@@ -47,6 +47,9 @@ let private writeValue (w: BinaryWriter) (v: Value) =
     | VDate d -> w.Write 8uy; w.Write d
     | VCurrency c -> w.Write 9uy; w.Write c
     | VError e -> w.Write 10uy; w.Write e
+    | VLong n -> w.Write 11uy; w.Write n
+    | VSingle f -> w.Write 12uy; w.Write f
+    | VByte b -> w.Write 13uy; w.Write b
     | other -> failwithf "non-constant value in bytecode: %A" other
 
 let private readValue (r: BinaryReader) : Value =
@@ -62,6 +65,9 @@ let private readValue (r: BinaryReader) : Value =
     | 8uy -> VDate (r.ReadDouble())
     | 9uy -> VCurrency (r.ReadInt64())
     | 10uy -> VError (r.ReadInt32())
+    | 11uy -> VLong (r.ReadInt32())
+    | 12uy -> VSingle (r.ReadSingle())
+    | 13uy -> VByte (r.ReadByte())
     | t -> failwithf "bad value tag %d" (int t)
 
 // --- Opcode (tag byte + payload) ---
@@ -162,6 +168,14 @@ let private writeOpcode (w: BinaryWriter) (op: Opcode) =
     | BindEvents n -> t 91; w.Write n
     | ReleaseCheck -> t 92
     | CallByNameOp n -> t 93; w.Write n
+    | AddChecked -> t 94
+    | SubtractChecked -> t 95
+    | MultiplyChecked -> t 96
+    | DivideChecked -> t 97
+    | IntDivideChecked -> t 98
+    | ModulusChecked -> t 99
+    | NegateChecked -> t 100
+    | CoerceParams pairs -> t 101; w.Write pairs.Length; (for x in pairs do w.Write x)
 
 let private readOpcode (r: BinaryReader) : Opcode =
     let i () = r.ReadInt32()
@@ -265,6 +279,17 @@ let private readOpcode (r: BinaryReader) : Opcode =
     | 91 -> BindEvents (i())
     | 92 -> ReleaseCheck
     | 93 -> CallByNameOp (i())
+    | 94 -> AddChecked
+    | 95 -> SubtractChecked
+    | 96 -> MultiplyChecked
+    | 97 -> DivideChecked
+    | 98 -> IntDivideChecked
+    | 99 -> ModulusChecked
+    | 100 -> NegateChecked
+    | 101 ->
+        let n = i()
+        if n < 0 || n > 1000000 then failwith "Invalid parameter conversions"
+        CoerceParams (Array.init n (fun _ -> i()))
     | t -> failwithf "bad opcode tag %d" t
 
 let private writeArray (w: BinaryWriter) (writeItem: 'a -> unit) (xs: 'a array) =

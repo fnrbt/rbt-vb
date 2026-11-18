@@ -108,6 +108,18 @@ type Opcode =
     | BindEvents of int           // new, old, sink -> new: WithEvents binding
     | ReleaseCheck                // a value just overwritten by Set: terminate it when unreachable
     | CallByNameOp of int         // obj, name, call type, args
+    // 0.5.0: arithmetic on operands with declared types (overflow is error 6
+    // instead of widening the Variant result)
+    | AddChecked
+    | SubtractChecked
+    | MultiplyChecked
+    | DivideChecked
+    | IntDivideChecked
+    | ModulusChecked
+    | NegateChecked
+    /// Convert parameter slots to their declared types unless they hold
+    /// references: slot, DeclaredType code, slot, code...
+    | CoerceParams of int array
 
 type Instruction = {
     Opcode: Opcode
@@ -177,7 +189,7 @@ let validate (program: BytecodeProgram) =
     let validTarget target = target >= 0 && target < program.Code.Length
     for constant in program.Constants do
         match constant with
-        | VInteger _ | VDouble _ | VString _ | VBoolean _ | VNull | VEmpty | VNothing | VUndefined | VDate _ | VCurrency _ | VError _ -> ()
+        | VInteger _ | VLong _ | VSingle _ | VByte _ | VDouble _ | VString _ | VBoolean _ | VNull | VEmpty | VNothing | VUndefined | VDate _ | VCurrency _ | VError _ -> ()
         | _ -> failwith "Invalid bytecode: runtime value in constant pool"
     for f in program.Functions do
         check (f.ParamsCount >= 0 && f.LocalsCount > f.ParamsCount && f.LocalsCount <= 1000000) "function locals"
@@ -185,7 +197,7 @@ let validate (program: BytecodeProgram) =
         check (not (isNull f.InitialLocals) && (f.InitialLocals.Length = 0 || f.InitialLocals.Length = f.LocalsCount)) "function initial locals"
         for v in f.InitialLocals do
             match v with
-            | VInteger _ | VDouble _ | VString _ | VBoolean _ | VEmpty | VNothing | VDate _ | VCurrency _ -> ()
+            | VInteger _ | VLong _ | VSingle _ | VByte _ | VDouble _ | VString _ | VBoolean _ | VEmpty | VNothing | VDate _ | VCurrency _ -> ()
             | _ -> failwith "Invalid bytecode: runtime value in initial locals"
     for c in program.Classes do
         check (not (isNull c.FieldTypes) && c.FieldTypes.Length <= c.Fields.Length) "class fields"
@@ -196,6 +208,10 @@ let validate (program: BytecodeProgram) =
                 check (index >= 0 && index < program.Functions.Length) "class member"
     for instruction in program.Code do
         match instruction.Opcode with
+        | CoerceParams pairs ->
+            check (not (isNull pairs) && pairs.Length % 2 = 0) "parameter conversions"
+            for k in 0 .. 2 .. pairs.Length - 1 do
+                check (pairs.[k] >= 0 && pairs.[k] < 1000000 && pairs.[k + 1] >= 1 && pairs.[k + 1] <= 11) "parameter conversion"
         | LoadConst i -> check (i >= 0 && i < program.Constants.Length) "constant slot"
         | LoadGlobal i | StoreGlobal i | MakeRefGlobal i -> check (i >= 0 && i < program.Globals) "global slot"
         | LoadLocal i | StoreLocal i | MakeRefLocal i -> check (i >= 0 && i < 1000000) "local slot"
@@ -239,6 +255,9 @@ let validate (program: BytecodeProgram) =
         match current, program.Code.[pc].Opcode with
         | Some f, (LoadLocal slot | StoreLocal slot | MakeRefLocal slot | LetLocal slot) ->
             check (slot < f.LocalsCount) "function local slot"
+        | Some f, CoerceParams pairs ->
+            for k in 0 .. 2 .. pairs.Length - 1 do check (pairs.[k] < f.LocalsCount) "function local slot"
+        | None, CoerceParams _ -> check false "parameter conversion outside a procedure"
         | _ -> ()
 
     let regions = Array.create program.Code.Length -1

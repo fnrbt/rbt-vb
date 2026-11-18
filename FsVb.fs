@@ -185,7 +185,9 @@ module VbDate =
         match ValueSemantics.dereference value with
         | VDate serial -> Some serial
         | VDouble d -> Some d
-        | VInteger i -> Some (float i)
+        | VInteger i | VLong i -> Some (float i)
+        | VSingle f -> Some (float f)
+        | VByte b -> Some (float b)
         | _ -> None
 
     /// (year, month, day, hour, minute, second) of a Date.
@@ -408,7 +410,10 @@ module private ProjectInternals =
 
     let literalValue expr =
         match expr with
-        | Literal (Integer i) -> Some (VInteger i)
+        | Literal (Integer i) -> Some (if i >= -32768 && i <= 32767 then VInteger i else VLong i)
+        | Literal (Long i) -> Some (VLong i)
+        | Literal (Single f) -> Some (VSingle f)
+        | Literal (Currency c) -> Some (VCurrency c)
         | Literal (Double d) -> Some (VDouble d)
         | Literal (Ast.String s) -> Some (VString s)
         | Literal (Boolean b) -> Some (VBoolean b)
@@ -416,6 +421,8 @@ module private ProjectInternals =
         | Literal Empty -> Some VEmpty
         | Literal Nothing -> Some VNothing
         | Unary (Negate, Literal (Integer i)) -> Some (VInteger (-i))
+        | Unary (Negate, Literal (Long i)) -> Some (if i = 32768 then VLong -32768 else VLong (-i))
+        | Unary (Negate, Literal (Single f)) -> Some (VSingle (-f))
         | Unary (Negate, Literal (Double d)) -> Some (VDouble (-d))
         | _ -> None
 

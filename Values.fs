@@ -3,6 +3,8 @@ module Rbt.Vb.Values
 open System.Collections.Generic
 
 type Value =
+    /// An Integer (16-bit, -32768..32767). A host value outside that range is
+    /// treated as a Long; return `VLong` for Longs.
     | VInteger of int
     | VDouble of float
     | VString of string
@@ -25,6 +27,14 @@ type Value =
     | VCurrency of int64
     /// An Error value (`CVErr(2042)`, Excel's #N/A); VarType 10.
     | VError of int
+    /// A Long (32-bit): `70000`, `5&`, `CLng`, `Len`, `UBound`, `Err.Number`,
+    /// `Collection.Count`, Enum members. VarType 3.
+    | VLong of int
+    /// A Single (32-bit float): `CSng`, `Rnd`, `Timer`, `1.5!`. Prints with 7
+    /// significant digits. VarType 4. Build one with `Values.single`.
+    | VSingle of float32
+    /// A Byte (0..255): `CByte`, `Dim b As Byte`. VarType 17.
+    | VByte of byte
 
 and VBArray = {
     Data: Value array
@@ -123,6 +133,7 @@ let errorDescription number =
     | 51 -> "Internal error"
     | 91 -> "Object variable or With block variable not set"
     | 92 -> "For loop not initialized"
+    | 93 -> "Invalid pattern string"
     | 94 -> "Invalid use of Null"
     | 424 -> "Object required"
     | 429 -> "ActiveX component can't create object"
@@ -158,3 +169,9 @@ type RuntimeHooks = {
     /// `Environ("NAME")`; return "" for an unknown variable.
     Environ: string -> string
 }
+
+/// The Single nearest to `x` (also under Fable, which does not round float32).
+let toSingle (x: float) : float32 = NumberText.toSingle x
+
+/// A Single value from a Double (rounded to Single precision).
+let single (x: float) = VSingle (toSingle x)

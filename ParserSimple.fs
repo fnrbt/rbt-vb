@@ -124,18 +124,36 @@ let private numberLiteral (text: string) =
             value <- value * float radix + float digit
         if value > 4294967295.0 then failwithf "Overflow in literal %s" text
         // Without a & suffix, values that fit 16 bits are Integers (&HFFFF = -1).
-        let signed =
-            if not isLong && value <= 65535.0 then (if value >= 32768.0 then value - 65536.0 else value)
-            elif value >= 2147483648.0 then value - 4294967296.0
-            else value
-        Literal (Integer (int signed))
+        if not isLong && value <= 65535.0 then
+            Literal (Integer (int (if value >= 32768.0 then value - 65536.0 else value)))
+        else Literal (Long (int (if value >= 2147483648.0 then value - 4294967296.0 else value)))
     else
         let suffix = text.[text.Length - 1]
-        let body = if System.Char.IsDigit suffix || suffix = '.' then text else text.Substring(0, text.Length - 1)
-        let isFloat = suffix = '#' || suffix = '!' || suffix = '@'
-        match System.Int32.TryParse body with
-        | true, value when not isFloat -> Literal (Integer value)
-        | _ -> Literal (Double (float body))
+        let hasSuffix = not (System.Char.IsDigit suffix || suffix = '.')
+        let body = if hasSuffix then text.Substring(0, text.Length - 1) else text
+        let isWhole = body |> Seq.forall System.Char.IsDigit
+#if FABLE_COMPILER
+        let number = float body
+#else
+        let number = System.Double.Parse(body, System.Globalization.CultureInfo.InvariantCulture)
+#endif
+        match (if hasSuffix then suffix else ' ') with
+        | '%' ->
+            if not isWhole || number > 32767.0 then failwithf "Overflow in literal %s" text
+            Literal (Integer (int number))
+        | '&' ->
+            if not isWhole || number > 2147483647.0 then failwithf "Overflow in literal %s" text
+            Literal (Long (int number))
+        | '!' -> Literal (Single (NumberText.toSingle number))
+        | '#' -> Literal (Double number)
+        | '@' ->
+            let digits = NumberText.ofText body
+            let units = NumberText.integerPart { digits with Exponent = digits.Exponent + 4 }
+            if units.Length > 19 then failwithf "Overflow in literal %s" text
+            Literal (Currency (System.Int64.Parse units))
+        | _ when isWhole && number <= 32767.0 -> Literal (Integer (int number))
+        | _ when isWhole && number <= 2147483647.0 -> Literal (Long (int number))
+        | _ -> Literal (Double number)
 
 let pnumber : Parser<Expression> = fun tokens ->
     match tokens with

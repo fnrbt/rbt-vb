@@ -209,7 +209,9 @@ let private formatMagnitude (magnitude: Digits) (section: string) =
 let private numberDigits (value: Value) =
     match value with
     | VCurrency units -> ofScaled units 4, units < 0L
-    | VInteger n -> ofText (string n), n < 0
+    | VInteger n | VLong n -> ofText (string n), n < 0
+    | VByte n -> ofText (string n), false
+    | VSingle f -> ofSingleDigits f, f < 0.0f
     | other ->
         let x = toNumber other
         roundSignificant (ofFloat x) 15, x < 0.0
@@ -414,7 +416,7 @@ let private namedNumberFormat (name: string) =
 
 let private isNumeric (value: Value) =
     match value with
-    | VInteger _ | VDouble _ | VCurrency _ | VBoolean _ -> true
+    | VInteger _ | VLong _ | VSingle _ | VByte _ | VDouble _ | VCurrency _ | VBoolean _ -> true
     | VString text -> (tryParseNumber text).IsSome
     | _ -> false
 
@@ -436,7 +438,9 @@ let format (value: Value) (format: string) (firstDay: int) (firstWeek: int) : Va
     | _ ->
     match name with
     | "general number" ->
-        if isNumeric value then VString (let x = toNumber (asNumber value) in (if x < 0.0 then "-" else "") + general (ofFloat x) 15)
+        if isNumeric value then
+            let precision = match value with VSingle _ -> 7 | _ -> 15
+            VString (let x = toNumber (asNumber value) in (if x < 0.0 then "-" else "") + general (ofFloat x) precision)
         else VString (toString value)
     | "yes/no" | "true/false" | "on/off" ->
         let truthy = if isNumeric value then toNumber (asNumber value) <> 0.0 else toBool value
@@ -513,14 +517,18 @@ let formatDateTime (serial: float) (namedFormat: int) =
 // ── Str and Val ──
 
 /// Str: a leading space for non-negative numbers.
-let str (value: Value) =
+let rec str (value: Value) =
     match scalar value with
     | VNull -> VNull
-    | VString text ->
-        let number = toNumber (VString text)
-        VString ((if number >= 0.0 then " " else "") + toString (VDouble number))
+    | VString text -> str (VDouble (toNumber (VString text)))
+    | (VDate _ | VBoolean _ | VError _) as other -> VString (toString other)
     | other ->
+        // Str writes no 0 before the decimal point: Str(0.5) is " .5".
         let text = toString other
+        let text =
+            if text.StartsWith "0." then text.Substring 1
+            elif text.StartsWith "-0." then "-" + text.Substring 2
+            else text
         VString (if text.StartsWith "-" then text else " " + text)
 
 /// Val: the number at the start of a string, ignoring spaces, tabs and line
@@ -530,9 +538,10 @@ let valOf (text: string) =
     for c in text do
         if c <> ' ' && c <> '\t' && c <> '\n' && c <> '\r' then sb.Append c |> ignore
     let t = sb.ToString()
-    if t.Length >= 2 && t.[0] = '&' && (Char.ToLowerInvariant t.[1] = 'h' || Char.ToLowerInvariant t.[1] = 'o') then
+    if t.Length >= 2 && t.[0] = '&' && (Char.ToLowerInvariant t.[1] = 'h' || Char.ToLowerInvariant t.[1] = 'o' || Char.IsDigit t.[1]) then
+        // "&H" is hexadecimal; "&O" and a bare "&" are octal.
         let radix = if Char.ToLowerInvariant t.[1] = 'h' then 16 else 8
-        let mutable i = 2
+        let mutable i = if Char.IsDigit t.[1] then 1 else 2
         let mutable value = 0.0
         let digitOf (c: char) =
             let c = Char.ToLowerInvariant c
@@ -567,6 +576,11 @@ let valOf (text: string) =
                 while j < n && Char.IsDigit t.[j] do j <- j + 1
                 if j > expStart then stop <- j
             let number = t.Substring(0, stop).Replace('d', 'e').Replace('D', 'e')
-            match tryParseNumber number with
-            | Some value -> value
-            | None -> 0.0
+#if FABLE_COMPILER
+            match Double.TryParse number with
+#else
+            match Double.TryParse(number, Globalization.NumberStyles.Float, Globalization.CultureInfo.InvariantCulture) with
+#endif
+            | true, value when Double.IsInfinity value -> raiseVbError 6
+            | true, value -> value
+            | _ -> 0.0

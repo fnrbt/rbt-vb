@@ -118,6 +118,10 @@ type CompileContext = {
     EventBindings: ResizeArray<EventBinding>
     /// Class name -> default member (from `Attribute X.VB_UserMemId = 0`).
     DefaultMembers: Dictionary<string, string>
+    /// Function index -> declared return type name (`Function F() As Long`).
+    FunctionTypes: Dictionary<int, string>
+    /// Numeric line label -> the Erl it reports, for the current procedure.
+    mutable ErlLines: Dictionary<string, int>
 }
 
 let emptyContext () =
@@ -164,6 +168,8 @@ let emptyContext () =
         WithEventsVars = newNameDictionary ()
         EventBindings = ResizeArray()
         DefaultMembers = newNameDictionary ()
+        FunctionTypes = Dictionary()
+        ErlLines = Dictionary()
     }
 
 let private fail (ctx: CompileContext) message : 'a =
@@ -445,17 +451,169 @@ let rec private mayBeObject (ctx: CompileContext) expr =
         | _ -> false
     | _ -> true
 
+/// The static type of an expression: Variant, or a declared type known at
+/// compile time (literals, typed variables, constants, Enum members, typed
+/// functions and the built-ins VBA declares with a type).
+[<RequireQualifiedAccess>]
+type private SType =
+    | Variant
+    | Typed of ValueSemantics.DeclaredType
+    /// Declared, but not one of the scalar types (a user-defined type...).
+    | TypedOther
+
+let private isTyped t = match t with SType.Variant -> false | _ -> true
+
+let private literalSType (l: Literal) =
+    match l with
+    | Integer i when i >= -32768 && i <= 32767 -> SType.Typed ValueSemantics.DeclaredType.Integer
+    | Integer _ | Long _ -> SType.Typed ValueSemantics.DeclaredType.Long
+    | Single _ -> SType.Typed ValueSemantics.DeclaredType.Single
+    | Double _ -> SType.Typed ValueSemantics.DeclaredType.Double
+    | Currency _ -> SType.Typed ValueSemantics.DeclaredType.Currency
+    | String _ -> SType.Typed ValueSemantics.DeclaredType.String
+    | Boolean _ -> SType.Typed ValueSemantics.DeclaredType.Boolean
+    | Date _ -> SType.Typed ValueSemantics.DeclaredType.Date
+    | Null | Empty | Nothing -> SType.Variant
+
+let private valueSType (v: Value) =
+    match v with
+    | VInteger i when i >= -32768 && i <= 32767 -> SType.Typed ValueSemantics.DeclaredType.Integer
+    | VInteger _ | VLong _ -> SType.Typed ValueSemantics.DeclaredType.Long
+    | VString _ -> SType.Typed ValueSemantics.DeclaredType.String
+    | VDouble _ -> SType.Typed ValueSemantics.DeclaredType.Double
+    | VBoolean _ -> SType.Typed ValueSemantics.DeclaredType.Boolean
+    | _ -> SType.Variant
+
+let private typeNameSType (name: string option) =
+    match name |> Option.bind ValueSemantics.declaredTypeOf with
+    | Some ValueSemantics.DeclaredType.Object -> SType.Variant
+    | Some ValueSemantics.DeclaredType.LongLong -> SType.TypedOther
+    | Some dt -> SType.Typed dt
+    | None -> SType.Variant
+
+/// Numeric precision ranks of declared types (see ValueSemantics).
+let private typeRank (dt: ValueSemantics.DeclaredType) =
+    match dt with
+    | ValueSemantics.DeclaredType.Byte -> 0
+    | ValueSemantics.DeclaredType.Integer | ValueSemantics.DeclaredType.Boolean -> 1
+    | ValueSemantics.DeclaredType.Long -> 2
+    | ValueSemantics.DeclaredType.Single -> 3
+    | ValueSemantics.DeclaredType.Double | ValueSemantics.DeclaredType.String -> 4
+    | ValueSemantics.DeclaredType.Currency -> 5
+    | ValueSemantics.DeclaredType.Date -> 6
+    | _ -> 7
+
+let private rankType rank =
+    match rank with
+    | 0 -> SType.Typed ValueSemantics.DeclaredType.Byte
+    | 1 -> SType.Typed ValueSemantics.DeclaredType.Integer
+    | 2 -> SType.Typed ValueSemantics.DeclaredType.Long
+    | 3 -> SType.Typed ValueSemantics.DeclaredType.Single
+    | 4 -> SType.Typed ValueSemantics.DeclaredType.Double
+    | 5 -> SType.Typed ValueSemantics.DeclaredType.Currency
+    | 6 -> SType.Typed ValueSemantics.DeclaredType.Date
+    | _ -> SType.TypedOther
+
+/// The static result type of `left op right` when both are typed.
+let private binarySType op (l: SType) (r: SType) =
+    match l, r with
+    | SType.Typed lt, SType.Typed rt ->
+        let lr = typeRank lt
+        let rr = typeRank rt
+        let whole a b = if a = 0 && b = 0 then rankType 0 elif a <= 1 && b <= 1 then rankType 1 else rankType 2
+        match op with
+        | Ast.Add | Ast.Subtract | Ast.Multiply ->
+            if lr = 7 || rr = 7 then SType.TypedOther
+            elif op = Ast.Add && lt = ValueSemantics.DeclaredType.String && rt = ValueSemantics.DeclaredType.String then l
+            elif lr = 6 || rr = 6 then
+                if op = Ast.Multiply || (op = Ast.Subtract && lr = 6 && rr = 6) then rankType 4 else rankType 6
+            elif (lr = 3 && rr = 2) || (lr = 2 && rr = 3) then rankType 4
+            elif op = Ast.Multiply && (lr = 5 || rr = 5) && (lr = 3 || rr = 3 || lr = 4 || rr = 4) then rankType 4
+            else rankType (max lr rr)
+        | Ast.Divide ->
+            let singleOperand rank = rank = 0 || rank = 1 || rank = 3
+            if (lr = 3 || rr = 3) && singleOperand lr && singleOperand rr then rankType 3 else rankType 4
+        | Ast.IntDivide | Ast.Modulus -> whole lr rr
+        | Ast.Power -> rankType 4
+        | Ast.Concatenate -> SType.Typed ValueSemantics.DeclaredType.String
+        | Ast.Equal | Ast.NotEqual | Ast.LessThan | Ast.LessEqual | Ast.GreaterThan | Ast.GreaterEqual
+        | Ast.Is | Ast.Like -> SType.Typed ValueSemantics.DeclaredType.Boolean
+        | Ast.And | Ast.Or | Ast.Xor | Ast.Eqv | Ast.Imp ->
+            if lt = ValueSemantics.DeclaredType.Boolean && rt = ValueSemantics.DeclaredType.Boolean then l
+            else whole lr rr
+    | SType.Variant, _ | _, SType.Variant -> SType.Variant
+    | _ -> SType.TypedOther
+
+/// Built-ins that VBA declares with a type (an expression with them as an
+/// operand overflows instead of widening); the others return Variants.
+let private builtinSType (name: string) (argType: unit -> SType) =
+    let typed dt = SType.Typed dt
+    match name with
+    | "len" | "lenb" | "instr" | "instrrev" | "ubound" | "lbound" | "vartype" | "rgb" | "qbcolor" | "clng" ->
+        typed ValueSemantics.DeclaredType.Long
+    | "cint" | "asc" | "ascw" | "sgn" | "strcomp" -> typed ValueSemantics.DeclaredType.Integer
+    | "ascb" | "cbyte" -> typed ValueSemantics.DeclaredType.Byte
+    | "csng" -> typed ValueSemantics.DeclaredType.Single
+    | "cdbl" -> typed ValueSemantics.DeclaredType.Double
+    | "ccur" -> typed ValueSemantics.DeclaredType.Currency
+    | "cbool" -> typed ValueSemantics.DeclaredType.Boolean
+    | "cdate" -> typed ValueSemantics.DeclaredType.Date
+    | "cstr" -> typed ValueSemantics.DeclaredType.String
+    | "abs" | "int" | "fix" ->
+        match argType () with
+        | SType.Typed ValueSemantics.DeclaredType.Boolean -> typed ValueSemantics.DeclaredType.Integer
+        | SType.Typed ValueSemantics.DeclaredType.String -> typed ValueSemantics.DeclaredType.Double
+        | t -> t
+    | _ -> SType.Variant
+
+let rec private staticTypeOf (ctx: CompileContext) expr =
+    match expr with
+    | Literal l -> literalSType l
+    | Parenthesized e -> staticTypeOf ctx e
+    | Identifier name when isErrName ctx name -> SType.Variant
+    | Identifier name when normalizeName name = "erl" && not (isVariableName ctx name) && (tryResolveFunction ctx name).IsNone ->
+        SType.Typed ValueSemantics.DeclaredType.Long
+    | Identifier name when isVariableName ctx name ->
+        if (tryResolveFunction ctx name).IsSome && not (isLocalVariable ctx name) && (tryResolveGlobal ctx name).IsNone then SType.Variant
+        else typeNameSType (declaredTypeName ctx name)
+    | Identifier name when (tryResolveFunction ctx name).IsSome ->
+        let _, index = (tryResolveFunction ctx name).Value
+        typeNameSType (match ctx.FunctionTypes.TryGetValue index with | true, t -> Some t | _ -> None)
+    | Identifier name ->
+        match Builtins.tryConstant name with
+        | Some value -> valueSType value
+        | None -> SType.Variant
+    | Member (Identifier enumName, _) when containsName ctx.Enums enumName && not (isVariableName ctx enumName) ->
+        SType.Typed ValueSemantics.DeclaredType.Long
+    | Member (Identifier objectName, memberName) when isErrName ctx objectName && normalizeName memberName = "number" ->
+        SType.Typed ValueSemantics.DeclaredType.Long
+    | Unary (Ast.Negate, e) ->
+        match staticTypeOf ctx e with
+        | SType.Typed (ValueSemantics.DeclaredType.Byte | ValueSemantics.DeclaredType.Boolean) -> SType.Typed ValueSemantics.DeclaredType.Integer
+        | SType.Typed ValueSemantics.DeclaredType.String -> SType.Typed ValueSemantics.DeclaredType.Double
+        | t -> t
+    | Unary (Ast.Not, e) ->
+        match staticTypeOf ctx e with
+        | SType.Typed (ValueSemantics.DeclaredType.Byte | ValueSemantics.DeclaredType.Integer | ValueSemantics.DeclaredType.Long | ValueSemantics.DeclaredType.Boolean) as t -> t
+        | SType.Variant -> SType.Variant
+        | _ -> SType.Typed ValueSemantics.DeclaredType.Long
+    | Binary (op, l, r) -> binarySType op (staticTypeOf ctx l) (staticTypeOf ctx r)
+    | Ast.Call (Identifier name, args) when containsSetName ctx.ArrayVars name && isVariableName ctx name && not args.IsEmpty ->
+        typeNameSType (declaredTypeName ctx name)
+    | Ast.Call (Identifier name, args) when not (isVariableName ctx name) ->
+        match tryResolveFunction ctx name with
+        | Some (_, index) -> typeNameSType (match ctx.FunctionTypes.TryGetValue index with | true, t -> Some t | _ -> None)
+        | None ->
+            builtinSType (normalizeName name) (fun () ->
+                match args with
+                | [ arg ] -> staticTypeOf ctx arg
+                | _ -> SType.Variant)
+    | _ -> SType.Variant
+
 /// The declared type a literal or typed variable already has, if static.
 let private staticType (ctx: CompileContext) expr =
-    match expr with
-    | Literal (Integer i) when i >= -32768 && i <= 32767 -> Some [ ValueSemantics.DeclaredType.Integer; ValueSemantics.DeclaredType.Long ]
-    | Literal (Integer _) -> Some [ ValueSemantics.DeclaredType.Long ]
-    | Literal (Double _) -> Some [ ValueSemantics.DeclaredType.Double ]
-    | Literal (String _) -> Some [ ValueSemantics.DeclaredType.String ]
-    | Literal (Boolean _) -> Some [ ValueSemantics.DeclaredType.Boolean ]
-    | Literal (Date _) -> Some [ ValueSemantics.DeclaredType.Date ]
-    | Identifier name ->
-        declaredTypeName ctx name |> Option.bind ValueSemantics.declaredTypeOf |> Option.map List.singleton
+    match staticTypeOf ctx expr with
+    | SType.Typed dt -> Some [ dt ]
     | _ -> None
 
 /// Push one argument for a by-reference parameter: a reference when the
@@ -610,13 +768,28 @@ let private binaryOpcode op =
     | Ast.Eqv -> Bytecode.Eqv
     | Ast.Imp -> Bytecode.Imp
 
+/// The opcode of an operator whose operands both have declared types:
+/// overflow raises error 6 instead of widening.
+let private checkedOpcode op =
+    match op with
+    | Ast.Add -> AddChecked
+    | Ast.Subtract -> SubtractChecked
+    | Ast.Multiply -> MultiplyChecked
+    | Ast.Divide -> DivideChecked
+    | Ast.IntDivide -> IntDivideChecked
+    | Ast.Modulus -> ModulusChecked
+    | other -> binaryOpcode other
+
 let rec compileExpression (ctx: CompileContext) (expr: Expression) =
     match expr with
     | Parenthesized e -> compileExpression ctx e
     | ArrayBound _ -> fail ctx "Array bound outside declaration"
     | MissingArg -> emitConst ctx VUndefined
     | NamedArg (name, _) -> fail ctx (sprintf "Named argument not expected here: %s" name)
-    | Literal (Integer i) -> emitConst ctx (VInteger i)
+    | Literal (Integer i) -> emitConst ctx (if i >= -32768 && i <= 32767 then VInteger i else VLong i)
+    | Literal (Long i) -> emitConst ctx (VLong i)
+    | Literal (Single f) -> emitConst ctx (VSingle f)
+    | Literal (Currency c) -> emitConst ctx (VCurrency c)
     | Literal (Double d) -> emitConst ctx (VDouble d)
     | Literal (String s) -> emitConst ctx (VString s)
     | Literal (Boolean b) -> if b then emit ctx LoadTrue 0 else emit ctx LoadFalse 0
@@ -638,11 +811,12 @@ let rec compileExpression (ctx: CompileContext) (expr: Expression) =
         emit ctx Bytecode.Not 0
     | Unary (Ast.Negate, e) ->
         compileExpression ctx e
-        emit ctx Bytecode.Negate 0
+        emit ctx (if isTyped (staticTypeOf ctx e) then NegateChecked else Bytecode.Negate) 0
     | Binary (op, left, right) ->
         compileExpression ctx left
         compileExpression ctx right
-        emit ctx (binaryOpcode op) 0
+        let strict = isTyped (staticTypeOf ctx left) && isTyped (staticTypeOf ctx right)
+        emit ctx (if strict then checkedOpcode op else binaryOpcode op) 0
     | Ast.Call (Identifier name, args) when
         (match ctx.ClassName with Some className -> containsName ctx.FunctionIndex (className + "." + name) | None -> false) ->
         compileExpression ctx (Ast.Call (Member (MeExpr, name), args))
@@ -667,7 +841,8 @@ let rec compileExpression (ctx: CompileContext) (expr: Expression) =
         let isKnownValue = containsSetName ctx.ArrayVars name || isVariableName ctx name
         let isFunction = (tryResolveFunction ctx name).IsSome
         // Inside Function F, F(x) is a recursive call unless F is an array.
-        if isKnownValue && (not isFunction || (containsSetName ctx.ArrayVars name && isLocalVariable ctx name && ctx.ReturnSlotName <> Some name)) then
+        // A local (or parameter) shadows a procedure of the same name.
+        if isKnownValue && (not isFunction || (isLocalVariable ctx name && ctx.ReturnSlotName <> Some name)) then
             emitLoadVar ctx name
             if containsSetName ctx.ArrayVars name && not args.IsEmpty && not (hasNamed args) && not (List.contains MissingArg args) then
                 for arg in args do compileExpression ctx arg
@@ -793,7 +968,25 @@ let private compileLetValue (ctx: CompileContext) (expr: Expression) (convertsOn
 /// value's static type makes unnecessary.
 let private compileTypedValue (ctx: CompileContext) (expr: Expression) (name: string) =
     let target = declaredTypeName ctx name
+    let rec literalValue e =
+        match e with
+        | Literal (Integer i) -> Some (if i >= -32768 && i <= 32767 then VInteger i else VLong i)
+        | Literal (Long i) -> Some (VLong i)
+        | Literal (Single f) -> Some (VSingle f)
+        | Literal (Double d) -> Some (VDouble d)
+        | Literal (Currency c) -> Some (VCurrency c)
+        | Parenthesized inner -> literalValue inner
+        | _ -> None
+    let converted =
+        match target |> Option.bind ValueSemantics.declaredTypeOf, literalValue expr with
+        | Some dt, Some value when dt <> ValueSemantics.DeclaredType.Object ->
+            // A literal converts at compile time (`Dim l As Long: l = 0`).
+            try Some (ValueSemantics.coerceTo dt value) with _ -> None
+        | _ -> None
     match target |> Option.bind ValueSemantics.declaredTypeOf, staticType ctx expr with
+    | _ when converted.IsSome ->
+        emitConst ctx converted.Value
+        storeRaw ctx name
     | Some dt, Some kinds when List.contains dt kinds ->
         compileExpression ctx expr
         storeRaw ctx name
@@ -1024,7 +1217,7 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
 
     | Declaration (_, Const (name, _, expr)) ->
         compileExpression ctx expr
-        storeRaw ctx name
+        storeName ctx name
 
     | Declaration (_, ReDim (name, dimensions, preserve)) ->
         ctx.ImplicitAllowed <- true
@@ -1071,6 +1264,14 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
         | Some step -> compileExpression ctx step
         | None -> emitConst ctx (VInteger 1)
         emit ctx (StoreLocal stepSlot) 0
+        let counterTyped = isTyped (typeNameSType (declaredTypeName ctx varName))
+        if not counterTyped then
+            // A Variant counter takes the widest type of start, end and step.
+            emitLoadVar ctx varName
+            emit ctx (LoadLocal endSlot) 0
+            emit ctx (LoadLocal stepSlot) 0
+            emit ctx (CallBuiltin ("for:start", 3)) 0
+            storeName ctx varName
         let loopStartPc = ctx.Instructions.Count
         emit ctx (LoadLocal stepSlot) 0
         emitConst ctx (VInteger 0)
@@ -1093,7 +1294,8 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
         for stmt in body do compileStatement ctx stmt
         emitLoadVar ctx varName
         emit ctx (LoadLocal stepSlot) 0
-        emit ctx Add 0
+        // A typed counter overflows (error 6); a Variant counter widens.
+        emit ctx (if counterTyped then AddChecked else Add) 0
         storeName ctx varName
         emit ctx (Jump loopStartPc) 0
         patchJump ctx exitJumpPc (JumpIfTrue ctx.Instructions.Count)
@@ -1244,7 +1446,8 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
     | LabelStmt label ->
         setName ctx.Labels label ctx.Instructions.Count
         if label.Length > 0 && label.Length < 10 && Seq.forall System.Char.IsDigit label then
-            emit ctx (LineLabel (int label)) 0
+            let erl = match ctx.ErlLines.TryGetValue label with | true, n -> n | _ -> int label
+            emit ctx (LineLabel erl) 0
 
     | OnError ResumeNext -> emit ctx OnErrorResumeNext 0
     | OnError GoToZero -> emit ctx OnErrorGoToZero 0
@@ -1328,14 +1531,84 @@ let patchLabels (ctx: CompileContext) =
         | false, _ ->
             raise (CompileFailure (sprintf "Label not defined: %s" label, ctx.Instructions.[pc].LineNumber, ctx.ModuleName))
 
+/// The type of a constant: its `As` type, or that of its literal value
+/// (`Const K = 5` is an Integer).
+let private constTypeName (typeRef: TypeRef option) (value: Expression) =
+    match typeRef with
+    | Some t -> Some t.Name
+    | None ->
+        let rec literalOf e =
+            match e with
+            | Literal l -> Some l
+            | Parenthesized inner | Unary (Ast.Negate, inner) -> literalOf inner
+            | _ -> None
+        match literalOf value with
+        | Some (Integer i) when i >= -32768 && i <= 32767 -> Some "Integer"
+        | Some (Integer _ | Long _) -> Some "Long"
+        | Some (Single _) -> Some "Single"
+        | Some (Double _) -> Some "Double"
+        | Some (Currency _) -> Some "Currency"
+        | Some (String _) -> Some "String"
+        | Some (Boolean _) -> Some "Boolean"
+        | Some (Date _) -> Some "Date"
+        | _ -> None
+
+/// The Erl each numeric line label of a procedure reports. VBA reports a
+/// line's own number, with one exception observed in Excel 2019: when the
+/// procedure's first numbered lines are declarations (`10 Dim a`), the first
+/// numbered line with executable code reports the first numbered line
+/// (10), unless it is the last numbered line of the procedure.
+let private erlLines (body: Statement list) =
+    let labels = ResizeArray<string * bool>()
+    let mutable pending : string option = None
+    let isNumeric (label: string) = label.Length > 0 && label.Length < 10 && Seq.forall System.Char.IsDigit label
+    let rec visit (stmt: Statement) =
+        match stmt with
+        | LocatedStmt (_, inner) -> visit inner
+        | LabelStmt label when isNumeric label ->
+            match pending with
+            | Some previous -> labels.Add((previous, false))
+            | None -> ()
+            pending <- Some label
+        | LabelStmt _ -> ()
+        | other ->
+            match pending with
+            | Some label ->
+                let executable =
+                    match other with
+                    | Declaration (_, (Dim _ | Const _ | StaticDim _)) -> false
+                    | _ -> true
+                labels.Add((label, executable))
+                pending <- None
+            | None -> ()
+            match other with
+            | IfStmt (_, yes, alternatives, no) ->
+                for s in yes do visit s
+                for (_, stmts) in alternatives do for s in stmts do visit s
+                match no with Some stmts -> (for s in stmts do visit s) | None -> ()
+            | ForLoop (_, _, _, _, stmts) | ForEach (_, _, stmts) | WhileLoop (_, stmts) | WithStmt (_, stmts) ->
+                for s in stmts do visit s
+            | SelectCase (_, cases) -> for (_, stmts) in cases do for s in stmts do visit s
+            | DoLoop (a, b) ->
+                for c in [ a; b ] do
+                    match c with Some c -> (for s in c.Body do visit s) | None -> ()
+            | _ -> ()
+    for stmt in body do visit stmt
+    match pending with Some label -> labels.Add((label, false)) | None -> ()
+    let map = Dictionary<string, int>()
+    match Seq.tryFindIndex snd labels with
+    | Some i when i > 0 && i < labels.Count - 1 -> map.[fst labels.[i]] <- int (fst labels.[0])
+    | _ -> ()
+    map
+
 let mutable private visitStatic : VarDeclarator -> unit = ignore
 
-let rec private collectDeclarations (stmt: Statement) (visit: VarDeclarator -> unit) (visitConst: string -> unit) =
+let rec private collectDeclarations (stmt: Statement) (visit: VarDeclarator -> unit) (visitConst: string * TypeRef option * Expression -> unit) =
     match stmt with
     | LocatedStmt (_, inner) -> collectDeclarations inner visit visitConst
     | Declaration (_, Dim ds) -> for d in ds do visit d
     | Declaration (_, StaticDim ds) -> for d in ds do visitStatic d
-    | Declaration (_, Const (n, _, _)) -> visitConst n
+    | Declaration (_, Const (n, t, v)) -> visitConst (n, t, v)
     | IfStmt (_, yes, alternatives, no) ->
         for stmt in yes do collectDeclarations stmt visit visitConst
         for (_, stmts) in alternatives do
@@ -1356,6 +1629,19 @@ let rec private collectDeclarations (stmt: Statement) (visit: VarDeclarator -> u
     | _ -> ()
 
 let compileFunctionBodyWith (ctx: CompileContext) (isStatic: bool) (name: string) (returnName: string) (paramList: Parameter list) (returnType: TypeRef option) (body: Statement list) =
+    // A local declared with the procedure's own name (`Sub color()` /
+    // `Dim color`) is a variable that shadows the procedure; the return value
+    // then lives in a hidden slot.
+    let mutable shadowed = false
+    let declares (n: string) = if normalizeName n = normalizeName returnName then shadowed <- true
+    let savedVisitStatic = visitStatic
+    visitStatic <- (fun d -> declares d.Name)
+    for stmt in body do
+        collectDeclarations stmt (fun d -> declares d.Name) (fun (n, _, _) -> declares n)
+    visitStatic <- savedVisitStatic
+    let returnName = if shadowed then returnName + "#return" else returnName
+    let outerErlLines = ctx.ErlLines
+    ctx.ErlLines <- erlLines body
     let outerLocals = copyNameDictionary ctx.Locals
     let outerStatics = ctx.StaticLocals
     let outerAsNew = ctx.LocalAsNew
@@ -1424,7 +1710,11 @@ let compileFunctionBodyWith (ctx: CompileContext) (isStatic: bool) (name: string
             | _ -> ()
             match d.Type, d.ArraySpec with
             | Some t, _ -> setName ctx.LocalTypes d.Name t.Name
-            | _ -> ()) (fun n -> ignore (getLocalSlot ctx n))
+            | _ -> ()) (fun (n, t, v) ->
+                ignore (getLocalSlot ctx n)
+                match constTypeName t v with
+                | Some typeName -> setName ctx.LocalTypes n typeName
+                | None -> ())
     visitStatic <- outerVisit
 
     let funcIndex = getName ctx.FunctionIndex name
@@ -1433,14 +1723,17 @@ let compileFunctionBodyWith (ctx: CompileContext) (isStatic: bool) (name: string
     // Prologue: typed locals and return value start at their type's default;
     // ByVal typed parameters convert the passed value.
     let line = ctx.CurrentLine
+    // A ByRef typed parameter given a value rather than a variable (an
+    // expression, an Optional default, a host argument) converts it too.
+    let coercions = ResizeArray<int>()
     for param in paramList do
         match param.Type with
-        | Some t when not param.ByRef && not param.IsArray && not param.IsParamArray && (ValueSemantics.declaredTypeOf t.Name).IsSome ->
-            let slot = getName ctx.Locals param.Name
-            emit ctx (LoadLocal slot) line
-            emitStoreConversion ctx (Some t.Name)
-            emit ctx (StoreLocal slot) line
+        | Some t when not param.IsArray && not param.IsParamArray ->
+            match ValueSemantics.declaredTypeOf t.Name with
+            | Some dt -> coercions.Add(getName ctx.Locals param.Name); coercions.Add(int dt)
+            | None -> ()
         | _ -> ()
+    if coercions.Count > 0 then emit ctx (CoerceParams (coercions.ToArray())) line
     // Scalar defaults go into the frame template; user-defined types are
     // constructed by the prologue.
     let initial = Dictionary<int, Value>()
@@ -1482,6 +1775,7 @@ let compileFunctionBodyWith (ctx: CompileContext) (isStatic: bool) (name: string
     ctx.LocalTypes <- outerTypes
     ctx.NextLocalSlot <- outerNextLocal
     ctx.ReturnSlotName <- outerReturnSlot
+    ctx.ErlLines <- outerErlLines
     ctx.InFunction <- false
     ctx.ClassFields <- outerClassFields
     ctx.WithTargetSlot <- outerWith
@@ -1540,14 +1834,22 @@ let private registerDeclarations (ctx: CompileContext) (kind: ModuleKind) (tops:
             | PropertyGet (_, name, ps, _, _) -> name + "_get", ps
             | PropertyLet (_, name, ps, _) -> name + "_let", ps
             | PropertySet (_, name, ps, _) -> name + "_set", ps
-        if prefix = "" && ctx.ModuleName <> "" then
-            let key = privateKey ctx.ModuleName suffix
-            let index = registerFunction ctx key ps
-            if kind = StandardModule && not (isPrivate (functionModifiers func)) && not (containsName ctx.FunctionIndex suffix) then
-                setName ctx.FunctionIndex suffix index
-                setName ctx.Parameters suffix ps
-        else
-            ignore (registerFunction ctx (prefix + suffix) ps)
+        let returnType =
+            match func with
+            | FunctionDecl (_, _, _, Some t, _) | PropertyGet (_, _, _, Some t, _) -> Some t.Name
+            | _ -> None
+        let index =
+            if prefix = "" && ctx.ModuleName <> "" then
+                let key = privateKey ctx.ModuleName suffix
+                let index = registerFunction ctx key ps
+                if kind = StandardModule && not (isPrivate (functionModifiers func)) && not (containsName ctx.FunctionIndex suffix) then
+                    setName ctx.FunctionIndex suffix index
+                    setName ctx.Parameters suffix ps
+                index
+            else registerFunction ctx (prefix + suffix) ps
+        match returnType with
+        | Some t -> ctx.FunctionTypes.[index] <- t
+        | None -> ()
     for top in tops do
         match top with
         | FunctionDef f -> register "" f
@@ -1706,8 +2008,8 @@ let rec compileTopLevel (ctx: CompileContext) (topLevel: TopLevel) =
             | None, Some prev ->
                 emitLoadVar ctx prev
                 emitConst ctx (VInteger 1)
-                emit ctx Add 0
-            storeRaw ctx m.Name
+                emit ctx AddChecked 0
+            storeName ctx m.Name
             previous <- Some m.Name
     | OptionStmt option when normalizeName option = "compare text" -> ctx.TextCompare <- true
     | _ -> ()
@@ -1740,13 +2042,13 @@ let rec preRegisterGlobals (ctx: CompileContext) (topLevel: TopLevel) =
                 if not spec.Dimensions.IsEmpty then addSetName ctx.FixedArrays d.Name |> ignore
             | None -> ()
     | WithEventsDecl (vis, name, _) -> register vis name None
-    | TopLevelStatement (Declaration (vis, Const (name, _, _))) -> register vis name None
+    | TopLevelStatement (Declaration (vis, Const (name, typeRef, value))) -> register vis name (constTypeName typeRef value)
     | TopLevelStatement (Declaration (_, ReDim (name, _, _))) ->
         if (tryResolveGlobal ctx name).IsNone then register None name None
     | EnumDecl (vis, enumName, members) ->
         let names = newNameSet ()
         for m in members do
-            register (match vis with None -> Some Public | v -> v) m.Name None
+            register (match vis with None -> Some Public | v -> v) m.Name (Some "Long")
             addSetName names m.Name |> ignore
         setName ctx.Enums enumName names
     | _ -> ()

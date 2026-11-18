@@ -7,6 +7,7 @@ let main _ =
         "value semantics", SemanticCases.run
         "0.3.0 release", ReleaseCases.runAll
         "0.4.0 release", Release040Cases.runAll
+        "0.5.0 release", Release050Cases.runAll
 #if !FABLE_COMPILER
         "persistence", PersistenceCases.run
         "existing fixtures", FixtureCases.run

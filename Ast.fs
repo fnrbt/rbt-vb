@@ -39,8 +39,15 @@ type BinaryOperator =
 type UnaryOperator = Not | Negate
 
 type Literal =
+    /// An Integer literal (-32768..32767): `5`, `5%`, `&HFFFF`.
     | Integer of int
+    /// A Long literal: `70000`, `5&`, `&H10000`, `&HFFFF&`.
+    | Long of int
+    /// A Single literal: `1.5!`.
+    | Single of float32
     | Double of float
+    /// A Currency literal in 1/10000 units: `5@` is 50000.
+    | Currency of int64
     | String of string
     | Boolean of bool
     | Null

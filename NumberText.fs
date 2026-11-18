@@ -7,6 +7,27 @@ module Rbt.Vb.NumberText
 
 /// Significant digits (no leading or trailing zeros) and exponent `e` with
 /// |x| = 0.d1d2d3... × 10^e. Zero is ("", 0).
+/// The Single nearest to `x` (round half to even), as `float32 x` on .NET.
+/// Fable does not round `float32` conversions, so this rounds explicitly.
+let toSingle (x: float) : float32 =
+#if FABLE_COMPILER
+    if x = 0.0 || System.Double.IsNaN x || System.Double.IsInfinity x then float32 x
+    else
+        let a = abs x
+        if a >= 3.4028235677973366E38 then float32 (if x > 0.0 then infinity else -infinity)
+        else
+            let mutable e = int (System.Math.Floor(System.Math.Log(a) / System.Math.Log(2.0)))
+            if System.Math.Pow(2.0, float e) > a then e <- e - 1
+            if System.Math.Pow(2.0, float (e + 1)) <= a then e <- e + 1
+            let ulp = System.Math.Pow(2.0, float ((max e -126) - 23))
+            let q = System.Math.Round(a / ulp, System.MidpointRounding.ToEven)
+            let r = q * ulp
+            float32 (if x < 0.0 then -r else r)
+#else
+    float32 x
+#endif
+
+
 type Digits = { Digits: string; Exponent: int }
 
 let zeroDigits = { Digits = ""; Exponent = 0 }
@@ -93,14 +114,16 @@ let private exponentText (e: int) =
     (if e < 0 then "E-" else "E+") + (let a = abs e in if a < 10 then "0" + string a else string a)
 
 /// The text of a magnitude with at most `precision` significant digits, as
-/// C's `%.<p>G` writes it and VB prints Doubles: fixed notation for decimal
-/// exponents from -4 up to precision - 1, otherwise "1.5E+20" / "1E-05".
+/// VB prints Doubles (precision 15) and Singles (7): fixed notation when the
+/// integer part has fewer than `precision` digits and at most `precision`
+/// digits follow the decimal point ("0.0000000001", "0.333333333333333"),
+/// otherwise scientific ("1E+15", "3.33333333333333E-04").
 let general (d: Digits) (precision: int) =
     let d = roundSignificant d precision
     if d.Digits = "" then "0"
     else
         let x = d.Exponent - 1
-        if x >= -4 && x < precision then
+        if x < precision && d.Digits.Length - x - 1 <= precision then
             let fraction = significantFraction d
             integerPart d + (if fraction = "" then "" else "." + fraction)
         else
@@ -116,6 +139,33 @@ let ofDouble (x: float) =
     else
         let text = general (ofFloat x) 15
         if x < 0.0 && text <> "0" then "-" + text else text
+
+/// The decimal digits of a Single: 7 significant digits.
+let ofSingleDigits (x: float32) = roundSignificant (ofFloat (float x)) 7
+
+/// How VB prints a Single: 7 significant digits (CStr(Rnd) is "0.9078093").
+let ofSingle (x: float32) =
+    let f = float x
+    if System.Double.IsNaN f then "NaN"
+    elif System.Double.IsInfinity f then (if f > 0.0 then "1.#INF" else "-1.#INF")
+    else
+        let text = general (ofFloat f) 7
+        if f < 0.0 && text <> "0" then "-" + text else text
+
+let private digitsValue (d: Digits) =
+    if d.Digits = "" then 0.0
+    else
+        let text = "0." + d.Digits + "E" + string d.Exponent
+#if FABLE_COMPILER
+        System.Double.Parse text
+#else
+        System.Double.Parse(text, System.Globalization.CultureInfo.InvariantCulture)
+#endif
+
+/// The Double with a Single's 7 printed digits (CCur(CSng(0.1)) is 0.1).
+let singleAsDouble (x: float32) =
+    let v = digitsValue (ofSingleDigits x)
+    if x < 0.0f then -v else v
 
 /// How VB prints a Currency: up to four decimals, no trailing zeros.
 let ofCurrency (units: int64) =

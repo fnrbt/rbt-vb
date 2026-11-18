@@ -31,7 +31,7 @@ let private expectVbaText label expression expected =
 let run () =
     expect "numeric string multiplication" "2.5 * \"2\"" (VDouble 5.0)
     expect "Empty preserves fractional precision" "2.5 + Empty" (VDouble 2.5)
-    expect "True coerces to minus one" "2 + True" (VDouble 1.0)
+    expect "True coerces to minus one" "2 + True" (VInteger 1)
     expect "Null arithmetic propagates" "Null + 2" VNull
     expectRuntimeError "invalid numeric conversion" "2 * \"not a number\""
     expectRuntimeError "invalid Null conversion" "CDbl(Null)"
@@ -40,7 +40,7 @@ let run () =
     expect "string descending order" "\"b\" < \"a\"" (VBoolean false)
     expect "CInt midpoint rounds to even" "CInt(1.5)" (VInteger 2)
     expect "CInt negative midpoint rounds to even" "CInt(-2.5)" (VInteger -2)
-    expect "CLng midpoint rounds to even" "CLng(2.5)" (VInteger 2)
+    expect "CLng midpoint rounds to even" "CLng(2.5)" (VLong 2)
     expect "Int floors negatives" "Int(-1.5)" (VDouble -2.0)
     expect "Fix truncates negatives" "Fix(-1.5)" (VDouble -1.0)
     expect "Round ties to even" "Round(2.5)" (VDouble 2.0)
@@ -56,14 +56,14 @@ let run () =
     expectVbaText "StrComp Option Compare Text default" "StrComp(\"A\", \"a\")" (VInteger 0)
     expectVbaText "StrComp uses Option Compare Text" "StrComp(\"A\", \"a\", -1)" (VInteger 0)
     expectVbaText "StrComp explicit binary overrides option" "StrComp(\"A\", \"a\", 0)" (VInteger -1)
-    expect "InStr binary default" "InStr(\"Ab\", \"a\")" (VInteger 0)
-    expect "InStr text comparison" "InStr(1, \"Ab\", \"a\", 1)" (VInteger 1)
-    expectVbaText "InStr Option Compare Text default" "InStr(\"Ab\", \"a\")" (VInteger 1)
-    expectVbaText "InStr uses Option Compare Text" "InStr(1, \"Ab\", \"a\", -1)" (VInteger 1)
-    expectVbaText "InStr explicit binary overrides option" "InStr(1, \"Ab\", \"a\", 0)" (VInteger 0)
-    expect "InStr at end" "InStr(3, \"abc\", \"c\")" (VInteger 3)
-    expect "InStr beyond end" "InStr(5, \"abc\", \"a\")" (VInteger 0)
-    expect "InStr empty needle" "InStr(2, \"abc\", \"\")" (VInteger 2)
+    expect "InStr binary default" "InStr(\"Ab\", \"a\")" (VLong 0)
+    expect "InStr text comparison" "InStr(1, \"Ab\", \"a\", 1)" (VLong 1)
+    expectVbaText "InStr Option Compare Text default" "InStr(\"Ab\", \"a\")" (VLong 1)
+    expectVbaText "InStr uses Option Compare Text" "InStr(1, \"Ab\", \"a\", -1)" (VLong 1)
+    expectVbaText "InStr explicit binary overrides option" "InStr(1, \"Ab\", \"a\", 0)" (VLong 0)
+    expect "InStr at end" "InStr(3, \"abc\", \"c\")" (VLong 3)
+    expect "InStr beyond end" "InStr(5, \"abc\", \"a\")" (VLong 0)
+    expect "InStr empty needle" "InStr(2, \"abc\", \"\")" (VLong 2)
     expectRuntimeError "InStr invalid start" "InStr(0, \"abc\", \"a\")"
-    expect "Array upper bound" "UBound(Array(1, 2))" (VInteger 1)
+    expect "Array upper bound" "UBound(Array(1, 2))" (VLong 1)
     expect "Split then Join" "Join(Split(\"a,b\", \",\"), \"-\")" (VString "a-b")

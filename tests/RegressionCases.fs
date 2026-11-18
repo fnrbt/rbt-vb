@@ -25,7 +25,9 @@ let private checkGlobal options source name expected =
 let private checkNumber options source name expected =
     let result = run options source
     match globalValue name result with
-    | VInteger n when float n = expected -> ()
+    | VInteger n | VLong n when float n = expected -> ()
+    | VByte n when float n = expected -> ()
+    | VSingle n when abs (float n - expected) < 0.000001 -> ()
     | VDouble n when abs (n - expected) < 0.00000001 -> ()
     | actual -> fail name (VDouble expected) actual
 
@@ -98,7 +100,7 @@ let private cases : (string * (unit -> unit)) list = [
         script "Class C\nPublic x\nSub M()\nEnd Sub\nEnd Class\nDim result, x\nx = 8\nFunction F()\nDim x\nx = 3\nF = x\nEnd Function\nresult = F() + x" "result" (VInteger 11))
     "C08 property assignment has no stack result", (fun () ->
         let result = run RunOptions.vbScript "Class C\nPrivate stored\nProperty Let P(v)\nstored = v\nEnd Property\nProperty Get P()\nP = stored\nEnd Property\nEnd Class\nDim o, i, result\nSet o = New C\nFor i = 1 To 70000\no.P = i\nNext\nresult = o.P"
-        if globalValue "result" result <> VInteger 70000 then failwith "Property result lost"
+        if globalValue "result" result <> VLong 70000 then failwith "Property result lost"
         if result.State.Sp <> 0 then failwithf "Property assignment leaked %d operands" result.State.Sp)
     "C09 Resume Next preserves failed assignment target", (fun () ->
         script "Dim result, nextValue\nresult = 7\nOn Error Resume Next\nresult = 1 / 0 : nextValue = 9" "result" (VInteger 7)
@@ -133,7 +135,7 @@ let private cases : (string * (unit -> unit)) list = [
     "C16 multidimensional cells remain independent", (fun () ->
         script "Dim a(1, 1), result\na(0, 0) = 10\na(0, 1) = 20\na(1, 0) = 30\nresult = a(0, 0) + a(0, 1) + a(1, 0)" "result" (VInteger 60))
     "C16 explicit lower bounds and dimension bounds", (fun () ->
-        checkGlobal RunOptions.vba "Dim a(1 To 2, -1 To 1), result\na(2, -1) = 42\nresult = a(2, -1) + LBound(a, 1) + UBound(a, 2)" "result" (VInteger 44))
+        checkGlobal RunOptions.vba "Dim a(1 To 2, -1 To 1), result\na(2, -1) = 42\nresult = a(2, -1) + LBound(a, 1) + UBound(a, 2)" "result" (VLong 44))
     "C16 multidimensional Preserve", (fun () ->
         checkGlobal RunOptions.vba "Dim a(), result\nReDim a(1 To 2, 1 To 2)\na(2, 2) = 42\nReDim Preserve a(1 To 2, 1 To 3)\nresult = a(2, 2)" "result" (VInteger 42))
     "C16 invalid indices and Preserve shape fail", (fun () ->
@@ -150,7 +152,7 @@ let private cases : (string * (unit -> unit)) list = [
     "C19 member and initializer casing", (fun () ->
         script "Class C\nPublic Value\nSub class_initialize()\nvalue = 7\nEnd Sub\nFunction ReadValue()\nReadValue = VALUE\nEnd Function\nEnd Class\nDim o, result\nSet o = New C\no.vAlUe = o.VALUE + 1\nresult = o.readvalue()" "result" (VInteger 8))
     "C20 Err.Raise transfers to label handler", (fun () ->
-        checkGlobal RunOptions.vba "Dim result\nOn Error GoTo Handler\nErr.Raise 5, , \"failure\"\nresult = 99\nGoTo Done\nHandler:\nresult = Err.Number\nDone:" "result" (VInteger 5))
+        checkGlobal RunOptions.vba "Dim result\nOn Error GoTo Handler\nErr.Raise 5, , \"failure\"\nresult = 99\nGoTo Done\nHandler:\nresult = Err.Number\nDone:" "result" (VLong 5))
     "C20 Err.Raise resumes and retains description", (fun () ->
         script "Dim result\nOn Error Resume Next\nErr.Raise 5, , \"failure\"\nresult = Err.Description" "result" (VString "failure"))
     "C20 Err.Raise without handler fails", (fun () -> runtimeError RunOptions.vbScript "Err.Raise 5")
@@ -185,7 +187,7 @@ let private cases : (string * (unit -> unit)) list = [
     "C21 Null condition does not enter branch", (fun () ->
         script "Dim result\nresult = 7\nIf Null Then result = 99" "result" (VInteger 7))
     "C10 active handler propagates to caller", (fun () ->
-        checkGlobal RunOptions.vba "Dim result\nSub Inner()\nOn Error GoTo LocalHandler\nErr.Raise 5\nExit Sub\nLocalHandler:\nErr.Raise 6\nEnd Sub\nOn Error GoTo OuterHandler\nCall Inner()\nresult = 99\nGoTo Done\nOuterHandler:\nresult = Err.Number\nDone:" "result" (VInteger 6))
+        checkGlobal RunOptions.vba "Dim result\nSub Inner()\nOn Error GoTo LocalHandler\nErr.Raise 5\nExit Sub\nLocalHandler:\nErr.Raise 6\nEnd Sub\nOn Error GoTo OuterHandler\nCall Inner()\nresult = 99\nGoTo Done\nOuterHandler:\nresult = Err.Number\nDone:" "result" (VLong 6))
     "C14 local iteration shadows global", (fun () ->
         script "Dim x, result\nx = 99\nFunction Sum()\nDim x, total\ntotal = 0\nFor Each x In Array(1, 2, 3)\ntotal = total + x\nNext\nSum = total\nEnd Function\nresult = Sum() + x" "result" (VInteger 105))
     "C15 inner Exit For preserves outer loop", (fun () ->

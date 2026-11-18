@@ -44,7 +44,7 @@ let private str (s: string) = VString s
 
 /// The Err.Number a statement raises.
 let private errNumber setup statement expected =
-    vba (sprintf "Dim result\n%s\nOn Error Resume Next\n%s\nresult = Err.Number" setup statement) "result" (VInteger expected)
+    vba (sprintf "Dim result\n%s\nOn Error Resume Next\n%s\nresult = Err.Number" setup statement) "result" (VLong expected)
 
 let private date y m d = VDate (DateCore.fromComponents y m d 0.0)
 
@@ -105,7 +105,7 @@ let private cases : (string * (unit -> unit)) list = [
             "#2024-01-31#", date 2024 1 31
             "#1/31/2024#", date 2024 1 31
             "TypeName(#1/31/2024#)", str "Date"
-            "VarType(#1/31/2024#)", VInteger 7
+            "VarType(#1/31/2024#)", VLong 7
             "CDbl(#1/31/2024#)", VDouble 45322.0
             "CDbl(#1/1/1900#)", VDouble 2.0
             "CStr(#1/31/2024 13:45#)", str "1/31/2024 1:45:00 PM"
@@ -166,16 +166,16 @@ let private cases : (string * (unit -> unit)) list = [
             "CStr(DateAdd(\"h\", 25, #1/1/2024#))", str "1/2/2024 1:00:00 AM"
             "CStr(DateAdd(\"n\", 90, #1/1/2024#))", str "1/1/2024 1:30:00 AM"
             "CStr(DateAdd(\"s\", 61, #1/1/2024#))", str "1/1/2024 12:01:01 AM"
-            "DateDiff(\"d\", #1/1/2024#, #3/1/2024#)", VInteger 60
-            "DateDiff(\"m\", #1/31/2024#, #2/1/2024#)", VInteger 1
-            "DateDiff(\"yyyy\", #12/31/2023#, #1/1/2024#)", VInteger 1
-            "DateDiff(\"q\", #3/31/2024#, #4/1/2024#)", VInteger 1
-            "DateDiff(\"h\", #1/1/2024 23:59#, #1/2/2024 0:01#)", VInteger 1
-            "DateDiff(\"n\", #1/1/2024 10:00#, #1/1/2024 11:30#)", VInteger 90
-            "DateDiff(\"s\", #1/1/2024#, #1/1/2024 0:01#)", VInteger 60
-            "DateDiff(\"ww\", #1/6/2024#, #1/7/2024#)", VInteger 1
-            "DateDiff(\"w\", #1/1/2024#, #1/15/2024#)", VInteger 2
-            "DateDiff(\"d\", #3/1/2024#, #1/1/2024#)", VInteger -60
+            "DateDiff(\"d\", #1/1/2024#, #3/1/2024#)", VLong 60
+            "DateDiff(\"m\", #1/31/2024#, #2/1/2024#)", VLong 1
+            "DateDiff(\"yyyy\", #12/31/2023#, #1/1/2024#)", VLong 1
+            "DateDiff(\"q\", #3/31/2024#, #4/1/2024#)", VLong 1
+            "DateDiff(\"h\", #1/1/2024 23:59#, #1/2/2024 0:01#)", VLong 1
+            "DateDiff(\"n\", #1/1/2024 10:00#, #1/1/2024 11:30#)", VLong 90
+            "DateDiff(\"s\", #1/1/2024#, #1/1/2024 0:01#)", VLong 60
+            "DateDiff(\"ww\", #1/6/2024#, #1/7/2024#)", VLong 1
+            "DateDiff(\"w\", #1/1/2024#, #1/15/2024#)", VLong 2
+            "DateDiff(\"d\", #3/1/2024#, #1/1/2024#)", VLong -60
             "DatePart(\"q\", #5/15/2024#)", VInteger 2
             "DatePart(\"y\", #2/1/2024#)", VInteger 32
             "DatePart(\"ww\", #1/1/2024#)", VInteger 1
@@ -216,13 +216,13 @@ let private cases : (string * (unit -> unit)) list = [
             "CStr(1E+15)", str "1E+15"
             "CStr(123456789012345)", str "123456789012345"
             "CStr(0.0001)", str "0.0001"
-            "CStr(0.00001)", str "1E-05"
+            "CStr(0.00001)", str "0.00001"
             "CStr(-0.5)", str "-0.5"
             "CStr(1.5E+300)", str "1.5E+300"
             "\"x\" & 0.1 + 0.2", str "x0.3"
             "CStr(100)", str "100" ]
         let lines = printed "Debug.Print 0.1 + 0.2; -1.5; 1E-05"
-        if lines <> [ " 0.3 -1.5  1E-05 " ] then fail "Debug.Print" [ " 0.3 -1.5  1E-05 " ] lines)
+        if lines <> [ " 0.3 -1.5  0.00001 " ] then fail "Debug.Print" [ " 0.3 -1.5  0.00001 " ] lines)
     "Format with numeric formats", (fun () ->
         exprs "" [
             "Format(1234.5, \"#,##0.00\")", str "1,234.50"
@@ -328,13 +328,13 @@ let private cases : (string * (unit -> unit)) list = [
         let setup = "Dim c As New Collection, s, x\nc.Add 1\nc.Add \"two\", \"k2\"\nc.Add 3, , 1\nc.Add 4, , , 1\nFor Each x In c\ns = s & x & \",\"\nNext"
         exprs setup [
             "s", str "3,4,1,two,"
-            "c.Count", VInteger 4
+            "c.Count", VLong 4
             "c(1)", VInteger 3
             "c(\"K2\")", str "two"
             "c.Item(3)", VInteger 1
             "TypeName(c)", str "Collection" ]
         exprs "Dim c As Collection\nSet c = New Collection\nc.Add Item:=5, Key:=\"five\"\nc.Add 6, \"six\"\nc.Remove \"five\"\nc.Add 7, Before:=\"six\"\nc.Remove 2" [
-            "c.Count", VInteger 1
+            "c.Count", VLong 1
             "c(1)", VInteger 7 ]
         errNumber "Dim c As New Collection" "c.Add 1, \"k\"\nc.Add 2, \"k\"" 457
         errNumber "Dim c As New Collection, x" "x = c(10)" 9
@@ -347,21 +347,21 @@ let private cases : (string * (unit -> unit)) list = [
         let setup = "Dim d, s, k\nSet d = CreateObject(\"Scripting.Dictionary\")\nd.Add \"a\", 1\nd(\"b\") = 2\nd.Item(\"c\") = 3\nd(\"a\") = 10\nFor Each k In d\ns = s & k & \"=\" & d(k) & \";\"\nNext"
         exprs setup [
             "s", str "a=10;b=2;c=3;"
-            "d.Count", VInteger 3
+            "d.Count", VLong 3
             "d.Exists(\"b\")", VBoolean true
             "d.Exists(\"B\")", VBoolean false
             "Join(d.Keys, \",\")", str "a,b,c"
             "Join(d.Items, \",\")", str "10,2,3"
             "TypeName(d)", str "Dictionary"
-            "UBound(d.Keys)", VInteger 2 ]
+            "UBound(d.Keys)", VLong 2 ]
         exprs "Dim d\nSet d = CreateObject(\"Scripting.Dictionary\")\nd.CompareMode = vbTextCompare\nd(\"Key\") = 1\nd(\"KEY\") = 2\nd.Add 1, \"one\"\nd.Key(\"key\") = \"renamed\"\nd.Remove 1#\nIf IsEmpty(d(\"missing\")) Then d.Remove \"missing\"" [
-            "d.Count", VInteger 1
+            "d.Count", VLong 1
             "d(\"RENAMED\")", VInteger 2
             "d.Exists(1)", VBoolean false ]
         exprs "Dim d As New Dictionary, e As Object, n\nd.Add 1, \"x\"\nn = d.Exists(1#)\nSet e = New Scripting.Dictionary\nSet e(\"self\") = d\nd.RemoveAll" [
             "n", VBoolean true
-            "d.Count", VInteger 0
-            "e(\"self\").Count", VInteger 0 ]
+            "d.Count", VLong 0
+            "e(\"self\").Count", VLong 0 ]
         errNumber "Dim d\nSet d = CreateObject(\"Scripting.Dictionary\")" "d.Add \"a\", 1\nd.Add \"a\", 2" 457
         errNumber "Dim d\nSet d = CreateObject(\"Scripting.Dictionary\")" "d.Remove \"nope\"" 32811
         errNumber "Dim d" "Set d = CreateObject(\"Other.Thing\")" 429)
@@ -380,20 +380,20 @@ let private cases : (string * (unit -> unit)) list = [
             "StrConv(\"abc\", vbUpperCase)", str "ABC"
             "StrConv(\"ABC\", vbLowerCase)", str "abc"
             "AscW(ChrW(8364))", VInteger 8364
-            "LenB(\"abc\")", VInteger 6
+            "LenB(\"abc\")", VLong 6
             "Join(Filter(Array(\"apple\", \"banana\", \"cherry\"), \"an\"), \",\")", str "banana"
             "Join(Filter(Array(\"apple\", \"banana\", \"cherry\"), \"AN\", False, vbTextCompare), \",\")", str "apple,cherry"
-            "InStrRev(\"abcabc\", \"bc\")", VInteger 5
-            "InStrRev(\"abcabc\", \"bc\", 4)", VInteger 2
-            "InStrRev(\"ABC\", \"b\", -1, vbTextCompare)", VInteger 2
-            "InStrRev(\"abc\", \"x\")", VInteger 0
-            "InStr(1, \"ABC\", \"b\", vbTextCompare)", VInteger 2
+            "InStrRev(\"abcabc\", \"bc\")", VLong 5
+            "InStrRev(\"abcabc\", \"bc\", 4)", VLong 2
+            "InStrRev(\"ABC\", \"b\", -1, vbTextCompare)", VLong 2
+            "InStrRev(\"abc\", \"x\")", VLong 0
+            "InStr(1, \"ABC\", \"b\", vbTextCompare)", VLong 2
             "Replace(\"aaaa\", \"a\", \"b\", 2)", str "bbb"
             "Replace(\"aaaa\", \"a\", \"b\", 1, 2)", str "bbaa"
             "Replace(\"AbA\", \"a\", \"x\", , , vbTextCompare)", str "xbx"
-            "UBound(Split(\"a,b,c,d\", \",\", 2))", VInteger 1
+            "UBound(Split(\"a,b,c,d\", \",\", 2))", VLong 1
             "Split(\"a,b,c,d\", \",\", 2)(1)", str "b,c,d"
-            "UBound(Split(\"aXbxc\", \"x\", -1, vbTextCompare))", VInteger 2
+            "UBound(Split(\"aXbxc\", \"x\", -1, vbTextCompare))", VLong 2
             "String(3, \"x\")", str "xxx"
             "String(2, 65)", str "AA"
             "Space(3)", str "   " ]
@@ -403,14 +403,14 @@ let private cases : (string * (unit -> unit)) list = [
         let result = run RunOptions.vba "Dim a, b, c, d, e\na = Rnd(-1)\nb = Rnd\nc = Rnd(0)\nd = Rnd(-1)\nRandomize 5\ne = Rnd"
         let near name (expected: float) =
             match globalOf name result with
-            | VDouble v when abs (v - expected) < 1e-7 -> ()
+            | VSingle v when abs (float v - expected) < 1e-7 -> ()
             | other -> fail name expected other
         near "a" 0.2240070104598999
         near "b" 0.035845816135406494
         near "c" 0.035845816135406494
         near "d" 0.2240070104598999
         match globalOf "e" result with
-        | VDouble v when v >= 0.0 && v < 1.0 -> ()
+        | VSingle v when v >= 0.0f && v < 1.0f -> ()
         | other -> fail "e" "0 <= Rnd < 1" other)
     "Hex and Oct", (fun () ->
         exprs "" [
@@ -424,16 +424,16 @@ let private cases : (string * (unit -> unit)) list = [
     "Error values and conversions", (fun () ->
         exprs "" [
             "TypeName(CVErr(2042))", str "Error"
-            "VarType(CVErr(2042))", VInteger 10
+            "VarType(CVErr(2042))", VLong 10
             "IsError(CVErr(5))", VBoolean true
             "IsError(5)", VBoolean false
             "CStr(CVErr(5))", str "Error 5"
             "CDec(1.5)", VDouble 1.5
             "CVar(5)", VInteger 5
-            "CSng(0.5)", VDouble 0.5
+            "CSng(0.5)", VSingle 0.5f
             "CLngLng(2 ^ 40)", VDouble 1099511627776.0
-            "TypeName(CLngLng(5))", str "Integer"
-            "VarType(Array(1))", VInteger 8204 ]
+            "TypeName(CLngLng(5))", str "Long"
+            "VarType(Array(1))", VLong 8204 ]
         errNumber "Dim x" "x = CByte(300)" 6)
     "Environ through the host", (fun () ->
         let options = RunOptions.vba |> RunOptions.withHooks { defaultHooks with Environ = fun name -> if name = "USERNAME" then "dave" else "" }
@@ -441,11 +441,11 @@ let private cases : (string * (unit -> unit)) list = [
         if globalOf "a" result <> VString "dave" || globalOf "b" result <> VString "" then fail "Environ" "dave/\"\"" (globalOf "a" result))
     "Erase for every array kind", (fun () ->
         exprs "Type Pt\n  X As Long\nEnd Type\nDim a(3) As Long, b(), s(2) As String, p(1) As Pt, v(2)\na(1) = 5\nReDim b(5)\ns(0) = \"x\"\np(0).X = 9\nv(1) = \"y\"\nErase a, b, s, p, v" [
-            "a(1)", VInteger 0
-            "UBound(a)", VInteger 3
+            "a(1)", VLong 0
+            "UBound(a)", VLong 3
             "IsArray(b)", VBoolean true
             "s(0)", str ""
-            "p(0).X", VInteger 0
+            "p(0).X", VLong 0
             "IsEmpty(v(1))", VBoolean true ]
         errNumber "Dim b()\nReDim b(2)\nErase b" "Dim n\nn = UBound(b)" 9
         exprs "Dim z()\nReDim Preserve z(1)\nz(1) = 4" [ "z(1)", VInteger 4; "IsArray(Array())", VBoolean true ])
@@ -499,7 +499,7 @@ let private cases : (string * (unit -> unit)) list = [
             "End Sub\n"
         let s = session (project [ ModuleSource.classModule "Source" source; ModuleSource.classModule "Watcher" watcher; ModuleSource.standard "Module1" main ])
         finished "Main" (s.Run("Main", []))
-        globalIs s "Total" (VInteger 10)
+        globalIs s "Total" (VLong 10)
         globalIs s "Result" (VString "cancelled 7;|110"))
     "Implements: calls through the interface", (fun () ->
         let shape = "Public Function Area() As Double\nEnd Function\nPublic Property Get Name() As String\nEnd Property\n"
@@ -550,7 +550,7 @@ let private cases : (string * (unit -> unit)) list = [
         globalIs s "B" (VInteger 6)
         globalIs s "C" (VString "v=5")
         globalIs s "D" (VString "two")
-        globalIs s "E" (VInteger 1))
+        globalIs s "E" (VLong 1))
     "Assignment through a host object's default member", (fun () ->
         let store = System.Collections.Generic.Dictionary<string, Value>()
         run (hostOptions store) "Dim r, o As Object\nSet r = Range(\"A1\")\nr = 5\nSet o = Range(\"B1\")\no = \"x\"\nr = r + 1" |> ignore
@@ -559,13 +559,13 @@ let private cases : (string * (unit -> unit)) list = [
     // ── 6. Statics, line numbers, Option Explicit, Stop, End ──
     "Static variables and Static procedures", (fun () ->
         exprs "Function Counter()\nStatic n As Long\nn = n + 1\nCounter = n\nEnd Function\nStatic Function Both()\nDim a, b(2)\na = a + 1\nb(1) = b(1) + 10\nBoth = a + b(1)\nEnd Function\nDim x, y\nx = Counter() + Counter()\nx = Counter()\ny = Both()\ny = Both()" [
-            "x", VInteger 3
+            "x", VLong 3
             "y", VInteger 22 ])
     "Numeric line labels and Erl", (fun () ->
         exprs "Dim r1, r2\nSub P()\n10 On Error GoTo H\n20 r2 = 1\n30 r2 = 1 / 0\n40 Exit Sub\nH:\nr1 = Erl\nResume 40\nEnd Sub\nP" [
-            "r1", VInteger 30
+            "r1", VLong 30
             "r2", VInteger 1
-            "Erl", VInteger 0 ]
+            "Erl", VLong 0 ]
         exprs "Dim n\nn = 0\n100 n = n + 1\nIf n < 3 Then GoTo 100" [ "n", VInteger 3 ])
     "Option Explicit is enforced when compiling", (fun () ->
         match runSource RunOptions.vba "Option Explicit\nDim x\nx = 1\ny = 2" with
@@ -575,15 +575,15 @@ let private cases : (string * (unit -> unit)) list = [
         | Error [ f ] when f.Kind = Compile && f.Line = 4 && f.Description.Contains "j" -> ()
         | other -> fail "project Option Explicit" "line 4" other
         // Declared names, ReDim, constants and host globals are fine.
-        vba "Option Explicit\nDim result\nConst K = 2\nSub A()\nReDim arr(2)\narr(1) = K\nresult = arr(1) + Len(vbCrLf)\nEnd Sub\nA" "result" (VInteger 4))
+        vba "Option Explicit\nDim result\nConst K = 2\nSub A()\nReDim arr(2)\narr(1) = K\nresult = arr(1) + Len(vbCrLf)\nEnd Sub\nA" "result" (VLong 4))
     "Stop pauses a session and is a no-op otherwise", (fun () ->
         let s = session (project [ ModuleSource.standard "Module1" "Public X As Long\nSub Main()\n    X = 1\n    Stop\n    X = 2\nEnd Sub\n" ])
         match s.Run("Main", []) with
         | Paused location when location.Line = 4 && location.Procedure = "Main" -> ()
         | other -> fail "Stop" "Paused at line 4" other
-        globalIs s "X" (VInteger 1)
+        globalIs s "X" (VLong 1)
         finished "resume" (s.RunToEnd())
-        globalIs s "X" (VInteger 2)
+        globalIs s "X" (VLong 2)
         vba "Dim x\nx = 1\nStop\nx = 2" "x" (VInteger 2))
     "End stops the run and resets module state", (fun () ->
         let options = ProjectOptions.vba |> ProjectOptions.withHostGlobals (Map.ofList [ "Limit", VInteger 10 ])
@@ -593,11 +593,11 @@ let private cases : (string * (unit -> unit)) list = [
             | Error e -> failwithf "%A" e
         let s = session p
         finished "Bump" (s.Run("Bump", []))
-        globalIs s "Counter" (VInteger 1)
+        globalIs s "Counter" (VLong 1)
         finished "Quit" (s.Run("Quit", []))
-        globalIs s "Counter" (VInteger 0)
+        globalIs s "Counter" (VLong 0)
         finished "Check" (s.Run("Check", []))
-        globalIs s "Seen" (VInteger 10)
+        globalIs s "Seen" (VLong 10)
         vba "Dim x\nx = 1\nEnd\nx = 2" "x" (VInteger 1))
 
     // ── 7. Currency ──
@@ -605,7 +605,7 @@ let private cases : (string * (unit -> unit)) list = [
         exprs "Dim c As Currency, total As Currency, i\nc = 0.1\nFor i = 1 To 10\ntotal = total + c\nNext" [
             "total = 1", VBoolean true
             "TypeName(total)", str "Currency"
-            "VarType(c)", VInteger 6
+            "VarType(c)", VLong 6
             "CCur(1.23456)", VCurrency 12346L
             "CStr(CCur(0.1) + CCur(0.2))", str "0.3"
             "CCur(2.5) * 2", VCurrency 50000L
@@ -623,11 +623,11 @@ let private cases : (string * (unit -> unit)) list = [
 
     "Common macro idioms", (fun () ->
         exprs "Dim arr() As String, d As Object, k, n, parts\narr = Split(\"a,b,c\", \",\")\nSet d = CreateObject(\"Scripting.Dictionary\")\nFor Each k In Split(\"a b a c a\")\nIf d.Exists(k) Then d(k) = d(k) + 1 Else d.Add k, 1\nNext\nWith d\nn = .Count\nEnd With\nFunction Parts() As String()\nParts = Split(\"x y\")\nEnd Function\nparts = Parts()" [
-            "UBound(arr)", VInteger 2
+            "UBound(arr)", VLong 2
             "arr(1)", str "b"
             "d(\"a\")", VInteger 3
-            "n", VInteger 3
-            "UBound(parts)", VInteger 1
+            "n", VLong 3
+            "UBound(parts)", VLong 1
             "d.Keys()(1)", str "b" ]
         let lines = printed "Dim c As New Collection\nc.Add 5\nWith c\nDebug.Print .Count; .Item(1)\nEnd With\nDebug.Print c _\n    .Count"
         if lines <> [ " 1  5 "; " 1 " ] then fail "With member after Debug.Print" [ " 1  5 "; " 1 " ] lines
@@ -653,7 +653,7 @@ let private cases : (string * (unit -> unit)) list = [
             "IsNull(Len(Null))", VBoolean true
             "Trim(vbTab & \" a \")", str (string '\t' + " a")
             "TypeName(Array())", str "Variant()"
-            "UBound(Array())", VInteger -1 ]
+            "UBound(Array())", VLong -1 ]
         errNumber "Dim x" "x = Sqr(-1)" 5
         errNumber "Dim x" "x = Log(0)" 5
         errNumber "Dim x" "x = Left(\"abc\", -1)" 5
