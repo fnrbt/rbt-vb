@@ -103,7 +103,7 @@ type VbCollection() =
                     | "key" -> 1
                     | "before" -> 2
                     | "after" -> 3
-                    | other -> raiseVbErrorWith 448 ("Named argument not found: " + other)
+                    | other -> raiseVbErrorAbout 448 other
                 if slot > 3 then raiseVbError 450
                 slots.[slot] <- value)
             this.CallMethod "Add" slots
@@ -275,7 +275,7 @@ type VbDictionary() =
                     | "" -> i
                     | "key" -> 0
                     | "item" -> 1
-                    | other -> raiseVbErrorWith 448 ("Named argument not found: " + other)
+                    | other -> raiseVbErrorAbout 448 other
                 if slot > 1 then raiseVbError 450
                 slots.[slot] <- value)
             this.CallMethod "Add" slots

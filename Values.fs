@@ -121,12 +121,18 @@ type HostDispatch() =
     abstract GetById: id: int -> Value option
     abstract SetById: id: int -> value: Value -> bool
     abstract CallById: id: int -> args: Value array -> Value option
+    /// Whether a member is a method rather than a property (CallByName ... VbMethod calls only methods).
+    abstract IsMethod: id: int -> bool
+    default _.IsMethod _ = true
 
 /// A VB run-time error: Err.Number, Err.Description and Err.Source.
 type VbErrorInfo = {
     Number: int
     Description: string
     Source: string
+    /// What the error was about, for a report (not for Err): the member of an object that does not have it
+    /// ("Range.Nope"), a named argument. "" when there is nothing to add.
+    Detail: string
 }
 
 exception VbError of VbErrorInfo
@@ -176,10 +182,15 @@ let errorDescription number =
 
 /// Raise a VB run-time error with a custom description.
 let raiseVbErrorWith number (description: string) : 'a =
-    raise (VbError { Number = number; Description = description; Source = "" })
+    raise (VbError { Number = number; Description = description; Source = ""; Detail = "" })
 
 /// Raise a VB run-time error with its standard description.
 let raiseVbError number : 'a = raiseVbErrorWith number (errorDescription number)
+
+/// A run-time error with VB's own description of its number (as Err.Description shows it) and what it was
+/// about for a report: `raiseVbErrorAbout 438 "Range.Nope"`.
+let raiseVbErrorAbout number (detail: string) : 'a =
+    raise (VbError { Number = number; Description = errorDescription number; Source = ""; Detail = detail })
 
 /// Callbacks the engine uses for user interaction and object creation.
 type RuntimeHooks = {

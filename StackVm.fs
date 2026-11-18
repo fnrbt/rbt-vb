@@ -24,6 +24,8 @@ type RuntimeFailure = {
     Procedure: string
     /// Module name ("" for a single-source program).
     Module: string
+    /// What the error was about (VbErrorInfo.Detail).
+    Detail: string
 }
 
 let formatFailure (failure: RuntimeFailure) =
@@ -238,7 +240,7 @@ type ErrObject(state: VmState) =
                     | Some d -> d
                     | None when number = state.LastErrorNumber && state.LastErrorDescription <> "" -> state.LastErrorDescription
                     | None -> errorDescription number
-                raise (VbError { Number = number; Description = description; Source = defaultArg (text 1) "" })
+                raise (VbError { Number = number; Description = description; Source = defaultArg (text 1) ""; Detail = "" })
             | "" | "number" when args.Length = 0 -> Some (VLong state.LastErrorNumber)
             | _ -> None
         member this.CallNamed name args _ = (this :> IHostObject).CallMethod name args
@@ -460,8 +462,9 @@ let private hostCall (hostObj: IHostObject) (name: string) (args: Value array) =
         | Some value when args.Length = 0 -> value
         | Some (VArray a) -> a.Data.[indexArray a args]
         | Some (VHostObject inner) -> hostDefaultCall inner args
-        | Some _ -> raiseVbError 13
-        | None -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
+        // (A property that is not a collection, given arguments: VB's "wrong number of arguments".)
+        | Some _ -> raiseVbErrorAbout 450 name
+        | None -> raiseVbErrorAbout 438 name
 
 let private defaultCall (value: Value) (args: Value array) =
     match value with
@@ -628,7 +631,7 @@ let rec private callMethod (state: VmState) (name: string) (argCount: int) =
                 | _ ->
                     push state (if argCount = 0 then field else defaultCall field args)
                     state.Pc <- state.Pc + 1
-            | false, _ -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
+            | false, _ -> raiseVbErrorAbout 438 name
     | VHostObject hostObj ->
         let args = Array.zeroCreate argCount
         for i in argCount - 1 .. -1 .. 0 do
@@ -662,7 +665,7 @@ let private setMember (state: VmState) (obj: Value) (name: string) (value: Value
                 let frame = enterFunction state funcIdx obj (state.Pc + 1)
                 frame.Locals.[1] <- value
                 frame.DiscardResult <- true
-            | None -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
+            | None -> raiseVbErrorAbout 438 name
     | VHostObject hostObj ->
         let value = ValueSemantics.dereference value
         let byNumber =
@@ -673,7 +676,7 @@ let private setMember (state: VmState) (obj: Value) (name: string) (value: Value
                 | id -> d.SetById id value
             | _ -> false
         if not byNumber && not (hostObj.SetMember name value) then
-            raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
+            raiseVbErrorAbout 438 name
         state.Pc <- state.Pc + 1
     | other -> objectError other
 
@@ -688,7 +691,7 @@ let private setMemberIndexed (state: VmState) (obj: Value) (name: string) (args:
         | None ->
             match vbObj.Fields.TryGetValue key with
             | true, field -> indexedAssign state field (Array.map ValueSemantics.dereference args) value
-            | _ -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
+            | _ -> raiseVbErrorAbout 438 name
     | VHostObject hostObj ->
         hostIndexedAssign hostObj name (hostArgs args) value
         state.Pc <- state.Pc + 1
@@ -945,7 +948,7 @@ let private executeCold (state: VmState) (instr: Instruction) =
                         else
                             match funcDef.ParamNames |> Array.tryFindIndex (fun p -> equalsIgnoreCase p names.[i]) with
                             | Some p -> p
-                            | None -> raiseVbErrorWith 448 ("Named argument not found: " + names.[i])
+                            | None -> raiseVbErrorAbout 448 names.[i]
                     if position >= slots.Length then raiseVbError 450
                     slots.[position] <-
                         match args.[i] with
@@ -954,11 +957,11 @@ let private executeCold (state: VmState) (instr: Instruction) =
                         | value -> value
                 let frame = enterFunction state funcIdx receiver (state.Pc + 1)
                 for i in 0 .. slots.Length - 1 do frame.Locals.[i + 1] <- slots.[i]
-            | None -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
+            | None -> raiseVbErrorAbout 438 name
         | VHostObject hostObj ->
             match hostObj.CallNamed name (hostArgs args) names with
             | Some value -> push state value
-            | None -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
+            | None -> raiseVbErrorAbout 438 name
             state.Pc <- state.Pc + 1
         | other -> objectError other
 
@@ -1053,7 +1056,7 @@ let private executeCold (state: VmState) (instr: Instruction) =
         let num = valueToInt (pop state)
         let text value = match value with VUndefined | VEmpty -> "" | v -> valueToString v
         let description = match text desc with "" -> errorDescription num | d -> d
-        raise (VbError { Number = num; Description = description; Source = text source })
+        raise (VbError { Number = num; Description = description; Source = text source; Detail = "" })
 
     | LineLabel number ->
         state.CallStack.[state.Csp - 1].LineLabel <- number
@@ -1151,6 +1154,16 @@ let private executeCold (state: VmState) (instr: Instruction) =
         let target = ValueSemantics.dereference (pop state)
         match callType with
         | 1 | 2 ->
+            // (VbMethod calls a method only: a property of a host object called so is error 438, as VB's.)
+            match callType, target with
+            | 1, VHostObject host ->
+                match box host with
+                | :? HostDispatch as d ->
+                    match d.Resolve name with
+                    | -1 -> ()
+                    | id -> if not (d.IsMethod id) then raiseVbErrorAbout 438 name
+                | _ -> ()
+            | _ -> ()
             push state target
             for arg in args do push state arg
             callMethod state name argCount
@@ -1387,7 +1400,7 @@ let executeOneInstruction (state: VmState) =
                     match Map.tryFind key classDef.Methods with
                     | Some funcIdx when state.Program.Functions.[funcIdx].ParamsCount = 0 ->
                         ignore (enterFunction state funcIdx obj (state.Pc + 1))
-                    | _ -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
+                    | _ -> raiseVbErrorAbout 438 name
         | VHostObject hostObj ->
             let byNumber =
                 match box hostObj with
@@ -1405,7 +1418,7 @@ let executeOneInstruction (state: VmState) =
                     | None ->
                         match hostObj.CallMethod name [||] with
                         | Some value -> value
-                        | None -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
+                        | None -> raiseVbErrorAbout 438 name
             push state value
             state.Pc <- state.Pc + 1
         | other -> objectError other
@@ -1610,8 +1623,8 @@ let currentLocation (state: VmState) =
 let private errorInfo (state: VmState) (ex: exn) =
     match ex with
     | VbError info -> info
-    | :? VbRuntimeException as e -> { Number = e.Failure.Number; Description = e.Failure.Description; Source = e.Failure.Source }
-    | _ -> { Number = 440; Description = ex.Message; Source = "" }
+    | :? VbRuntimeException as e -> { Number = e.Failure.Number; Description = e.Failure.Description; Source = e.Failure.Source; Detail = e.Failure.Detail }
+    | _ -> { Number = 440; Description = ex.Message; Source = ""; Detail = "" }
 
 /// Record an error and transfer control to the active handler, or raise
 /// `VbRuntimeException` when no handler down to `BaseCsp` takes it.
@@ -1645,12 +1658,12 @@ let dispatchError (state: VmState) (ex: exn) =
         | _ ->
             raise (VbRuntimeException {
                 Number = info.Number; Description = info.Description; Source = source
-                Line = line; Procedure = procedure; Module = moduleName })
+                Line = line; Procedure = procedure; Module = moduleName; Detail = info.Detail })
 
 let cancelledFailure (state: VmState) =
     let line, procedure, moduleName = currentLocation state
     { Number = 18; Description = errorDescription 18; Source = state.ProjectName
-      Line = line; Procedure = procedure; Module = moduleName }
+      Line = line; Procedure = procedure; Module = moduleName; Detail = "" }
 
 /// Run a VB procedure to its end from inside an instruction (a default
 /// member read during arithmetic, a Class_Terminate) and return its value.
@@ -1690,7 +1703,7 @@ let callNested (state: VmState) (funcIdx: int) (receiver: Value option) (args: V
         with
         | :? VbRuntimeException as e ->
             unwind ()
-            raise (VbError { Number = e.Failure.Number; Description = e.Failure.Description; Source = e.Failure.Source })
+            raise (VbError { Number = e.Failure.Number; Description = e.Failure.Description; Source = e.Failure.Source; Detail = e.Failure.Detail })
     finally
         state.NestedDepth <- state.NestedDepth - 1
         state.BaseCsp <- savedBase

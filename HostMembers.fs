@@ -62,7 +62,7 @@ let alias (name: string) (target: Member<'T>) : Member<'T> = { target with Name 
 let arg (args: Value array) (index: int) = if index < args.Length then args.[index] else VUndefined
 
 let private notSupported (typeName: string) (name: string) : 'a =
-    raiseVbErrorWith 438 (sprintf "Object doesn't support this property or method (%s.%s)" typeName name)
+    raiseVbErrorAbout 438 (typeName + "." + name)
 
 /// What a type does with names that are not in its table: read (args None) or called (Some args), or
 /// written. None: not a member (error 438).
@@ -136,11 +136,32 @@ and TableObject<'T>(table: Table<'T>, state: 'T) =
         match table.Member id with
         | { Set = Some write } -> write state value; true
         | _ -> false
-    override _.CallById id args =
+    override this.CallById id args =
         match table.Member id with
-        | { Call = Some run } -> Some (run state args)
+        | { Call = Some run } as m -> this.CheckArguments m args; Some (run state args)
         | { Get = Some read } when args.Length = 0 -> Some (read state)
         | _ -> None
+    override _.IsMethod id = (table.Member id).Get.IsNone
+
+    /// More arguments than a method has parameters: error 450, as VB's (when the table names them all).
+    member private _.CheckArguments (m: Member<'T>) (args: Value array) =
+        if not m.Parameters.IsEmpty && args.Length > m.Parameters.Length then
+            raiseVbErrorAbout 450 (table.TypeNameOf state + "." + m.Name)
+
+    /// A member written that cannot be: `Set` of an object is a type mismatch (13); a value written to a
+    /// property that reads as an object goes to that object's default member (`ws.UsedRange = 1` fills the
+    /// used range); otherwise error 450 ("invalid property assignment").
+    member private _.WriteReadOnly (m: Member<'T>) (value: Value) =
+        let about = table.TypeNameOf state + "." + m.Name
+        match value with
+        | VHostObject _ | VObject _ | VNothing -> raiseVbErrorAbout 13 about
+        | _ ->
+            match m.Get with
+            | Some read ->
+                match read state with
+                | VHostObject inner when inner.SetMember "" value -> true
+                | _ -> raiseVbErrorAbout 450 about
+            | None -> raiseVbErrorAbout 450 about
 
     interface IHostObject with
         member _.TypeName = table.TypeNameOf state
@@ -151,13 +172,13 @@ and TableObject<'T>(table: Table<'T>, state: 'T) =
         member this.SetMember name value =
             match table.Resolve name with
             | -1 -> this.SetOther name value
-            | id -> if this.SetById id value then true else this.SetOther name value
+            | id -> if this.SetById id value then true else this.WriteReadOnly (table.Member id) value
         member this.CallMethod name args =
             match table.Resolve name with
             | -1 -> this.CallOther name args
             | id ->
                 match table.Member id with
-                | { Call = Some run } -> Some (run state args)
+                | { Call = Some run } as m -> this.CheckArguments m args; Some (run state args)
                 | { Get = Some read } when args.Length = 0 -> Some (read state)
                 // (A property given arguments: the engine applies them to what it reads.)
                 | { Get = Some _ } -> None
@@ -180,7 +201,7 @@ and TableObject<'T>(table: Table<'T>, state: 'T) =
                         else
                             match parameters |> List.tryFindIndex ((=) (argName.ToLowerInvariant())) with
                             | Some position -> put position value
-                            | None -> raiseVbErrorWith 448 ("Named argument not found: " + argName))
+                            | None -> raiseVbErrorAbout 448 argName)
                     self.CallMethod name (slots.ToArray())
                 | _ -> self.CallMethod name args
         member _.Enumerate () = table.Items |> Option.map (fun items -> items state)

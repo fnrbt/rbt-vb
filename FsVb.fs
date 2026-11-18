@@ -110,7 +110,7 @@ let executeWith (hooks: RuntimeHooks) (instructionLimit: int option) (globals: s
         if not finished then
             raise (StackVm.VbRuntimeException {
                 Number = 17; Description = "Instruction limit exceeded"; Source = state.ProjectName
-                Line = (let line, _, _ = StackVm.currentLocation state in line); Procedure = ""; Module = "" })
+                Line = (let line, _, _ = StackVm.currentLocation state in line); Procedure = ""; Module = ""; Detail = "" })
         if not state.EndRequested then StackVm.finalizeObjects state
         Builtins.flushPendingPrint state.Hooks
     state
@@ -240,6 +240,9 @@ type VbFailure = {
     /// Procedure name without the module ("" for module-level code).
     Procedure: string
     Module: string
+    /// What the error was about, for a report: the member an object does not have ("Range.Nope"), a named
+    /// argument. Not part of Description, which is Err.Description as VB gives it. "" when nothing.
+    Detail: string
 }
 
 module VbFailure =
@@ -257,11 +260,13 @@ module VbFailure =
         match failure.Kind with
         | Syntax -> "Syntax error: " + failure.Description + where
         | Compile -> "Compile error: " + failure.Description + where
-        | Runtime -> sprintf "Run-time error '%d': %s%s" failure.Number failure.Description where
+        | Runtime ->
+            let about = if failure.Detail = "" then "" else " [" + failure.Detail + "]"
+            sprintf "Run-time error '%d': %s%s%s" failure.Number failure.Description about where
 
     let ofRuntime (f: StackVm.RuntimeFailure) =
         { Kind = Runtime; Number = f.Number; Description = f.Description; Source = f.Source
-          Line = f.Line; Column = 0; Procedure = f.Procedure; Module = f.Module }
+          Line = f.Line; Column = 0; Procedure = f.Procedure; Module = f.Module; Detail = f.Detail }
 
 type ModuleKind =
     | Standard
@@ -522,21 +527,21 @@ module private ProjectInternals =
         let header = ModuleSource.parseHeader m.Source
         match ParserSimple.parseDetailed options.Dialect header.Body with
         | Error (message, line, column) ->
-            Error { Kind = Syntax; Number = 0; Description = message; Source = options.ProjectName
+            Error { Detail = ""; Kind = Syntax; Number = 0; Description = message; Source = options.ProjectName
                     Line = line; Column = column; Procedure = ""; Module = m.Name }
         | Ok program ->
             let errors = if options.Validate then Validator.validate program else []
             match errors, (if options.Dialect = VBA then declarationAfterProcedure header.Body program else None) with
             | _, Some line ->
-                Error { Kind = Compile; Number = 0; Description = "Only comments may appear after End Sub, End Function, or End Property"
+                Error { Detail = ""; Kind = Compile; Number = 0; Description = "Only comments may appear after End Sub, End Function, or End Property"
                         Source = options.ProjectName; Line = line; Column = 0; Procedure = ""; Module = m.Name }
             | [], None -> Ok program
             | first :: _, None ->
-                Error { Kind = Compile; Number = 0; Description = first.Message; Source = options.ProjectName
+                Error { Detail = ""; Kind = Compile; Number = 0; Description = first.Message; Source = options.ProjectName
                         Line = 0; Column = 0; Procedure = ""; Module = m.Name }
 
     let compileFailure (options: ProjectOptions) message line moduleName =
-        { Kind = Compile; Number = 0; Description = message; Source = options.ProjectName
+        { Detail = ""; Kind = Compile; Number = 0; Description = message; Source = options.ProjectName
           Line = line; Column = 0; Procedure = ""; Module = moduleName }
 
     /// `Attribute Value.VB_UserMemId = 0` makes Value a class's default member.
@@ -613,7 +618,7 @@ type Session private (project: Project, ctx: Compiler.CompileContext, state: Sta
         running <- false
 
     let busy () =
-        { Kind = Runtime; Number = 17; Description = "Can't perform requested operation: the session is already running"
+        { Detail = ""; Kind = Runtime; Number = 17; Description = "Can't perform requested operation: the session is already running"
           Source = project.Options.ProjectName; Line = 0; Column = 0; Procedure = ""; Module = "" }
 
     /// `End`: module-level variables return to their initial values (the
@@ -723,7 +728,7 @@ type Session private (project: Project, ctx: Compiler.CompileContext, state: Sta
                 | ex ->
                     let line, procedure, moduleName = StackVm.currentLocation state
                     reset ()
-                    Failed { Kind = Runtime; Number = 51; Description = ex.Message; Source = project.Options.ProjectName
+                    Failed { Detail = ""; Kind = Runtime; Number = 51; Description = ex.Message; Source = project.Options.ProjectName
                              Line = line; Column = 0; Procedure = procedure; Module = moduleName }
             status <- result
             result
@@ -748,7 +753,7 @@ type Session private (project: Project, ctx: Compiler.CompileContext, state: Sta
     /// Optional arguments take their defaults (or Missing).
     member _.Call(name: string, args: Value list) : Result<unit, VbFailure> =
         let notFound () =
-            Error { Kind = Runtime; Number = 35; Description = errorDescription 35 + ": " + name
+            Error { Detail = ""; Kind = Runtime; Number = 35; Description = errorDescription 35 + ": " + name
                     Source = project.Options.ProjectName; Line = 0; Column = 0; Procedure = ""; Module = "" }
         let info = Project.tryFindProcedure name project
         let key = name.ToLowerInvariant()
@@ -769,7 +774,7 @@ type Session private (project: Project, ctx: Compiler.CompileContext, state: Sta
             let parameters = info |> Option.map (fun p -> p.Parameters) |> Option.defaultValue []
             let args = List.toArray args
             if args.Length > funcDef.ParamsCount then
-                Error { Kind = Runtime; Number = 450; Description = errorDescription 450; Source = project.Options.ProjectName
+                Error { Detail = ""; Kind = Runtime; Number = 450; Description = errorDescription 450; Source = project.Options.ProjectName
                         Line = 0; Column = 0; Procedure = name; Module = funcDef.Module }
             else
                 startExecution (fun () ->
@@ -810,7 +815,7 @@ type Session private (project: Project, ctx: Compiler.CompileContext, state: Sta
     member this.Evaluate(expression: string, ?moduleName: string) : Result<unit, VbFailure> =
         match ParserSimple.parseExpression expression with
         | Error (message, line, column) ->
-            Error { Kind = Syntax; Number = 0; Description = message; Source = project.Options.ProjectName
+            Error { Detail = ""; Kind = Syntax; Number = 0; Description = message; Source = project.Options.ProjectName
                     Line = line; Column = column; Procedure = ""; Module = "" }
         | Ok expr -> this.BeginSnippet(defaultArg moduleName "", Choice1Of2 expr)
 
@@ -819,12 +824,12 @@ type Session private (project: Project, ctx: Compiler.CompileContext, state: Sta
     member this.Execute(statements: string, ?moduleName: string) : Result<unit, VbFailure> =
         match ParserSimple.parseDetailed project.Options.Dialect statements with
         | Error (message, line, column) ->
-            Error { Kind = Syntax; Number = 0; Description = message; Source = project.Options.ProjectName
+            Error { Detail = ""; Kind = Syntax; Number = 0; Description = message; Source = project.Options.ProjectName
                     Line = line; Column = column; Procedure = ""; Module = "" }
         | Ok program ->
             let stmts = program.TopLevels |> List.choose (function TopLevelStatement s -> Some s | _ -> None)
             if stmts.Length <> program.TopLevels.Length then
-                Error { Kind = Compile; Number = 0; Description = "Invalid in Immediate pane"; Source = project.Options.ProjectName
+                Error { Detail = ""; Kind = Compile; Number = 0; Description = "Invalid in Immediate pane"; Source = project.Options.ProjectName
                         Line = 0; Column = 0; Procedure = ""; Module = "" }
             else this.BeginSnippet(defaultArg moduleName "", Choice2Of2 stmts)
 

@@ -1,6 +1,7 @@
 module Rbt.Vb.Tests.Release060Cases
 
-// 0.6.0: HostMembers - an object model as tables of members. Shared by .NET and Fable.
+// 0.6.0-0.7.0: HostMembers - an object model as tables of members, members by number, VB's errors for
+// late-bound calls. Shared by .NET and Fable.
 
 open Rbt.Vb
 open Rbt.Vb.Api
@@ -89,11 +90,46 @@ let private groups : (string * (unit -> unit)) list = [
         let out = printed b "Sub Main()\n    b.LEFT = 5\n    b.move 2\n    B.Move Times:=3, Dx:=1\n    Debug.Print b.Left; b.Count; b.Item(2); b(1)\n    b.Caption = \"hi\"\n    Debug.Print b; b.Self.Text\n    b.Locked = True\n    Dim s\n    For Each s In b: Debug.Print s;: Next\n    Debug.Print\n    b.Clear\n    Debug.Print b.Count\nEnd Sub\n"
         if out <> [ " 10  2 yx"; "hihi"; "xy"; ""; " 0 " ] && out <> [ " 10  2 yx"; "hihi"; "xy"; " 0 " ] then fail "box" "..." out)
 
-    "an unknown member is error 438 naming the type and member", (fun () ->
+    "an unknown member: error 438 with VB's text in Err, the member in the failure's Detail", (fun () ->
         let b = { Left = 1.0; Text = "a"; Items = ResizeArray() }
         let out = printed b "Sub Main()\n    On Error Resume Next\n    b.Nope = 1\n    Debug.Print Err.Number; Err.Description\n    Err.Clear\n    x = b.Nope2\n    Debug.Print Err.Description\nEnd Sub\n"
-        let expected = [ " 438 Object doesn't support this property or method (Box.Nope)"; "Object doesn't support this property or method (Box.Nope2)" ]
-        if out <> expected then fail "438" expected out)
+        let expected = [ " 438 Object doesn't support this property or method"; "Object doesn't support this property or method" ]
+        if out <> expected then fail "438" expected out
+        let options = ProjectOptions.vba |> ProjectOptions.withHostGlobals (Map.ofList [ "B", boxType.Wrap b ])
+        match Project.compile options [ ModuleSource.standard "M" "Sub Main()\n    x = b.Nope\nEnd Sub\n" ] with
+        | Error e -> failwithf "%A" e
+        | Ok p ->
+            match Session.Create p with
+            | Error f -> failwithf "%A" f
+            | Ok s ->
+                match s.Run("Main", [], 1000) with
+                | Failed f when f.Number = 438 && f.Detail = "Box.Nope" && f.Description = "Object doesn't support this property or method" ->
+                    let text = VbFailure.format f
+                    if not (text.Contains "[Box.Nope]") then fail "format" "[Box.Nope]" text
+                | other -> fail "unhandled 438" "Failed with Detail Box.Nope" other)
+
+    // As Excel 2019 answers late-bound calls (tests/vba-parity/cases/dispatch.bas in rbt-office).
+    "read-only properties, argument counts and CallByName as VB's", (fun () ->
+        let b = { Left = 1.0; Text = "a"; Items = ResizeArray [ "x" ] }
+        let code =
+            [ "Sub Main()"
+              "    On Error Resume Next"
+              "    Dim n"
+              "    b.Count = 5: n = Err.Number: Err.Clear: Debug.Print \"read-only\"; n"
+              "    Set b.Count = b: n = Err.Number: Err.Clear: Debug.Print \"set read-only\"; n"
+              "    b.Self = \"via default\": n = Err.Number: Err.Clear: Debug.Print \"read-only object\"; n; b.Text"
+              "    b.Move 1, 2, 3: n = Err.Number: Err.Clear: Debug.Print \"too many\"; n"
+              "    x = b.Left(1): n = Err.Number: Err.Clear: Debug.Print \"property with arguments\"; n"
+              "    x = CallByName(b, \"Left\", VbMethod): n = Err.Number: Err.Clear: Debug.Print \"property as method\"; n"
+              "    x = CallByName(b, \"Left\", VbGet): n = Err.Number: Err.Clear: Debug.Print \"property got\"; n"
+              "    CallByName b, \"Clear\", VbMethod: n = Err.Number: Err.Clear: Debug.Print \"method\"; n; b.Count"
+              "    CallByName b, \"Count\", VbLet, 3: n = Err.Number: Err.Clear: Debug.Print \"let read-only\"; n"
+              "End Sub" ] |> String.concat "\n"
+        let out = printed b code
+        let expected =
+            [ "read-only 450 "; "set read-only 13 "; "read-only object 0 via default"; "too many 450 "
+              "property with arguments 450 "; "property as method 438 "; "property got 0 "; "method 0  0 "; "let read-only 450 " ]
+        if out <> expected then fail "dispatch rules" expected out)
 
     "one place in the code with objects of two types: each finds its own member", (fun () ->
         let b = { Left = 1.0; Text = "box"; Items = ResizeArray() }

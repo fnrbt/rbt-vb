@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.0 — 2026-11-18
+
+Late-bound calls on host objects raise what VB raises, as Microsoft Excel 2019 answers them (a case of rbt-office's VBA parity run). `VbErrorInfo`, `RuntimeFailure` and `VbFailure` have a new field, so this is 0.7.0.
+
+- **Err.Description is VB's text.** Error 438 is "Object doesn't support this property or method" and 448 "Named argument not found", with nothing added. What the error was about (the type and member, "Range.Nope"; the argument's name) is in the new `Detail` field of `VbErrorInfo`, `RuntimeFailure` and `VbFailure`, and `VbFailure.format` shows it: `Run-time error '438': Object doesn't support this property or method [Range.Nope] (Module1.Main, line 3)`. `raiseVbErrorAbout number detail` raises an error with VB's description and a detail.
+- **Read-only properties** (`HostMembers` members without a setter): written, error 450 "Wrong number of arguments or invalid property assignment"; `Set` of an object, error 13. A value written to a read-only property that reads as an object goes to that object's default member (`ws.UsedRange = 1` fills the used range, as Excel's).
+- **Argument counts**: a method given more arguments than its table names parameters is error 450; a property that is not a collection given arguments is 450 (it was 13).
+- **CallByName ... VbMethod** calls methods only: a property of a `HostDispatch` object called so is error 438. `HostDispatch.IsMethod` says which members are methods (true unless a host says otherwise).
+
 ## 0.6.1 — 2026-11-18
 
 ### Members of host objects by number
