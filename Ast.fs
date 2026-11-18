@@ -18,6 +18,8 @@ type TokenKind =
     | Eq
     | Newline
     | DateLiteral
+    /// `[A1:B2]`: Excel's bracket evaluation (the text between the brackets).
+    | BracketText
     | EOF
 
 type Token = {
@@ -137,7 +139,8 @@ type Statement =
     | LabelStmt of string
     | Declaration of Visibility option * Declaration
     | Assignment of string * Expression
-    | IndexedAssignment of string * Expression list * Expression
+    /// `a(i) = v`, or `Set a(i) = obj` (isSet).
+    | IndexedAssignment of string * Expression list * Expression * bool
     | MemberAssignment of Expression * string * Expression * bool // isSet
     | OnError of OnErrorAction
     | WithStmt of Expression * Statement list
@@ -150,6 +153,9 @@ type Statement =
     | StopStmt
     /// `End`: stop the program and reset module state.
     | EndStmt
+    /// Several statements from one line (`Const A = 1, B = 2`); the parser
+    /// flattens groups before returning a Program.
+    | StatementGroup of Statement list
 
 and ResumeTarget =
     | ResumeRetry

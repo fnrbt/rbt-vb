@@ -142,7 +142,7 @@ let validateVBScript (program: Program) : ValidationError list =
                     checkExpression dc.Condition
                     for s in dc.Body do checkStatement s
                 | None -> ()
-        | IndexedAssignment (_, indices, value) ->
+        | IndexedAssignment (_, indices, value, _) ->
             for index in indices do checkExpression index
             checkExpression value
         | MemberAssignment (receiver, _, value, _) ->

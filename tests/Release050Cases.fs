@@ -198,6 +198,82 @@ let private groups : (string * (unit -> unit)) list = [
                          "Function Cleared()\n    Dim a, r\n    On Error Resume Next\n10  a = 1 / 0\n    r = Erl\n    Err.Clear\n    Cleared = r & \",\" & Erl\nEnd Function\n" +
                          "Sub Main()\n    Debug.Print Lines(); Last(); Caller(); Cleared()\nEnd Sub\n") ] "Main"
         if lines <> [ " 10  20  10 10,10" ] then fail "Erl" [ " 10  20  10 10,10" ] lines)
+    "Resume retries the statement after Then in a single-line If", (fun () ->
+        let lines =
+            printed [ ModuleSource.standard "M"
+                        ("Function Retried()\n    Dim tries\n    On Error GoTo h\n    If tries < 3 Then Err.Raise 5\n    Retried = \"tries:\" & tries\n    Exit Function\n" +
+                         "h:\n    tries = tries + 1\n    If tries < 5 Then Resume\n    Retried = \"looped \" & tries\nEnd Function\nSub Main()\n    Debug.Print Retried()\nEnd Sub\n") ] "Main"
+        if lines <> [ "looped 5" ] then fail "Resume" [ "looped 5" ] lines)
+
+    "A declaration after the first procedure is a compile error", (fun () ->
+        let f = compileFailure [ ModuleSource.standard "M" "Sub Main()\nEnd Sub\nPrivate afterwards As Long\n" ]
+        if f.Line <> 3 || not (f.Description.Contains "Only comments") then fail "declaration after procedure" "line 3" f
+        let f = compileFailure [ ModuleSource.standard "M" "Sub Main()\nEnd Sub\nEnum E\n  A\nEnd Enum\n" ]
+        if f.Line <> 3 then fail "Enum after procedure" "line 3" f)
+
+    "Statements from real macros parse", (fun () ->
+        let lines =
+            printed [ ModuleSource.standard "M"
+                        ("Sub color()\n    Dim color\n    color = Array(10, 20)\n    Debug.Print color(1)\nEnd Sub\n" +
+                         "Sub Show(a)\n    Debug.Print UBound(a)\nEnd Sub\n" +
+                         "Sub Main()\n    Dim c, a, x, rr As Long, cnt As Long\n    a = Array(1)\n    For Each c In a\n    Next c\n" +
+                         "    color\n    Debug.Print (\"a\") & (\"b\")\n    Debug.Print (1 = 1) & \"!\"\n" +
+                         "    If cnt = 1 Then\n        If rr < 1 Then rr = 5\n    Else\n        x = \"else\"\n    End If\n    Debug.Print x\n" +
+                         "    Const K1 = 15, K2 = 4\n    Const H As Double = 1.5, N As Long = 4\n    Debug.Print K1 * K2; H * N\n" +
+                         "    Dim p(5) As String\n    Show p()\n" +
+                         "    Debug.Print VBA.Len(\"abc\"); VBA.RGB(1, 0, 0); VBA.Left$(\"abc\", 2); Strings.UCase(\"q\"); Math.Sqr(16); VBA.Strings.Mid(\"abc\", 2)\n" +
+                         "End Sub\n") ] "Main"
+        let expected = [ " 20 "; "ab"; "True!"; "else"; " 60  6 "; " 5 "; " 3  1 abQ 4 bc" ]
+        if lines <> expected then fail "statements" expected lines)
+
+    "Set a(i) = obj stores the object; [A1] is Evaluate", (fun () ->
+        let store = System.Collections.Generic.Dictionary<int * int, Value>()
+        let evaluated = ResizeArray<string>()
+        let sheet =
+            { new HostObject("Application") with
+                override _.CallMethod name args =
+                    match name with
+                    | "Cells" -> Some (VHostObject (ParityCell(store, ValueSemantics.toInteger args.[0], ValueSemantics.toInteger args.[1])))
+                    | "Evaluate" ->
+                        evaluated.Add(ValueSemantics.toString args.[0])
+                        Some (VHostObject (ParityCell(store, 1, 1)))
+                    | _ -> None }
+        let options = RunOptions.vba |> RunOptions.withHostGlobals (Map.ofList [ "Application", VHostObject sheet ])
+        let result =
+            run options ("Dim a(1) As Object, v(1), t1, t2, t3\nSet a(0) = Application.Cells(1, 1)\nSet v(1) = Application.Cells(2, 2)\n" +
+                         "t1 = TypeName(a(0)) & TypeName(v(1))\n[A1] = 10\nt2 = [A1] + 1\nt3 = TypeName([A1:B2])")
+        if globalOf "t1" result <> str "RangeRange" then fail "Set a(i)" (str "RangeRange") (globalOf "t1" result)
+        if globalOf "t2" result <> VInteger 11 then fail "[A1] + 1" (VInteger 11) (globalOf "t2" result)
+        if globalOf "t3" result <> str "Range" then fail "[A1:B2]" (str "Range") (globalOf "t3" result)
+        if List.ofSeq evaluated <> [ "A1"; "A1"; "A1:B2" ] then fail "Evaluate texts" [ "A1"; "A1"; "A1:B2" ] (List.ofSeq evaluated))
+
+    "Typed parameters convert values passed to them", (fun () ->
+        exprs "Function F(n As Long, Optional m As Long = 5)\nF = TypeName(n) & TypeName(m)\nEnd Function" [ "F(1)", str "LongLong"; "F(1 + 1, 2)", str "LongLong" ])
+
+    "A host call can end a Step slice", (fun () ->
+        let mutable calls = 0
+        let host =
+            { new HostObject("Application") with
+                override _.CallMethod name _ =
+                    if name = "Wait" then
+                        calls <- calls + 1
+                        HostSignals.requestYield ()
+                        Some VEmpty
+                    else None }
+        let options = ProjectOptions.vba |> ProjectOptions.withHostGlobals (Map.ofList [ "Application", VHostObject host ])
+        match Project.compile options [ ModuleSource.standard "M" "Public n As Long\nSub Main()\n    Application.Wait\n    n = 1\n    DoEvents\n    n = 2\nEnd Sub\n" ] with
+        | Error e -> failwithf "%A" e
+        | Ok p ->
+            match Session.Create p with
+            | Error f -> failwithf "%A" f
+            | Ok s ->
+                match s.Call("Main", []) with Error f -> failwithf "%A" f | Ok () -> ()
+                if s.Step 1000000 <> Running || calls <> 1 || s.TryGetGlobal "n" <> Some (VLong 0) then fail "first slice" "Running after Wait" (s.Status, s.TryGetGlobal "n")
+                if s.Step 1000000 <> Running || s.TryGetGlobal "n" <> Some (VLong 1) then fail "second slice" "Running after DoEvents" (s.Status, s.TryGetGlobal "n")
+                match s.Step 1000000 with
+                | Finished _ when s.TryGetGlobal "n" = Some (VLong 2) -> ()
+                | other -> fail "third slice" "Finished" other)
+
 ]
 
 let runAll () =

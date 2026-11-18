@@ -114,6 +114,15 @@ type VbErrorInfo = {
 
 exception VbError of VbErrorInfo
 
+/// Requests a host can make while the engine runs one of its members.
+module HostSignals =
+    let mutable internal yieldRequested = false
+
+    /// End the current `Session.Step` slice as soon as the running host call
+    /// returns (DoEvents, Application.Wait): Step reports `Running` and the
+    /// next Step continues. Outside a Step slice it has no effect.
+    let requestYield () = yieldRequested <- true
+
 /// Standard descriptions of the run-time errors the engine raises.
 let errorDescription number =
     match number with

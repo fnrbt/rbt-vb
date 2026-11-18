@@ -1711,6 +1711,7 @@ collectHook <- collectUnreachable
 /// unhandled error, including cancellation (error 18). A `Stop` ends the
 /// slice early with `Paused` set.
 let runSlice (state: VmState) (budget: int) =
+    HostSignals.yieldRequested <- false
     let previousDefault = ValueSemantics.objectDefault
     let hasDefaults = state.Program.Classes |> Array.exists (fun c -> c.DefaultMember <> "")
     if hasDefaults then ValueSemantics.objectDefault <- objectDefaultOf state
@@ -1724,7 +1725,7 @@ let runSlice (state: VmState) (budget: int) =
             let mutable executed = 0
             try
                 let code = state.Program.Code
-                while executed < chunk && state.Pc < code.Length do
+                while executed < chunk && state.Pc < code.Length && not HostSignals.yieldRequested do
                     executeOneInstruction state
                     executed <- executed + 1
             with
@@ -1736,6 +1737,10 @@ let runSlice (state: VmState) (budget: int) =
                 executed <- executed + 1
                 dispatchError state ex
             remaining <- remaining - executed
+            if HostSignals.yieldRequested then
+                // A host call (DoEvents, Application.Wait) asked to end the slice.
+                HostSignals.yieldRequested <- false
+                remaining <- 0
         state.Pc >= state.Program.Code.Length
     finally
         if hasDefaults then ValueSemantics.objectDefault <- previousDefault

@@ -566,8 +566,23 @@ let private builtinSType (name: string) (argType: unit -> SType) =
         | t -> t
     | _ -> SType.Variant
 
+/// `VBA.Left`, `Strings.Left`, `VBA.Strings.Left`, `Math.Sqr`...: the VBA
+/// library's module names qualify built-ins (unless the program defines the name).
+let private libraryModules = set [ "vba"; "strings"; "math"; "interaction"; "datetime"; "conversion"; "information"; "financial"; "filesystem"; "constants"; "colorconstants"; "keycodeconstants"; "systemcolorconstants" ]
+
+let private libraryMember (ctx: CompileContext) (expr: Expression) =
+    let isLibrary name =
+        libraryModules.Contains (normalizeName name) && not (isVariableName ctx name) && not (containsSetName ctx.ModuleNames name)
+        && (tryResolveFunction ctx name).IsNone && not (containsName ctx.ClassIndex name) && not (containsName ctx.Enums name)
+    match expr with
+    | Member (Member (Identifier vba, library), name) when normalizeName vba = "vba" && isLibrary vba && isLibrary library -> Some name
+    | Member (Identifier library, name) when isLibrary library -> Some name
+    | _ -> None
+
 let rec private staticTypeOf (ctx: CompileContext) expr =
     match expr with
+    | Member _ when (libraryMember ctx expr).IsSome -> staticTypeOf ctx (Identifier (libraryMember ctx expr).Value)
+    | Ast.Call (callee, args) when (libraryMember ctx callee).IsSome -> staticTypeOf ctx (Ast.Call (Identifier (libraryMember ctx callee).Value, args))
     | Literal l -> literalSType l
     | Parenthesized e -> staticTypeOf ctx e
     | Identifier name when isErrName ctx name -> SType.Variant
@@ -629,6 +644,9 @@ let rec private emitRefArgument (ctx: CompileContext) (arg: Expression) (compile
         | GlobalLoc slot -> emit ctx (MakeRefGlobal slot) 0
         | LocalLoc slot -> emit ctx (MakeRefLocal slot) 0
         | _ -> compileExpr ctx arg
+    | Ast.Call (Identifier arrayName, []) when containsSetName ctx.ArrayVars arrayName && isVariableName ctx arrayName ->
+        // `Show p()`: the array itself.
+        emitRefArgument ctx (Identifier arrayName) compileExpr
     | Ast.Call (Identifier arrayName, indices)
         when isVariableName ctx arrayName && (tryResolveFunction ctx arrayName).IsNone
              && not (isField ctx arrayName) ->
@@ -782,6 +800,18 @@ let private checkedOpcode op =
 
 let rec compileExpression (ctx: CompileContext) (expr: Expression) =
     match expr with
+    | Ast.Call (Identifier "[evaluate]", [ text ]) ->
+        // `[A1]` is Evaluate("A1"): a host global or procedure Evaluate, else
+        // Application.Evaluate.
+        if isVariableName ctx "Evaluate" || (tryResolveFunction ctx "Evaluate").IsSome then
+            compileExpression ctx (Ast.Call (Identifier "Evaluate", [ text ]))
+        elif isVariableName ctx "Application" then
+            compileExpression ctx (Ast.Call (Member (Identifier "Application", "Evaluate"), [ text ]))
+        else
+            emitRaise ctx 424 (errorDescription 424)
+            emit ctx LoadEmpty 0
+    | Member _ when (libraryMember ctx expr).IsSome -> compileExpression ctx (Identifier (libraryMember ctx expr).Value)
+    | Ast.Call (callee, args) when (libraryMember ctx callee).IsSome -> compileExpression ctx (Ast.Call (Identifier (libraryMember ctx callee).Value, args))
     | Parenthesized e -> compileExpression ctx e
     | ArrayBound _ -> fail ctx "Array bound outside declaration"
     | MissingArg -> emitConst ctx VUndefined
@@ -844,7 +874,8 @@ let rec compileExpression (ctx: CompileContext) (expr: Expression) =
         // A local (or parameter) shadows a procedure of the same name.
         if isKnownValue && (not isFunction || (isLocalVariable ctx name && ctx.ReturnSlotName <> Some name)) then
             emitLoadVar ctx name
-            if containsSetName ctx.ArrayVars name && not args.IsEmpty && not (hasNamed args) && not (List.contains MissingArg args) then
+            if containsSetName ctx.ArrayVars name && args.IsEmpty then ()
+            elif containsSetName ctx.ArrayVars name && not (hasNamed args) && not (List.contains MissingArg args) then
                 for arg in args do compileExpression ctx arg
                 emit ctx (ArrayGet args.Length) 0
             else
@@ -1035,7 +1066,7 @@ let private letsThroughObject (ctx: CompileContext) name =
 let private assignmentTo (ctx: CompileContext) (target: Expression) (value: Expression) =
     match target with
     | Identifier name -> Assignment (name, value)
-    | Ast.Call (Identifier name, indices) -> IndexedAssignment (name, indices, value)
+    | Ast.Call (Identifier name, indices) -> IndexedAssignment (name, indices, value, false)
     | Member (receiver, name) -> MemberAssignment (receiver, name, value, false)
     | Ast.Call (Member _, _) -> DefaultAssignment (target, value, false)
     | Parenthesized inner -> DefaultAssignment (inner, value, false)
@@ -1078,6 +1109,8 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
         compileExpression ctx expr
         emit ctx Pop 0
 
+    | StatementGroup statements -> for inner in statements do compileStatement ctx inner
+
     | Assignment (name, expr) | Let (name, expr) ->
         match ctx.ReturnSlotName with
         | Some returnName when normalizeName returnName = normalizeName name && ctx.InFunction ->
@@ -1106,14 +1139,25 @@ let rec compileStatement (ctx: CompileContext) (stmt: Statement) =
             emit ctx (LetLocal slot) 0
         | _ -> compileTypedValue ctx expr name
 
-    | IndexedAssignment (name, (target :: start :: rest as args), valueExpr)
+    | IndexedAssignment (name, (target :: start :: rest as args), valueExpr, false)
         when normalizeName name = "mid" && not (isVariableName ctx name) && (tryResolveFunction ctx name).IsNone ->
         // Mid(target, start[, length]) = value
         let length = match rest with [ l ] -> l | _ -> MissingArg
         ignore args
         compileStatement ctx (assignmentTo ctx target (Ast.Call (Identifier "mid:statement", [ target; start; length; valueExpr ])))
 
-    | IndexedAssignment (name, indices, valueExpr) ->
+    | IndexedAssignment ("[evaluate]", args, valueExpr, isSet) ->
+        // `[A1] = 10` assigns through the evaluated object's default member.
+        compileStatement ctx (DefaultAssignment (Ast.Call (Identifier "[evaluate]", args), valueExpr, isSet))
+
+    | IndexedAssignment (name, indices, valueExpr, true) ->
+        // `Set a(i) = obj` stores the object itself.
+        emitLoadVar ctx name
+        for index in indices do compileExpression ctx index
+        compileExpression ctx valueExpr
+        emit ctx (ArraySet indices.Length) 0
+
+    | IndexedAssignment (name, indices, valueExpr, false) ->
         emitLoadVar ctx name
         for index in indices do compileExpression ctx index
         // Elements of typed arrays convert; `d(k) = v` on an object does not.

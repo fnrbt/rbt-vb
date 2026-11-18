@@ -438,7 +438,7 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
         match arg 0 with
         | VString variable -> VString (hooks.Environ variable)
         | _ -> VString ""
-    | "doevents" -> VInteger 0
+    | "doevents" -> HostSignals.requestYield (); VInteger 0
     | "beep" -> VEmpty
 
     // String functions

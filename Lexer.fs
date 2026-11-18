@@ -216,6 +216,17 @@ let tokenize (source: string) =
                 state <- newState
             | None -> ()
             precedingNewline <- false
+        | '[' ->
+            // `[A1]`: everything up to the closing bracket on the same line.
+            let mutable s = advance state
+            let sb = System.Text.StringBuilder()
+            while peek s <> ']' && peek s <> '\n' && peek s <> '\r' && peek s <> '\000' do
+                sb.Append(peek s) |> ignore
+                s <- advance s
+            if peek s <> ']' then failwithf "Expected ']' at line %d, column %d" line col
+            add BracketText (sb.ToString())
+            state <- advance s
+            precedingNewline <- false
         | '(' -> add LParen "("; state <- advance state; precedingNewline <- false
         | ')' -> add RParen ")"; state <- advance state; precedingNewline <- false
         | ',' -> add Comma ","; state <- advance state; precedingNewline <- false

@@ -249,6 +249,8 @@ and pprimary : Parser<Expression> = fun tokens ->
         Success (numberLiteral lexeme, tail)
     | { Kind = StringLiteral; Lexeme = lexeme } :: tail ->
         Success (Literal (Ast.String lexeme), tail)
+    | { Kind = BracketText; Lexeme = text } :: tail ->
+        Success (Call (Identifier "[evaluate]", [ Literal (Ast.String text) ]), tail)
     | { Kind = DateLiteral; Lexeme = lexeme } :: tail ->
         match DateCore.tryParse lexeme System.DateTime.Now.Year with
         | Some serial -> Success (Literal (Ast.Date serial), tail)
@@ -471,8 +473,9 @@ let pdimWith (keyword: string) (dialect: Dialect) : Parser<Statement> = fun toke
 
 let pdim dialect = pdimWith "dim" dialect
 
-let pconst (dialect: Dialect) : Parser<Statement> = fun tokens ->
-    match (pkeyword "const" >>. pidentifier) tokens with
+/// `name [As Type] = value`, one item of a Const statement.
+let private pconstItem (dialect: Dialect) : Parser<string * TypeRef option * Expression> = fun tokens ->
+    match pidentifier tokens with
     | Success (name, remaining) ->
         // Optional As Type (VBA only)
         let typeRef, remaining2 =
@@ -486,9 +489,21 @@ let pconst (dialect: Dialect) : Parser<Statement> = fun tokens ->
                 | _ -> (None, remaining)
             | VBScript -> (None, remaining)
         match (ptoken Eq >>. pexpression) remaining2 with
-        | Success (expr, remaining3) ->
-            Success (Declaration (None, Const (name, typeRef, expr)), remaining3)
+        | Success (expr, remaining3) -> Success ((name, typeRef, expr), remaining3)
         | Error (msg, token) -> Error (msg, token)
+    | Error (msg, token) -> Error (msg, token)
+
+/// `Const A = 1, B As Long = 2` after the Const keyword.
+let pconstItems (dialect: Dialect) (visibility: Visibility option) : Parser<Statement> = fun tokens ->
+    match sepBy1 (ptoken Comma) (pconstItem dialect) tokens with
+    | Success ([ (name, typeRef, expr) ], rest) -> Success (Declaration (visibility, Const (name, typeRef, expr)), rest)
+    | Success (items, rest) ->
+        Success (StatementGroup [ for (name, typeRef, expr) in items -> Declaration (visibility, Const (name, typeRef, expr)) ], rest)
+    | Error (msg, token) -> Error (msg, token)
+
+let pconst (dialect: Dialect) : Parser<Statement> = fun tokens ->
+    match pkeyword "const" tokens with
+    | Success (_, remaining) -> pconstItems dialect None remaining
     | Error (msg, token) -> Error (msg, token)
 
 let predim : Parser<Statement> = fun tokens ->
@@ -660,7 +675,7 @@ let rec psetStmtFull : Parser<Statement> = fun tokens ->
                     | Identifier name ->
                         Success (Set (name, value), remaining3)
                     | Ast.Call (Identifier name, indices) ->
-                        Success (IndexedAssignment (name, indices, value), remaining3)
+                        Success (IndexedAssignment (name, indices, value, true), remaining3)
                     | Ast.Call _ ->
                         Success (DefaultAssignment (expr, value, true), remaining3)
                     | _ -> Error ("Expected identifier or member after Set", List.head remaining)
@@ -672,13 +687,44 @@ let rec psetStmtFull : Parser<Statement> = fun tokens ->
 
 /// Parenthesless Sub/method call: name arg1, arg2  OR  obj.method arg1, arg2
 and pSubCallNoParens : Parser<Statement> = fun tokens ->
-    // Parse a postfix expression (identifier, obj.method, etc.)
-    match ppostfix tokens with
+    // `Name (a) & b` / `obj.Method (1), 2`: the parentheses belong to the first
+    // argument when more of the statement follows them. The callee is the
+    // dotted name before the parenthesis.
+    let rec dotted (toks: Token list) count =
+        match toks with
+        | { Kind = Ast.Identifier } :: { Kind = Dot } :: rest -> dotted rest (count + 2)
+        | { Kind = Ast.Identifier } :: { Kind = LParen } :: _ -> Some (count + 1)
+        | _ -> None
+    let rec closing (toks: Token list) depth =
+        match toks with
+        | { Kind = LParen } :: rest -> closing rest (depth + 1)
+        | { Kind = RParen } :: rest -> if depth = 1 then Some rest else closing rest (depth - 1)
+        | { Kind = EOF } :: _ | [] -> None
+        | { PrecedingNewline = true } :: _ when depth = 0 -> None
+        | _ :: rest -> closing rest depth
+    let splitTarget =
+        match dotted tokens 0 with
+        | Some count when (match tokens with { Kind = Ast.Identifier; Lexeme = l } :: _ -> l.ToLowerInvariant() <> "call" | _ -> false) ->
+            let afterName = List.skip count tokens
+            match closing afterName 0 with
+            | Some (next :: _) when not next.PrecedingNewline
+                                    && (next.Kind = Operator || next.Kind = Comma
+                                        || (next.Kind = Keyword && List.contains (next.Lexeme.ToLowerInvariant()) [ "and"; "or"; "xor"; "mod"; "like"; "eqv"; "imp" ])) ->
+                match ppostfix (List.take count tokens @ [ { Kind = Ast.EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false } ]) with
+                | Success (target, _) -> Some (target, afterName)
+                | Error _ -> None
+            | _ -> None
+        | _ -> None
+    let postfix =
+        match splitTarget with
+        | Some (target, rest) -> Success (target, rest)
+        | None -> ppostfix tokens
+    match postfix with
     | Success (target, remaining) ->
         // Must be followed by an arg on the same line (not =, (, :, newline, EOF)
         match remaining with
         | { Kind = Eq } :: _ -> Error ("Assignment", List.head remaining)
-        | { Kind = LParen } :: _ -> Error ("Parenthesized", List.head remaining)
+        | { Kind = LParen } :: _ when splitTarget.IsNone -> Error ("Parenthesized", List.head remaining)
         | { Kind = Colon } :: _ -> Error ("No args", List.head remaining)
         | { Kind = EOF } :: _ -> Error ("No args", List.head remaining)
         | { PrecedingNewline = true } :: _ -> Error ("New line", List.head remaining)
@@ -839,7 +885,8 @@ and pifStmt (dialect: Dialect) : Parser<Statement> = fun tokens ->
             match branch [] remaining with
             | Error (msg, token) -> Error (msg, token)
             | Success ([], rest) -> Error ("Expected statement after Then", List.head rest)
-            | Success (thenStmts, { Kind = Keyword; Lexeme = "else" } :: tail) ->
+            // An Else on a later line belongs to an enclosing block If.
+            | Success (thenStmts, { Kind = Keyword; Lexeme = "else"; PrecedingNewline = false } :: tail) ->
                 match branch [] tail with
                 | Success ([], rest) -> Error ("Expected statement after Else", List.head rest)
                 | Success (elseStmts, rest) -> Success (IfStmt (cond, thenStmts, [], Some elseStmts), rest)
@@ -863,7 +910,7 @@ and pforLoop (dialect: Dialect) : Parser<Statement> = fun tokens ->
                 // Optionally consume trailing loop variable after Next (e.g. "Next i")
                 let remainingFinal =
                     match remainingFinal with
-                    | { Kind = Ast.Identifier; Lexeme = name } :: tail when name.ToLower() = v.ToLower() -> tail
+                    | { Kind = Ast.Identifier; Lexeme = name; PrecedingNewline = false } :: tail when name.ToLower() = v.ToLower() -> tail
                     | _ -> remainingFinal
                 Success (ForLoop (v, s, e, stepOpt, body), remainingFinal)
             | Error (msg, token) -> Error (msg, token)
@@ -874,7 +921,13 @@ and pforEach (dialect: Dialect) : Parser<Statement> = fun tokens ->
     match (pkeyword "for" >>. pkeyword "each" >>. pidentifier .>> pkeyword "in" .>>. pexpression) tokens with
     | Success ((varName, collExpr), remaining) ->
         match (pstatements dialect .>> skipColons .>> pkeyword "next") remaining with
-        | Success (body, remaining2) -> Success (ForEach (varName, collExpr, body), remaining2)
+        | Success (body, remaining2) ->
+            // `Next c`: the loop variable may follow Next.
+            let remaining2 =
+                match remaining2 with
+                | { Kind = Ast.Identifier; Lexeme = name; PrecedingNewline = false } :: tail when name.ToLower() = varName.ToLower() -> tail
+                | _ -> remaining2
+            Success (ForEach (varName, collExpr, body), remaining2)
         | Error (msg, token) -> Error (msg, token)
     | Error (msg, token) -> Error (msg, token)
 
@@ -1076,8 +1129,8 @@ and plsetStmt : Parser<Statement> = fun tokens ->
             Success (Assignment (name, Ast.Call (Identifier builtin, [ Identifier name; value ])), next)
         | Success (MemberAssignment (target, memberName, value, false), next) ->
             Success (MemberAssignment (target, memberName, Ast.Call (Identifier builtin, [ Member (target, memberName); value ]), false), next)
-        | Success (IndexedAssignment (name, indices, value), next) ->
-            Success (IndexedAssignment (name, indices, Ast.Call (Identifier builtin, [ Ast.Call (Identifier name, indices); value ])), next)
+        | Success (IndexedAssignment (name, indices, value, isSet), next) ->
+            Success (IndexedAssignment (name, indices, Ast.Call (Identifier builtin, [ Ast.Call (Identifier name, indices); value ]), isSet), next)
         | Success (_, _) -> Error ("Expected variable after LSet/RSet", List.head rest)
         | Error (msg, token) -> Error (msg, token)
     | head :: _ -> Error ("Expected LSet", head)
@@ -1121,25 +1174,7 @@ and pVisibilityDecl (dialect: Dialect) : Parser<Statement> = fun tokens ->
     | Success (vis, remaining) ->
         // Check if it's a Const
         match remaining with
-        | { Kind = Keyword; Lexeme = "const" } :: _ ->
-            match (pkeyword "const" >>. pidentifier) remaining with
-            | Success (name, remaining2) ->
-                // Optional As Type (VBA only)
-                let typeRef, remaining3 =
-                    match dialect with
-                    | VBA ->
-                        match remaining2 with
-                        | { Kind = Keyword; Lexeme = "as" } :: _ ->
-                            match (pkeyword "as" >>. pTypeRef) remaining2 with
-                            | Success (tr, rem) -> (Some tr, rem)
-                            | Error _ -> (None, remaining2)
-                        | _ -> (None, remaining2)
-                    | VBScript -> (None, remaining2)
-                match (ptoken Eq >>. pexpression) remaining3 with
-                | Success (expr, remaining4) ->
-                    Success (Declaration (Some vis, Const (name, typeRef, expr)), remaining4)
-                | Error (msg, token) -> Error (msg, token)
-            | Error (msg, token) -> Error (msg, token)
+        | { Kind = Keyword; Lexeme = "const" } :: tail -> pconstItems dialect (Some vis) tail
         | _ ->
             // Variable declaration: Public x, y As Integer  (or just Public x in VBS)
             match sepBy1 (ptoken Comma) (pVarDeclarator dialect) remaining with
@@ -1166,7 +1201,7 @@ and ptargetAssignment : Parser<Statement> = fun tokens ->
                 match expr with
                 | Identifier name -> Success (Assignment (name, value), remaining2)
                 | Member (objExpr, memberName) -> Success (MemberAssignment (objExpr, memberName, value, false), remaining2)
-                | Ast.Call (Identifier name, indices) -> Success (IndexedAssignment (name, indices, value), remaining2)
+                | Ast.Call (Identifier name, indices) -> Success (IndexedAssignment (name, indices, value, false), remaining2)
                 | Ast.Call _ -> Success (DefaultAssignment (expr, value, false), remaining2)
                 | headExpr -> Error (sprintf "Expected assignable target but got %A" headExpr, List.head remaining)
             | Error (msg, token) -> Error (msg, token)
@@ -1230,6 +1265,7 @@ and pstatementAfterColons (dialect: Dialect) : Parser<Statement> = fun tokens ->
                 when (let k = keyword.ToLowerInvariant() in k = "lset" || k = "rset") ->
                 plsetStmt tokens
             | { Kind = Ast.Identifier } :: _
+            | { Kind = BracketText } :: _
             | { Kind = Dot } :: _ ->
                 (ptargetAssignment
                  <|> pSubCallNoParens
@@ -1541,12 +1577,51 @@ let pTopLevel (dialect: Dialect) : Parser<TopLevel> = fun tokens ->
         | _ -> statement ()
     | Error (msg, token) -> Error (msg, token)
 
+/// Expand statement groups into their statements, keeping each one's line.
+let rec private flattenStatements (statements: Statement list) : Statement list =
+    statements |> List.collect (fun stmt ->
+        match stmt with
+        | StatementGroup inner -> flattenStatements inner
+        | LocatedStmt (line, StatementGroup inner) -> flattenStatements inner |> List.map (fun s -> match s with LocatedStmt _ -> s | _ -> LocatedStmt (line, s))
+        | LocatedStmt (line, inner) -> [ LocatedStmt (line, flattenStatement inner) ]
+        | other -> [ flattenStatement other ])
+
+and private flattenStatement (stmt: Statement) : Statement =
+    match stmt with
+    | IfStmt (c, yes, alternatives, no) ->
+        IfStmt (c, flattenStatements yes, alternatives |> List.map (fun (e, b) -> e, flattenStatements b), no |> Option.map flattenStatements)
+    | SelectCase (e, cases) -> SelectCase (e, cases |> List.map (fun (t, b) -> t, flattenStatements b))
+    | ForLoop (v, a, b, step, body) -> ForLoop (v, a, b, step, flattenStatements body)
+    | ForEach (v, e, body) -> ForEach (v, e, flattenStatements body)
+    | WhileLoop (c, body) -> WhileLoop (c, flattenStatements body)
+    | DoLoop (a, b) ->
+        let f (c: DoCondition option) = c |> Option.map (fun c -> { c with Body = flattenStatements c.Body })
+        DoLoop (f a, f b)
+    | WithStmt (e, body) -> WithStmt (e, flattenStatements body)
+    | LocatedStmt (line, inner) -> LocatedStmt (line, flattenStatement inner)
+    | other -> other
+
+let rec private flattenTopLevels (tops: TopLevel list) : TopLevel list =
+    let flattenFunction f =
+        match f with
+        | FunctionDecl (m, n, ps, t, body) -> FunctionDecl (m, n, ps, t, flattenStatements body)
+        | SubDecl (m, n, ps, body) -> SubDecl (m, n, ps, flattenStatements body)
+        | PropertyGet (m, n, ps, t, body) -> PropertyGet (m, n, ps, t, flattenStatements body)
+        | PropertyLet (m, n, ps, body) -> PropertyLet (m, n, ps, flattenStatements body)
+        | PropertySet (m, n, ps, body) -> PropertySet (m, n, ps, flattenStatements body)
+    tops |> List.collect (fun top ->
+        match top with
+        | TopLevelStatement stmt -> flattenStatements [ stmt ] |> List.map TopLevelStatement
+        | FunctionDef f -> [ FunctionDef (flattenFunction f) ]
+        | ClassDecl (v, n, members) -> [ ClassDecl (v, n, flattenTopLevels members) ]
+        | other -> [ other ])
+
 let pprogram (dialect: Dialect) : Parser<Program> = fun tokens ->
     let rec loop acc remaining =
         match skipColons remaining with
         | Error (msg, token) -> Error (msg, token)
         | Success ((), ({ Kind = EOF } :: _ as rest)) ->
-            Success ({ Dialect = dialect; TopLevels = List.rev acc }, rest)
+            Success ({ Dialect = dialect; TopLevels = flattenTopLevels (List.rev acc) }, rest)
         | Success ((), rest) ->
             match pTopLevel dialect rest with
             | Error (msg, token) -> Error (msg, token)

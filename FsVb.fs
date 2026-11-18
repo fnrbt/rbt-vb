@@ -487,6 +487,37 @@ module private ProjectInternals =
                 members |> List.choose (function FunctionDef f -> Some (ofFunction f) | _ -> None)
             | _ -> [])
 
+    /// The line of a module-level declaration after the first procedure (a
+    /// compile error in VBA), if any.
+    let declarationAfterProcedure (source: string) (program: Ast.Program) =
+        let isDeclaration top =
+            match top with
+            | TopLevelStatement (LocatedStmt (_, Declaration _)) | TopLevelStatement (Declaration _)
+            | EnumDecl _ | TypeDecl _ | DeclareDecl _ | ImplementsDecl _ | EventDecl _ | WithEventsDecl _ | OptionStmt _ -> true
+            | _ -> false
+        let afterFirst = program.TopLevels |> List.skipWhile (function FunctionDef _ -> false | _ -> true)
+        match afterFirst |> List.tryFind isDeclaration with
+        | None -> None
+        | Some top ->
+            match top with
+            | TopLevelStatement (LocatedStmt (line, _)) -> Some line
+            | _ ->
+                // Find the line: the first declaration keyword after a procedure's end.
+                let lines = source.Replace("\r\n", "\n").Split('\n')
+                let words (line: string) = line.Trim().ToLowerInvariant().Split([| ' '; '\t' |], System.StringSplitOptions.RemoveEmptyEntries)
+                let mutable seenEnd = false
+                let mutable found = 0
+                for i in 0 .. lines.Length - 1 do
+                    let w = words lines.[i]
+                    if found = 0 && w.Length > 0 then
+                        if w.[0] = "end" && w.Length > 1 && (w.[1] = "sub" || w.[1] = "function" || w.[1] = "property") then seenEnd <- true
+                        elif seenEnd then
+                            let head = if (w.[0] = "public" || w.[0] = "private" || w.[0] = "global" || w.[0] = "friend") && w.Length > 1 then w.[1] else w.[0]
+                            if List.contains head [ "dim"; "const"; "type"; "enum"; "declare"; "option"; "implements"; "event"; "withevents" ]
+                               || (head <> w.[0] && not (List.contains head [ "sub"; "function"; "property"; "static" ])) then
+                                found <- i + 1
+                Some found
+
     let parseModule (options: ProjectOptions) (m: ModuleSource) : Result<Ast.Program, VbFailure> =
         let header = ModuleSource.parseHeader m.Source
         match ParserSimple.parseDetailed options.Dialect header.Body with
@@ -495,9 +526,12 @@ module private ProjectInternals =
                     Line = line; Column = column; Procedure = ""; Module = m.Name }
         | Ok program ->
             let errors = if options.Validate then Validator.validate program else []
-            match errors with
-            | [] -> Ok program
-            | first :: _ ->
+            match errors, (if options.Dialect = VBA then declarationAfterProcedure header.Body program else None) with
+            | _, Some line ->
+                Error { Kind = Compile; Number = 0; Description = "Only comments may appear after End Sub, End Function, or End Property"
+                        Source = options.ProjectName; Line = line; Column = 0; Procedure = ""; Module = m.Name }
+            | [], None -> Ok program
+            | first :: _, None ->
                 Error { Kind = Compile; Number = 0; Description = first.Message; Source = options.ProjectName
                         Line = 0; Column = 0; Procedure = ""; Module = m.Name }
 
