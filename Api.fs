@@ -569,7 +569,15 @@ module private ProjectInternals =
             programs |> List.map (fun (m, program) ->
                 ({ Name = m.Name; Kind = toCompilerKind m.Kind; Program = program; DefaultMember = defaultMember m } : Compiler.CompileModule))
         let hostNames = options.HostGlobals |> Map.toSeq |> Seq.map fst
-        try Ok (Compiler.compileModules hostNames modules)
+        // (The host's classes and interfaces, not its enums: a variable declared As one starts as Nothing.)
+        let objectTypes, enumTypes =
+            match options.HostTypes with
+            | Some host ->
+                (Seq.append host.Library.Classes.Keys host.Library.Interfaces.Keys
+                 |> Seq.filter (fun name -> not (host.Library.Enums.Contains name)) |> Seq.toList),
+                List.ofSeq host.Library.Enums
+            | None -> [], []
+        try Ok (Compiler.compileModulesWith hostNames objectTypes enumTypes modules)
         with
         | Compiler.CompileFailure (message, line, moduleName) -> Error (compileFailure options message line moduleName)
         | ex -> Error (compileFailure options ex.Message 0 "")

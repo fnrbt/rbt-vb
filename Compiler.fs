@@ -100,6 +100,11 @@ type CompileContext = {
     mutable OptionExplicit: bool
     /// A ReDim may declare its array implicitly.
     mutable ImplicitAllowed: bool
+    /// Lower-cased names of the host's object types (Range, Shape, Document ...): a variable declared
+    /// As one starts as Nothing. (Its enums are not among them: a variable of an enum type is a Long.)
+    ObjectTypes: HashSet<string>
+    /// Lower-cased names of the host's enums (XlDirection ...): a variable declared As one is a Long.
+    EnumTypes: HashSet<string>
     /// `Dim x As New Class`: variable key -> class name (globals and fields).
     AsNew: Dictionary<string, string>
     mutable LocalAsNew: Dictionary<string, string>
@@ -158,6 +163,8 @@ let emptyContext () =
         OptionBase = 0
         OptionExplicit = false
         ImplicitAllowed = false
+        ObjectTypes = HashSet()
+        EnumTypes = HashSet()
         AsNew = newNameDictionary ()
         LocalAsNew = newNameDictionary ()
         FixedArrays = newNameSet ()
@@ -313,6 +320,24 @@ let private udtIndex (ctx: CompileContext) (typeName: string) =
     match tryGetName ctx.ClassIndex typeName with
     | true, idx when ctx.Classes.[idx].IsValueType -> Some idx
     | _ -> None
+
+/// VBA's own classes, known without a host's library.
+let private vbaObjectTypes =
+    HashSet<string>([ "collection"; "dictionary"; "scripting.dictionary"; "regexp"; "vbscript_regexp_55.regexp"
+                      "filesystemobject"; "scripting.filesystemobject"; "errobject" ])
+
+/// What a variable declared `As typeName` starts as, when it is not one of VBA's own types: Nothing for a
+/// class (of the project, VBA's or the host's), a Long 0 for an enum, else None (Variant, an unknown name:
+/// Empty).
+let private namedTypeDefault (ctx: CompileContext) (typeName: string) =
+    let key = typeName.ToLowerInvariant()
+    if key = "variant" || key = "any" then None
+    elif containsName ctx.Enums typeName || ctx.EnumTypes.Contains key then Some (VLong 0)
+    else
+        match tryGetName ctx.ClassIndex typeName with
+        | true, idx when not ctx.Classes.[idx].IsValueType -> Some VNothing
+        | true, _ -> None
+        | _ -> if ctx.ObjectTypes.Contains key || vbaObjectTypes.Contains key then Some VNothing else None
 
 /// Emit the conversion for storing into a variable declared `As typeName`.
 let private emitStoreConversion (ctx: CompileContext) (typeName: string option) =
@@ -1033,7 +1058,10 @@ let private emitTypedInitial (ctx: CompileContext) (typeName: string) =
     | None ->
         match udtIndex ctx typeName with
         | Some idx -> emit ctx (NewObj idx) 0; true
-        | None -> false
+        | None ->
+            match namedTypeDefault ctx typeName with
+            | Some value -> emitConst ctx value; true
+            | None -> false
 
 /// Fill a just-created array with the element default of `typeName`.
 let private emitArrayFill (ctx: CompileContext) (typeName: string option) =
@@ -1044,7 +1072,10 @@ let private emitArrayFill (ctx: CompileContext) (typeName: string option) =
         | None ->
             match udtIndex ctx t with
             | Some idx -> emit ctx (ArrayFillNew idx) 0
-            | None -> ()
+            | None ->
+                match namedTypeDefault ctx t with
+                | Some value -> emit ctx (ArrayFill (addConstant ctx value)) 0
+                | None -> ()
     | None -> ()
 
 let private emitDimensions (ctx: CompileContext) (dimensions: Expression list) =
@@ -1092,7 +1123,10 @@ let private emitArrayReset (ctx: CompileContext) (typeName: string option) =
             | None ->
                 match udtIndex ctx t with
                 | Some idx -> -(idx + 1)
-                | None -> System.Int32.MinValue
+                | None ->
+                    match namedTypeDefault ctx t with
+                    | Some value -> addConstant ctx value
+                    | None -> System.Int32.MinValue
         | None -> System.Int32.MinValue
     emit ctx (ArrayReset code) 0
 
@@ -1790,7 +1824,7 @@ let compileFunctionBodyWith (ctx: CompileContext) (isStatic: bool) (name: string
             | Some idx ->
                 emit ctx (NewObj idx) line
                 emit ctx (StoreLocal slot) line
-            | None -> ()
+            | None -> namedTypeDefault ctx typeName |> Option.iter (fun value -> initial.[slot] <- value)
     match returnType with
     | Some t when not (normalizeName returnName = "class_initialize") -> initialise (getName ctx.Locals returnName) t.Name
     | _ -> ()
@@ -1923,7 +1957,11 @@ let private fieldTypeCode (ctx: CompileContext) (typeName: string option) =
         | None ->
             match udtIndex ctx t with
             | Some idx -> -(idx + 1)
-            | None -> 0
+            | None ->
+                match namedTypeDefault ctx t with
+                | Some VNothing -> int ValueSemantics.DeclaredType.Object
+                | Some _ -> int ValueSemantics.DeclaredType.Long
+                | None -> 0
 
 /// Fill in the field lists of user-defined types (after all are registered).
 let private defineTypes (ctx: CompileContext) (tops: TopLevel list) =
@@ -2188,8 +2226,12 @@ let rec private prepareTopLevels (tls: TopLevel list) =
 
 /// Compile several modules into one program. Module-level code runs in module
 /// order; `ModuleStarts` records where each module's code begins.
-let compileModules (hostNames: string seq) (modules: CompileModule list) : BytecodeProgram * CompileContext =
+/// compileModules, knowing the host's object types and enums: variables declared As one start as Nothing,
+/// As the other as a Long 0.
+let compileModulesWith (hostNames: string seq) (objectTypes: string seq) (enumTypes: string seq) (modules: CompileModule list) : BytecodeProgram * CompileContext =
     let ctx = emptyContext ()
+    for name in objectTypes do ctx.ObjectTypes.Add(name.ToLowerInvariant()) |> ignore
+    for name in enumTypes do ctx.EnumTypes.Add(name.ToLowerInvariant()) |> ignore
     for name in hostNames do
         if not (System.String.IsNullOrWhiteSpace name) then
             ignore (getGlobalSlot ctx name)
@@ -2267,6 +2309,9 @@ let compileModules (hostNames: string seq) (modules: CompileModule list) : Bytec
             patchLabels ctx)
     emit ctx Halt 0
     toProgram ctx, ctx
+
+let compileModules (hostNames: string seq) (modules: CompileModule list) : BytecodeProgram * CompileContext =
+    compileModulesWith hostNames Seq.empty Seq.empty modules
 
 let compileWithGlobalNames (names: string seq) (program: Program) : BytecodeProgram =
     compileModules names [ { Name = ""; Kind = StandardModule; Program = program; DefaultMember = None } ] |> fst

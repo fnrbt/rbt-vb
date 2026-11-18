@@ -708,7 +708,8 @@ and pSubCallNoParens : Parser<Statement> = fun tokens ->
             let afterName = List.skip count tokens
             match closing afterName 0 with
             | Some (next :: _) when not next.PrecedingNewline
-                                    && (next.Kind = Operator || next.Kind = Comma
+                                    // (A ';' after them: Debug.Print (a); (b).)
+                                    && (next.Kind = Operator || next.Kind = Comma || next.Kind = Semicolon
                                         || (next.Kind = Keyword && List.contains (next.Lexeme.ToLowerInvariant()) [ "and"; "or"; "xor"; "mod"; "like"; "eqv"; "imp" ])) ->
                 match ppostfix (List.take count tokens @ [ { Kind = Ast.EOF; Lexeme = ""; Line = 0; Column = 0; PrecedingNewline = false } ]) with
                 | Success (target, _) -> Some (target, afterName)

@@ -214,6 +214,38 @@ let private groups : (string * (unit -> unit)) list = [
         let expected = [ "Method or data member not found", "Class1.Hidden", 6 ]
         if got <> expected then fail "classes and functions" expected got)
 
+    "A variable declared As a class starts as Nothing, As an enum as a Long", (fun () ->
+        let library = TypeCheck.Library.parse (String.concat "\n" [ "member\tShape\tName\tget\t\tString"; "interface\tShape\tnonextensible"; "coclass\tWorksheet\t_Worksheet"; "interface\t_Worksheet\tnonextensible"; "enum\tXlDirection\txlUp\t-4162" ])
+        let host : TypeCheck.HostTypes = { Library = library; GlobalInterface = None; Globals = Map.empty }
+        let output = ResizeArray<string>()
+        let options = ProjectOptions.vba |> ProjectOptions.withHostTypes host |> ProjectOptions.withHooks { defaultHooks with Print = output.Add }
+        let code =
+            String.concat "\n"
+                [ "Enum Mine"; "    One = 1"; "End Enum"
+                  "Dim fieldShape As Shape, fieldMine As Mine"
+                  "Sub Main()"
+                  "    Dim s As Shape, w As Worksheet, c As Class1, k As Collection, d As XlDirection, m As Mine, v As Variant, u As Unknown, a(1) As Shape"
+                  "    Debug.Print s Is Nothing; w Is Nothing; c Is Nothing; k Is Nothing; a(0) Is Nothing; fieldShape Is Nothing"
+                  "    Debug.Print TypeName(d); TypeName(m); TypeName(fieldMine); TypeName(v); TypeName(u)"
+                  "    Dim o As New Class1"
+                  "    Debug.Print o.Inner Is Nothing"
+                  "    Debug.Print (1); (2) + 1, (3)"
+                  "    Debug.Print (4)"
+                  "End Sub" ]
+        let cls = ModuleSource.classModule "Class1" "Public Inner As Shape\n"
+        match Project.compile options [ cls; ModuleSource.standard "M" code ] with
+        | Error e -> failwithf "%A" e
+        | Ok p ->
+            match Session.Create p with
+            | Error f -> failwithf "%A" f
+            | Ok session ->
+                match session.Run("Main", [], 100000) with
+                | Finished _ -> ()
+                | other -> failwithf "%A" other
+        let expected = [ "TrueTrueTrueTrueTrueTrue"; "LongLongLongEmptyEmpty"; "True"; "1  3   3"; "4" ]
+        let got = List.ofSeq output |> List.map (fun l -> l.Replace("\t", " ").Trim())
+        if got <> expected then fail "Is Nothing / TypeName" expected got)
+
     "TryState finds the state of the table's own objects", (fun () ->
         let b = { Left = 1.0; Text = "a"; Items = ResizeArray() }
         match boxType.TryState (boxType.Wrap b) with

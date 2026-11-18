@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.3 — 2026-11-18
+
+- A variable declared As a class starts as Nothing, as in VBA: the project's own classes, VBA's (Collection, Dictionary ...) and, with `ProjectOptions.withHostTypes`, the host's (Range, Shape, Document ...), for locals, module variables, class fields and array elements. It started as Empty, so `If s Is Nothing Then` after a failed `Set s = Shapes("x")` under On Error Resume Next was False. A variable As an enum (the project's, or the host's: XlDirection) starts as a Long 0. Unknown type names still start as Empty. (`Compiler.compileModulesWith` takes the host's object and enum type names.)
+- `Debug.Print (a); (b)` parses: a parenthesised first item followed by `;`.
+
 ## 0.8.2 — 2026-11-18
 
 - Compile errors whose VBA text names nothing ("Variable not defined", "Named argument not found", "Label not defined") have VBA's text as their Description, and the name in Detail; it was appended to the text ("Variable not defined: y"). Matches Excel 2019 (rbt-office's compile parity cases: 22 of 22).
