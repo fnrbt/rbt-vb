@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.1 — 2026-11-18
+
+- Early binding follows default members: arguments given to a member without parameters go to its result's default member (`ActiveDocument.Paragraphs(1)` is a Paragraph, `ps(1)` for `ps As Paragraphs` too), as the library's DISPID 0 says (a `default` sixth field of a member line). 0.8.0 took `Paragraphs(1)` for the collection and reported its members as missing.
+- `VbFailure.format` shows a syntax or compile error's `Detail` as it does a run-time error's: `Compile error: Method or data member not found [Range.Frobnicate] (Module1.Main, line 2)`.
+
 ## 0.8.0 — 2026-11-18
 
 ### Early binding (TypeCheck)

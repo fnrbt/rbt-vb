@@ -257,12 +257,11 @@ module VbFailure =
             | 0, loc -> " (" + loc + ")"
             | line, "" -> sprintf " (line %d)" line
             | line, loc -> sprintf " (%s, line %d)" loc line
+        let about = if failure.Detail = "" then "" else " [" + failure.Detail + "]"
         match failure.Kind with
-        | Syntax -> "Syntax error: " + failure.Description + where
-        | Compile -> "Compile error: " + failure.Description + where
-        | Runtime ->
-            let about = if failure.Detail = "" then "" else " [" + failure.Detail + "]"
-            sprintf "Run-time error '%d': %s%s%s" failure.Number failure.Description about where
+        | Syntax -> "Syntax error: " + failure.Description + about + where
+        | Compile -> "Compile error: " + failure.Description + about + where
+        | Runtime -> sprintf "Run-time error '%d': %s%s%s" failure.Number failure.Description about where
 
     let ofRuntime (f: StackVm.RuntimeFailure) =
         { Kind = Runtime; Number = f.Number; Description = f.Description; Source = f.Source

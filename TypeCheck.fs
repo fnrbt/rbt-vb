@@ -8,7 +8,7 @@
 /// library describes, are bound late.
 ///
 /// The libraries are the host's (Excel's, Word's), as TSV made from their type libraries:
-///     member <TAB> interface <TAB> name <TAB> method|get|let|set <TAB> parameters (name[?];...) <TAB> returns
+///     member <TAB> interface <TAB> name <TAB> method|get|let|set <TAB> parameters (name[?];...) <TAB> returns [<TAB> default]
 ///     coclass <TAB> name <TAB> default interface        alias <TAB> name <TAB> type
 ///     enum <TAB> enum <TAB> name <TAB> value          interface <TAB> name <TAB> extensible|nonextensible
 /// VBA classes of the project are types too: their public members.
@@ -36,13 +36,15 @@ type Library = {
     Names: Dictionary<string, string>
     /// Lower-cased names of the interfaces whose members VBA checks when it compiles.
     NonExtensible: HashSet<string>
+    /// Lower-cased interface name to its default member's lower-cased name (`coll(1)` is `coll.Item(1)`).
+    Defaults: Dictionary<string, string>
     /// The enums' members: constants, as the library names them.
     Constants: (string * Value) list
 }
 
 module Library =
     let empty () =
-        { Interfaces = Dictionary(); Classes = Dictionary(); Enums = HashSet(); Names = Dictionary(); NonExtensible = HashSet(); Constants = [] }
+        { Interfaces = Dictionary(); Classes = Dictionary(); Enums = HashSet(); Names = Dictionary(); NonExtensible = HashSet(); Defaults = Dictionary(); Constants = [] }
 
     /// A library from its TSV (several are merged with `merge`).
     let parse (text: string) : Library =
@@ -51,8 +53,10 @@ module Library =
         for line in text.Split('\n') do
             let fields = line.TrimEnd('\r').Split('\t')
             match fields with
-            | [| "member"; iface; name; kind; parameters; returns |] ->
+            | [| "member"; iface; name; kind; parameters; returns |]
+            | [| "member"; iface; name; kind; parameters; returns; _ |] ->
                 let key = iface.ToLowerInvariant()
+                if fields.Length = 7 && fields.[6] = "default" then library.Defaults.[key] <- name.ToLowerInvariant()
                 library.Names.[key] <- iface
                 let members =
                     match library.Interfaces.TryGetValue key with
@@ -89,6 +93,7 @@ module Library =
             for name in library.Enums do merged.Enums.Add name |> ignore
             for KeyValue (key, name) in library.Names do merged.Names.[key] <- name
             for name in library.NonExtensible do merged.NonExtensible.Add name |> ignore
+            for KeyValue (key, name) in library.Defaults do merged.Defaults.[key] <- name
         { merged with Constants = libraries |> List.collect (fun l -> l.Constants) }
 
 /// The types a host gives its project: its libraries, the interface whose members are globals (Excel's and
@@ -147,6 +152,15 @@ type private Checker(host: HostTypes, classes: Dictionary<string, ClassInfo>, pr
         match signatures |> List.tryFind (fun s -> s.Kind = GetMember || s.Kind = MethodMember) with
         | Some s -> this.Resolve s.Returns
         | None -> Late
+
+    /// What `x(args)` is for x of this type: its default member's result (`ps(1)` is a Paragraph).
+    member this.DefaultOf(ty: Ty) : Ty =
+        match ty with
+        | Interface iface ->
+            match library.Defaults.TryGetValue iface with
+            | true, name -> (match this.Signatures(iface, name) with Some signatures -> this.ReadType signatures | None -> Late)
+            | _ -> Late
+        | _ -> Late
 
     member _.Report(scope: Scope, line: int, description: string, detail: string) =
         if not (problems |> Seq.exists (fun p -> p.Module = scope.Module && p.Line = line && p.Detail = detail)) then
@@ -209,15 +223,19 @@ type private Checker(host: HostTypes, classes: Dictionary<string, ClassInfo>, pr
             let t = this.TypeOf(scope, line, target)
             for a in args do this.Check(scope, line, a)
             match this.MemberType(scope, line, t, name, this.Label t) with
-            | result, Some signatures -> this.CheckArguments(scope, line, signatures, args, this.Label t + "." + name); result
+            | result, Some signatures ->
+                this.CheckArguments(scope, line, signatures, args, this.Label t + "." + name)
+                // (A member without parameters given arguments passes them to its result's default member.)
+                let parameterless = signatures |> List.forall (fun s -> s.Parameters.IsEmpty)
+                if parameterless && not args.IsEmpty then this.DefaultOf result else result
             | result, None -> result
         | Call (Identifier name, args) ->
             for a in args do this.Check(scope, line, a)
             this.NameType(scope, name, true)
         | Call (target, args) ->
-            this.Check(scope, line, target)
+            let t = this.TypeOf(scope, line, target)
             for a in args do this.Check(scope, line, a)
-            Late
+            if args.IsEmpty then t else this.DefaultOf t
         | Binary (_, l, r) -> this.Check(scope, line, l); this.Check(scope, line, r); Late
         | Unary (_, x) | NamedArg (_, x) | TypeOfIs (x, _) -> this.Check(scope, line, x); Late
         | ArrayBound (a, b) -> this.Check(scope, line, a); this.Check(scope, line, b); Late
@@ -236,18 +254,23 @@ type private Checker(host: HostTypes, classes: Dictionary<string, ClassInfo>, pr
                 | true, v -> Some v
                 | _ -> match scope.ProjectVariables.TryGetValue key with | true, v -> Some v | _ -> None
         match variable with
-        | Some v -> if v.IsArray && not indexed then Late else this.Resolve v.Type
+        | Some v ->
+            if v.IsArray then (if indexed then this.Resolve v.Type else Late)
+            elif indexed then this.DefaultOf (this.Resolve v.Type)
+            else this.Resolve v.Type
         | None ->
             match scope.Functions.TryGetValue key with
             | true, returns -> (match returns with Some t -> this.Resolve t | None -> Late)
             | _ ->
                 match host.Globals |> Map.tryFind key with
-                | Some t -> this.Resolve t
+                | Some t -> if indexed then this.DefaultOf (this.Resolve t) else this.Resolve t
                 | None ->
                     match host.GlobalInterface with
                     | Some iface ->
                         match this.Signatures(lower iface, name) with
-                        | Some signatures -> this.ReadType signatures
+                        | Some signatures ->
+                            let result = this.ReadType signatures
+                            if indexed && signatures |> List.forall (fun s -> s.Parameters.IsEmpty) then this.DefaultOf result else result
                         | None -> Late
                     | None -> Late
 

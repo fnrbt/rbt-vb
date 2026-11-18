@@ -164,6 +164,12 @@ let private groups : (string * (unit -> unit)) list = [
                   "interface\tFont\textensible"
                   "interface\t_Worksheet\tnonextensible"
                   "interface\t_Global\tnonextensible"
+                  "member\tItems\tItem\tmethod\tIndex\tThing\tdefault"
+                  "member\tItems\tCount\tget\t\tLong"
+                  "member\tThing\tName\tget\t\tString\tdefault"
+                  "member\t_Global\tThings\tget\t\tItems"
+                  "interface\tItems\tnonextensible"
+                  "interface\tThing\tnonextensible"
                   "enum\tXlDirection\txlUp\t-4162" ]
         let library = TypeCheck.Library.parse tsv
         if library.Constants <> [ "xlUp", VLong -4162 ] then fail "constants" [ "xlUp", VLong -4162 ] library.Constants
@@ -193,7 +199,12 @@ let private groups : (string * (unit -> unit)) list = [
               "    x = Sheet1.UsedRange.Nope", []
               "    Dim a(3) As Range\n    x = a(1).Nope", []
               "    Dim w As Worksheet\n    x = w.Nope", [ "Method or data member not found", "_Worksheet.Nope", 3 ]
-              "    Dim w As Worksheet\n    x = w.UsedRange.Nope", [] ]
+              "    Dim w As Worksheet\n    x = w.UsedRange.Nope", []
+              // Arguments given to a member without parameters go to its result's default member.
+              "    x = Things(1).Name & Things.Count", []
+              "    x = Things(1).Nope", [ "Method or data member not found", "Thing.Nope", 2 ]
+              "    Dim t As Items\n    x = t(1).Nope", [ "Method or data member not found", "Thing.Nope", 3 ]
+              "    Dim t As Items\n    x = t.Nope", [ "Method or data member not found", "Items.Nope", 3 ] ]
         for body, expected in cases do
             let got = one body
             if got <> expected then fail body expected got
