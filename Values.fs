@@ -105,6 +105,23 @@ type HostObject(typeName: string) =
         member this.CallNamed name args names = this.CallNamed name args names
         member this.Enumerate () = this.Enumerate ()
 
+/// A host object whose members have numbers, shared by every object of its type (a member table,
+/// `HostMembers.Table`). The engine resolves a name once per place in the code and type of object, and
+/// then reaches the member by its number: a loop over `Cells(r, c).Value` looks no name up after its
+/// first pass. A host object need not be one: the engine falls back to the names of IHostObject.
+///
+/// The ...ById members answer as GetMember / SetMember / CallMethod would for that member's name, or
+/// None / false to have the engine ask by name after all.
+[<AbstractClass>]
+type HostDispatch() =
+    /// The same object for all objects whose members have the same numbers (their type).
+    abstract DispatchType: obj
+    /// The number of a member, or -1 when it has none (the engine asks by name then).
+    abstract Resolve: name: string -> int
+    abstract GetById: id: int -> Value option
+    abstract SetById: id: int -> value: Value -> bool
+    abstract CallById: id: int -> args: Value array -> Value option
+
 /// A VB run-time error: Err.Number, Err.Description and Err.Source.
 type VbErrorInfo = {
     Number: int

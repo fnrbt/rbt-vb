@@ -72,27 +72,34 @@ type Dynamic<'T> = {
 }
 
 /// A type of object: its name (TypeName), its members, the default member (`obj(...)`, `obj = x`, the
-/// object read as a value) and, for a collection, its items (For Each).
+/// object read as a value) and, for a collection, its items (For Each). Its members are numbered (their
+/// place in the list), so the engine can reach them by number (HostDispatch).
 [<AllowNullLiteral>]
 type Table<'T>(typeName: string, members: Member<'T> list, ?defaultMember: string, ?items: 'T -> Value seq,
                ?dynamic: Dynamic<'T>, ?typeNameOf: 'T -> string) =
-    let index = Dictionary<string, Member<'T>>()
+    let numbered = List.toArray members
+    let index = Dictionary<string, int>()
     do
-        for m in members do
-            index.[m.Name.ToLowerInvariant()] <- m
+        numbered |> Array.iteri (fun i m -> index.[m.Name.ToLowerInvariant()] <- i)
     let defaultKey = defaultMember |> Option.map (fun name -> name.ToLowerInvariant())
 
     member _.TypeName = typeName
     /// The members, as the table names them (for an editor's completion, documentation, parity checks).
     member _.Names = members |> List.map (fun m -> m.Name)
-    member _.TryFind(name: string) : Member<'T> option =
+    /// The number of a member by name (any case; "" and _Default: the default member), or -1.
+    member _.Resolve(name: string) : int =
         let key =
             match name with
             | "" | "_Default" | "_default" -> (match defaultKey with Some key -> key | None -> "")
             | _ -> name.ToLowerInvariant()
         match index.TryGetValue key with
-        | true, m -> Some m
-        | _ -> None
+        | true, i -> i
+        | _ -> -1
+    member _.Member(id: int) : Member<'T> = numbered.[id]
+    member this.TryFind(name: string) : Member<'T> option =
+        match this.Resolve name with
+        | -1 -> None
+        | i -> Some numbered.[i]
     member _.Items = items
     member _.Dynamic = dynamic
     member _.TypeNameOf(state: 'T) = match typeNameOf with Some f -> f state | None -> typeName
@@ -112,40 +119,49 @@ type Table<'T>(typeName: string, members: Member<'T> list, ?defaultMember: strin
 
 /// An instance: its type's table and its state.
 and TableObject<'T>(table: Table<'T>, state: 'T) =
+    inherit HostDispatch()
     member _.Table = table
     member _.State = state
+
+    // (By number: what the member answers by itself; None / false when the name has to decide - a property
+    // with arguments, a member that cannot be read or written.)
+    override _.DispatchType = box table
+    override _.Resolve name = table.Resolve name
+    override _.GetById id =
+        match table.Member id with
+        | { Get = Some read } -> Some (read state)
+        | { Call = Some run } -> Some (run state [||])
+        | _ -> None
+    override _.SetById id value =
+        match table.Member id with
+        | { Set = Some write } -> write state value; true
+        | _ -> false
+    override _.CallById id args =
+        match table.Member id with
+        | { Call = Some run } -> Some (run state args)
+        | { Get = Some read } when args.Length = 0 -> Some (read state)
+        | _ -> None
+
     interface IHostObject with
         member _.TypeName = table.TypeNameOf state
-        member _.GetMember name =
-            match table.TryFind name with
-            | Some { Get = Some read } -> Some (read state)
-            | Some { Call = Some run } -> Some (run state [||])
-            | _ ->
-                match table.Dynamic |> Option.bind (fun d -> d.Read state name None) with
-                | Some value -> Some value
-                | None ->
-                    // (The engine reads an object as a value through "" and _Default: None lets it go on.)
-                    if name = "" || name = "_Default" || name = "Value" && not table.HasDefault then None
-                    else notSupported (table.TypeNameOf state) name
-        member _.SetMember name value =
-            match table.TryFind name with
-            | Some { Set = Some write } -> write state value; true
-            | _ ->
-                match table.Dynamic with
-                | Some d when d.Write state name value -> true
-                | _ -> if name = "" then false else notSupported (table.TypeNameOf state) name
-        member _.CallMethod name args =
-            match table.TryFind name with
-            | Some { Call = Some run } -> Some (run state args)
-            | Some { Get = Some read } when args.Length = 0 -> Some (read state)
-            // (A property given arguments: the engine applies them to what it reads.)
-            | Some { Get = Some _ } -> None
-            | _ ->
-                match table.Dynamic |> Option.bind (fun d -> d.Read state name (Some args)) with
-                | Some value -> Some value
-                | None ->
-                    if name = "" || name = "_Default" || name = "Item" then None
-                    else notSupported (table.TypeNameOf state) name
+        member this.GetMember name =
+            match table.Resolve name with
+            | -1 -> this.GetOther name
+            | id -> match this.GetById id with Some value -> Some value | None -> this.GetOther name
+        member this.SetMember name value =
+            match table.Resolve name with
+            | -1 -> this.SetOther name value
+            | id -> if this.SetById id value then true else this.SetOther name value
+        member this.CallMethod name args =
+            match table.Resolve name with
+            | -1 -> this.CallOther name args
+            | id ->
+                match table.Member id with
+                | { Call = Some run } -> Some (run state args)
+                | { Get = Some read } when args.Length = 0 -> Some (read state)
+                // (A property given arguments: the engine applies them to what it reads.)
+                | { Get = Some _ } -> None
+                | _ -> this.CallOther name args
         member this.CallNamed name args names =
             let self = this :> IHostObject
             if names |> Array.forall (fun n -> n = "") then self.CallMethod name args
@@ -168,3 +184,22 @@ and TableObject<'T>(table: Table<'T>, state: 'T) =
                     self.CallMethod name (slots.ToArray())
                 | _ -> self.CallMethod name args
         member _.Enumerate () = table.Items |> Option.map (fun items -> items state)
+
+    // A name the table does not answer: the type's dynamic members, else error 438.
+    member private _.GetOther(name: string) =
+        match table.Dynamic |> Option.bind (fun d -> d.Read state name None) with
+        | Some value -> Some value
+        | None ->
+            // (The engine reads an object as a value through "" and _Default: None lets it go on.)
+            if name = "" || name = "_Default" || name = "Value" && not table.HasDefault then None
+            else notSupported (table.TypeNameOf state) name
+    member private _.SetOther (name: string) (value: Value) =
+        match table.Dynamic with
+        | Some d when d.Write state name value -> true
+        | _ -> if name = "" then false else notSupported (table.TypeNameOf state) name
+    member private _.CallOther (name: string) (args: Value array) =
+        match table.Dynamic |> Option.bind (fun d -> d.Read state name (Some args)) with
+        | Some value -> Some value
+        | None ->
+            if name = "" || name = "_Default" || name = "Item" then None
+            else notSupported (table.TypeNameOf state) name

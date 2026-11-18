@@ -105,6 +105,12 @@ type VmState = {
     LowerNames: Dictionary<string, string>
     /// Nested runs (callNested) in progress; a yield waits for them.
     mutable NestedDepth: int
+    /// Members of host objects by place in the code (HostDispatch): the program they are for, and at each
+    /// instruction the type of object, the name and the member's number found there last.
+    mutable MemberCacheProgram: obj
+    mutable MemberCacheTypes: obj array
+    mutable MemberCacheNames: string array
+    mutable MemberCacheIds: int array
 }
 
 /// Raised by `Stop` to end the current slice.
@@ -300,6 +306,10 @@ let emptyStateWithHooks (hooks: RuntimeHooks) (constants: Value array) (program:
         Marks = Dictionary<obj, int>(HashIdentity.Reference)
         LowerNames = Dictionary<string, string>()
         NestedDepth = 0
+        MemberCacheProgram = null
+        MemberCacheTypes = [||]
+        MemberCacheNames = [||]
+        MemberCacheIds = [||]
     }
 
 let emptyState (constants: Value array) (program: BytecodeProgram) : VmState =
@@ -558,6 +568,26 @@ let private classCallable (classDef: ClassDef) (key: string) =
     | None -> Map.tryFind key classDef.PropertyGetters
 
 /// `receiver.name(args)` with the receiver and arguments on the stack.
+/// The number of a host object's member at this instruction: found by name the first time, or when the
+/// object is of another type than last time, then remembered (a loop looks no name up after its first pass).
+let private memberId (state: VmState) (d: HostDispatch) (name: string) =
+    if not (obj.ReferenceEquals(state.MemberCacheProgram, state.Program)) then
+        let n = state.Program.Code.Length
+        state.MemberCacheProgram <- box state.Program
+        state.MemberCacheTypes <- Array.create n null
+        state.MemberCacheNames <- Array.create n null
+        state.MemberCacheIds <- Array.create n -1
+    let pc = state.Pc
+    let kind = d.DispatchType
+    if pc < 0 || pc >= state.MemberCacheIds.Length then d.Resolve name
+    elif obj.ReferenceEquals(state.MemberCacheTypes.[pc], kind) && state.MemberCacheNames.[pc] = name then state.MemberCacheIds.[pc]
+    else
+        let id = d.Resolve name
+        state.MemberCacheTypes.[pc] <- kind
+        state.MemberCacheNames.[pc] <- name
+        state.MemberCacheIds.[pc] <- id
+        id
+
 let rec private callMethod (state: VmState) (name: string) (argCount: int) =
     if state.Sp < argCount + 1 then raiseVbErrorWith 51 "Stack underflow"
     let receiver = state.Stack.[state.Sp - argCount - 1]
@@ -604,7 +634,14 @@ let rec private callMethod (state: VmState) (name: string) (argCount: int) =
         for i in argCount - 1 .. -1 .. 0 do
             args.[i] <- ValueSemantics.dereference (pop state)
         ignore (pop state)
-        push state (hostCall hostObj name args)
+        let byNumber =
+            match box hostObj with
+            | :? HostDispatch as d ->
+                match memberId state d name with
+                | -1 -> None
+                | id -> d.CallById id args
+            | _ -> None
+        push state (match byNumber with Some value -> value | None -> hostCall hostObj name args)
         state.Pc <- state.Pc + 1
     | other -> objectError other
 
@@ -627,7 +664,15 @@ let private setMember (state: VmState) (obj: Value) (name: string) (value: Value
                 frame.DiscardResult <- true
             | None -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
     | VHostObject hostObj ->
-        if not (hostObj.SetMember name (ValueSemantics.dereference value)) then
+        let value = ValueSemantics.dereference value
+        let byNumber =
+            match box hostObj with
+            | :? HostDispatch as d ->
+                match memberId state d name with
+                | -1 -> false
+                | id -> d.SetById id value
+            | _ -> false
+        if not byNumber && not (hostObj.SetMember name value) then
             raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
         state.Pc <- state.Pc + 1
     | other -> objectError other
@@ -1344,12 +1389,24 @@ let executeOneInstruction (state: VmState) =
                         ignore (enterFunction state funcIdx obj (state.Pc + 1))
                     | _ -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
         | VHostObject hostObj ->
-            match hostObj.GetMember name with
-            | Some value -> push state value
-            | None ->
-                match hostObj.CallMethod name [||] with
-                | Some value -> push state value
-                | None -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
+            let byNumber =
+                match box hostObj with
+                | :? HostDispatch as d ->
+                    match memberId state d name with
+                    | -1 -> None
+                    | id -> d.GetById id
+                | _ -> None
+            let value =
+                match byNumber with
+                | Some value -> value
+                | None ->
+                    match hostObj.GetMember name with
+                    | Some value -> value
+                    | None ->
+                        match hostObj.CallMethod name [||] with
+                        | Some value -> value
+                        | None -> raiseVbErrorWith 438 (errorDescription 438 + ": " + name)
+            push state value
             state.Pc <- state.Pc + 1
         | other -> objectError other
 

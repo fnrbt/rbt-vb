@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.1 — 2026-11-18
+
+### Members of host objects by number
+
+- `HostDispatch`, an abstract class a host object can inherit: its members have numbers shared by every object of its type (`DispatchType`, `Resolve`, `GetById`, `SetById`, `CallById`). The engine finds a member's number by name the first time an instruction meets an object of that type, then reaches it by number: a loop over `Cells(r, c).Interior.Color` looks no name up after its first pass. An instruction that meets objects of another type finds the number again.
+- `HostMembers.Table` objects are `HostDispatch` objects (a member's number is its place in the table), so object models built from tables get this without a change.
+- Host objects that implement only `IHostObject` are asked by name, as before.
+
 ## 0.6.0 — 2026-11-18
 
 ### HostMembers: an object model as tables
