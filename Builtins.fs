@@ -735,7 +735,7 @@ let callBuiltin (hooks: RuntimeHooks) (defaultTextCompare: bool) (name: string) 
     | "now" -> VDate (nowSerial ())
     | "date" -> VDate (Math.Floor (nowSerial ()))
     | "time" -> VDate (let now = nowSerial () in now - Math.Floor now)
-    | "timer" -> single (Math.Round(DateTime.Now.TimeOfDay.TotalSeconds, 2))
+    | "timer" -> single DateTime.Now.TimeOfDay.TotalSeconds
     | "year" -> dateOrNull 0 (fun serial -> let y, _, _, _, _, _ = DateCore.components serial in VInteger y)
     | "month" -> dateOrNull 0 (fun serial -> let _, m, _, _, _, _ = DateCore.components serial in VInteger m)
     | "day" -> dateOrNull 0 (fun serial -> let _, _, day, _, _, _ = DateCore.components serial in VInteger day)

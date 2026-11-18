@@ -103,10 +103,15 @@ type VmState = {
     Marks: Dictionary<obj, int>
     /// Lowercased member names, so class-member lookups do not allocate.
     LowerNames: Dictionary<string, string>
+    /// Nested runs (callNested) in progress; a yield waits for them.
+    mutable NestedDepth: int
 }
 
 /// Raised by `Stop` to end the current slice.
 exception StopSignal
+
+/// Raised at a statement boundary after a host asked to end the slice.
+exception YieldSignal
 
 let valueToInt = ValueSemantics.toInteger
 let valueToDouble = ValueSemantics.toNumber
@@ -294,6 +299,7 @@ let emptyStateWithHooks (hooks: RuntimeHooks) (constants: Value array) (program:
         MarkEpoch = 0
         Marks = Dictionary<obj, int>(HashIdentity.Reference)
         LowerNames = Dictionary<string, string>()
+        NestedDepth = 0
     }
 
 let emptyState (constants: Value array) (program: BytecodeProgram) : VmState =
@@ -664,6 +670,39 @@ let private frameHoldsTerminable (state: VmState) (frame: StackFrame) =
     for value in frame.Locals do
         if not found && mayHoldTerminable state value then found <- true
     found
+
+/// Convert parameter slots to their declared types (CoerceParams), leaving
+/// references to the caller's variables alone.
+let private coerceParams (locals: Value array) (pairs: int array) =
+    let mutable k = 0
+    while k < pairs.Length do
+        let slot = pairs.[k]
+        let code = pairs.[k + 1]
+        match locals.[slot] with
+        | VRef _ | VFieldRef _ | VUndefined -> ()
+        | VLong _ when code = 2 -> ()
+        | VDouble _ when code = 4 -> ()
+        | VString _ when code = 6 -> ()
+        | VBoolean _ when code = 7 -> ()
+        | VInteger i when code = 1 && i >= -32768 && i <= 32767 -> ()
+        | VInteger i when code = 2 -> locals.[slot] <- VLong i
+        | value -> locals.[slot] <- ValueSemantics.coerceTo (enum<ValueSemantics.DeclaredType> code) value
+        k <- k + 2
+
+/// `Call`: a new frame with the arguments; typed parameters convert here
+/// rather than in a dispatched CoerceParams instruction.
+let private callProcedure (state: VmState) (funcIndex: int) (argCount: int) =
+    let funcDef = state.Program.Functions.[funcIndex]
+    pushFrameFor state (state.Pc + 1) funcDef.LocalsCount funcIndex
+    let frame = state.CallStack.[state.Csp - 1]
+    for i in argCount - 1 .. -1 .. 0 do
+        frame.Locals.[i] <- pop state
+    frame.StatementSp <- state.Sp
+    match state.Program.Code.[funcDef.StartPC].Opcode with
+    | CoerceParams pairs ->
+        coerceParams frame.Locals pairs
+        state.Pc <- funcDef.StartPC + 1
+    | _ -> state.Pc <- funcDef.StartPC
 
 let private executeCold (state: VmState) (instr: Instruction) =
     match instr.Opcode with
@@ -1080,6 +1119,10 @@ let private executeCold (state: VmState) (instr: Instruction) =
             else setMemberIndexed state target name indices value
         | _ -> raiseVbError 5
 
+    | CoerceParams pairs ->
+        coerceParams state.CallStack.[state.Csp - 1].Locals pairs
+        state.Pc <- state.Pc + 1
+
     | Halt ->
         state.Pc <- hostReturnAddress
     | _ -> raiseVbErrorWith 51 "Unknown opcode"
@@ -1089,6 +1132,8 @@ let executeOneInstruction (state: VmState) =
 
     match instr.Opcode with
     | Statement target ->
+        // A host call asked to end the Step slice (HostSignals.requestYield).
+        if HostSignals.yieldRequested && state.NestedDepth = 0 then raise YieldSignal
         let frame = state.CallStack.[state.Csp - 1]
         frame.StatementStart <- state.Pc
         frame.StatementEnd <- target
@@ -1267,23 +1312,6 @@ let executeOneInstruction (state: VmState) =
             | ArraySet _ -> objectError other
             | _ -> raiseVbError 13
 
-    | CoerceParams pairs ->
-        let locals = state.CallStack.[state.Csp - 1].Locals
-        let mutable k = 0
-        while k < pairs.Length do
-            let slot = pairs.[k]
-            let code = pairs.[k + 1]
-            match locals.[slot] with
-            | VRef _ | VFieldRef _ | VUndefined -> ()
-            | VLong _ when code = 2 -> ()
-            | VDouble _ when code = 4 -> ()
-            | VString _ when code = 6 -> ()
-            | VBoolean _ when code = 7 -> ()
-            | VInteger i when code = 1 && i >= -32768 && i <= 32767 -> ()
-            | value -> locals.[slot] <- ValueSemantics.coerceTo (enum<ValueSemantics.DeclaredType> code) value
-            k <- k + 2
-        state.Pc <- state.Pc + 1
-
     | Coerce code ->
         match state.Stack.[state.Sp - 1] with
         | VLong _ when code = 2 -> ()
@@ -1364,14 +1392,7 @@ let executeOneInstruction (state: VmState) =
             if value <> VNull && valueToBool value then state.Pc <- target
             else state.Pc <- state.Pc + 1
 
-    | Call (funcIndex, argCount) ->
-        let funcDef = state.Program.Functions.[funcIndex]
-        pushFrameFor state (state.Pc + 1) funcDef.LocalsCount funcIndex
-        let frame = state.CallStack.[state.Csp - 1]
-        for i in argCount - 1 .. -1 .. 0 do
-            frame.Locals.[i] <- pop state
-        frame.StatementSp <- state.Sp
-        state.Pc <- funcDef.StartPC
+    | Call (funcIndex, argCount) -> callProcedure state funcIndex argCount
 
     | Return ->
         let retVal = pop state
@@ -1584,6 +1605,7 @@ let callNested (state: VmState) (funcIdx: int) (receiver: Value option) (args: V
     let savedSp = state.Sp
     let funcDef = state.Program.Functions.[funcIdx]
     pushFrameFor state hostReturnAddress funcDef.LocalsCount funcIdx
+    state.NestedDepth <- state.NestedDepth + 1
     let frame = state.CallStack.[state.Csp - 1]
     let offset =
         match receiver with
@@ -1613,6 +1635,7 @@ let callNested (state: VmState) (funcIdx: int) (receiver: Value option) (args: V
             unwind ()
             raise (VbError { Number = e.Failure.Number; Description = e.Failure.Description; Source = e.Failure.Source })
     finally
+        state.NestedDepth <- state.NestedDepth - 1
         state.BaseCsp <- savedBase
         state.Pc <- savedPc
 
@@ -1725,7 +1748,7 @@ let runSlice (state: VmState) (budget: int) =
             let mutable executed = 0
             try
                 let code = state.Program.Code
-                while executed < chunk && state.Pc < code.Length && not HostSignals.yieldRequested do
+                while executed < chunk && state.Pc < code.Length do
                     executeOneInstruction state
                     executed <- executed + 1
             with
@@ -1733,14 +1756,13 @@ let runSlice (state: VmState) (budget: int) =
                 executed <- executed + 1
                 state.Paused <- true
                 remaining <- 0
+            | YieldSignal ->
+                HostSignals.yieldRequested <- false
+                remaining <- 0
             | ex ->
                 executed <- executed + 1
                 dispatchError state ex
             remaining <- remaining - executed
-            if HostSignals.yieldRequested then
-                // A host call (DoEvents, Application.Wait) asked to end the slice.
-                HostSignals.yieldRequested <- false
-                remaining <- 0
         state.Pc >= state.Program.Code.Length
     finally
         if hasDefaults then ValueSemantics.objectDefault <- previousDefault

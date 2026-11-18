@@ -493,6 +493,12 @@ let divideWith strict left right =
 /// `\` and `Mod`: the operands are rounded to whole numbers; the result is a
 /// Byte for two Bytes, an Integer for Integers (and Booleans), else a Long.
 let integerDivideWith strict modulus left right =
+    match left, right with
+    | VInteger a, VInteger b when b > 0 && b <= 32767 && a >= -32768 && a <= 32767 -> VInteger (if modulus then a % b else a / b)
+    | (VLong a | VInteger a), (VLong b | VInteger b) when b <> 0 && b <> -1 && (match left, right with VInteger _, VInteger _ -> false | _ -> true) ->
+        // Long operands (the common case): no overflow is possible.
+        VLong (if modulus then a % b else a / b)
+    | _ ->
     match scalar left, scalar right with
     | VNull, _ | _, VNull -> VNull
     | l, r ->
@@ -739,6 +745,9 @@ let toSingleValue value =
 let coerceTo (t: DeclaredType) (value: Value) =
     match t, value with
     | DeclaredType.Long, VLong _ -> value
+    | DeclaredType.Long, VInteger n -> VLong n
+    | DeclaredType.Long, VByte n -> VLong (int n)
+    | DeclaredType.Double, (VInteger n | VLong n) -> VDouble (float n)
     | DeclaredType.Integer, VInteger n when n >= -32768 && n <= 32767 -> value
     | DeclaredType.Double, VDouble _ -> value
     | DeclaredType.Single, VSingle _ -> value

@@ -613,9 +613,10 @@ let rec private staticTypeOf (ctx: CompileContext) expr =
         | SType.Variant -> SType.Variant
         | _ -> SType.Typed ValueSemantics.DeclaredType.Long
     | Binary (op, l, r) -> binarySType op (staticTypeOf ctx l) (staticTypeOf ctx r)
-    | Ast.Call (Identifier name, args) when containsSetName ctx.ArrayVars name && isVariableName ctx name && not args.IsEmpty ->
-        typeNameSType (declaredTypeName ctx name)
-    | Ast.Call (Identifier name, args) when not (isVariableName ctx name) ->
+    | Ast.Call (Identifier name, args) when
+        isVariableName ctx name && ((tryResolveFunction ctx name).IsNone || (isLocalVariable ctx name && ctx.ReturnSlotName <> Some name)) ->
+        if containsSetName ctx.ArrayVars name && not args.IsEmpty then typeNameSType (declaredTypeName ctx name) else SType.Variant
+    | Ast.Call (Identifier name, args) when not (isVariableName ctx name) || (tryResolveFunction ctx name).IsSome ->
         match tryResolveFunction ctx name with
         | Some (_, index) -> typeNameSType (match ctx.FunctionTypes.TryGetValue index with | true, t -> Some t | _ -> None)
         | None ->
