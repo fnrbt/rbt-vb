@@ -1,5 +1,125 @@
 # Changelog
 
+## 0.5.0 — 2026-11-18
+
+This release makes values carry VBA's numeric subtypes. The same macros were run in Microsoft Excel 2019 and in Rbt.Vb, and the differences in types, overflow, number formatting, Like, Erl and parsing are fixed. The comparison runs as a test (832 probes in 18 modules). It changes the `Value` type, so it is 0.5.0 rather than 0.4.1. See [docs/embedding.md](docs/embedding.md).
+
+### Integer, Long, Single and Byte
+
+- New `Value` cases: `VLong of int` (VarType 3), `VSingle of float32` (4) and `VByte of byte` (17). `VInteger` is now the 16-bit Integer. A `VInteger` outside its range still reads as a Long.
+- Literals have VBA's types: `5` and `5%` are Integers, `70000`, `5&` and `&HFFFF&` are Longs, `-32768` is a Long (the negation of the Long 32768), `1.5!` is a Single and `5@` a Currency (it was a Double).
+- Declared types hold their subtype: `Dim l As Long` is a `VLong`, `As Single` a `VSingle`, `As Byte` a `VByte`. Typed parameters convert values passed to them, including Optional defaults and arguments from `Session.Call`.
+- Built-ins return VBA's types:
+  - Long: `Len`, `LenB`, `InStr`, `InStrRev`, `UBound`, `LBound`, `CLng`, `VarType`, `RGB`, `QBColor`, `DateDiff` (a Double beyond the Long range), `Err.Number`, `Erl`, `MsgBox`, `Collection.Count`, `Dictionary.Count`, Enum members and the `vb*` constants.
+  - Integer: `CInt`, `Asc`, `AscW`, `Sgn`, `StrComp`, `Year`, `Month`, `Day`, `Weekday`, `Hour`, `Minute`, `Second`, `DatePart`.
+  - Single: `CSng`, `Rnd`, `Timer`. Byte: `CByte`, `AscB`.
+  - `Int`, `Fix`, `Abs` and `Round` keep the operand's type, so `Int(2.5!)` is a Single and `Abs(True)` an Integer.
+- Operators follow VBA's result types:
+  - `+ - *` take the most precise operand's type (Byte < Integer < Long < Single < Double < Currency; Boolean counts as Integer, a numeric String as Double, Empty takes the other operand's type). Single with Long is a Double, and Currency times a Single, Double or String is a Double.
+  - `/` is a Double, or a Single when a Single meets a Single, Integer, Byte or Boolean. `0 / 0` is error 6.
+  - `\` and `Mod` give a Byte for two Bytes, an Integer for Integers and Booleans, otherwise a Long.
+  - `Not`, `And`, `Or`, `Xor`, `Eqv` and `Imp` are bitwise unless both operands are Booleans: `3 Eqv 5` is -7, `Not CByte(1)` is 254. Null follows VBA's rules (`False Imp Null` is True).
+- Overflow:
+  - When both operands have declared types the operation raises error 6, as VBA does. These are literals, typed variables and functions, constants, Enum members, and the built-ins VBA declares with a type (`Len`, `InStr`, `UBound`, `CInt`, `CLng`, `Err.Number`, …). So `30000 + 30000`, `123456789 * 1000`, `Len(s) * 70000 * 70000`, `-i` for an Integer -32768 and a typed `For i = 32760 To 32767` loop overflow.
+  - With a Variant operand the result widens: Byte to Integer to Long to Double, Single to Double. `v + w` with two Variant Integers of 30000 is the Long 60000. 0.3.0 widened to Double in every case.
+  - Double overflow (`1E+308 * 10`) is error 6.
+- A Variant `For` counter takes the widest type of its start, end and step. `For k = 1 To n` with n a Long counts in Longs.
+- `Hex` and `Oct` use 16 bits for Integers, Bytes and Booleans, 32 for Longs and 64 for other types: `Hex(-1#)` is "FFFFFFFFFFFFFFFF".
+- A Single compares with a Double at Single precision: `CSng(0.1) = 0.1` is True.
+
+### Number text
+
+- Singles print with 7 significant digits: `CStr(Rnd)` is "0.9078093" and `CStr(CSng(123456789))` is "1.234568E+08".
+- Doubles and Singles are written in fixed notation while at most 15 (Singles: 7) digits follow the decimal point and the integer part has fewer than 15 (7) digits. So `CStr(0.000001)` is "0.000001", `CStr(1E-10)` is "0.0000000001", `CStr(1.5E-15)` is "1.5E-15" and `CStr(1 / 3 / 1000)` is "3.33333333333333E-04". 0.4.0 switched to scientific notation below 1E-4.
+- `Str` writes no 0 before the decimal point (`Str(0.5)` is " .5") and no space before a Date or Boolean.
+- `Format` of a Single rounds its 7 printed digits, so `Format(CSng(2.675), "0.00")` is "2.68".
+- `CCur` of a large Double or of decimal text keeps every digit (`CStr(CCur(922337203685477#))` is "922337203685477").
+- `IsNumeric` and `CDbl` read "$5", "5 $", "1,234", "(5)", "5-", "+5", "1D2", tabs, line breaks and non-breaking spaces as VBA does. ",5", "5%" and "1d" are not numbers.
+- `Val("&777")` is octal 511, and `Val("1e400")` is error 6.
+
+### Like
+
+- Bracket classes support ranges (`[a-c]`, `[1-3]`), `[!a-c]`, a literal `-` at the start or end, `[[]`, and `[]` (which matches nothing). `"b7" Like "[a-c]#"` is True.
+- Like is case-sensitive unless `Option Compare Text` is set, as in VBA. 0.4.0 ignored case.
+- A bracket without its closing `]` is error 93.
+
+### Erl and Resume
+
+- `Erl` is the line number reached in the procedure that handles the error. When the error comes from a called procedure, it is the line of the call. 0.4.0 used the failing procedure's line.
+- `Err.Clear` keeps `Erl`. `Resume`, `On Error` and leaving the handler reset it.
+- When a procedure's first numbered lines are declarations (`10 Dim a`), Excel reports the first numbered line for an error in the first executable numbered line, unless that line is the procedure's last numbered line. Rbt.Vb reports the same.
+- `Resume` in a single-line `If … Then Err.Raise 5` repeats `Err.Raise`, not the If. This was already so in the engine; a test now covers it.
+
+### Parsing and compiling
+
+- A module-level declaration after the first procedure is a compile error: "Only comments may appear after End Sub, End Function, or End Property". This applies to `Project.compile`; single scripts still allow it.
+- `Next c` after `For Each c`.
+- A local variable or parameter named like a procedure hides that procedure. For example, `Sub color()` with `Dim color` uses the variable.
+- `Debug.Print ("a") & ("b")`, `Debug.Print (1 = 1) & "!"` and `Foo (1), 2`: parentheses followed by more of the statement belong to the first argument.
+- An `Else` on the line after a single-line `If … Then x = 1` belongs to the enclosing block If.
+- `Const A = 15, B = 4` and `Private Const X As Long = 1, Y As Long = 2`.
+- `Set a(i) = obj` stores the object itself, also for host objects with a default member.
+- `Show p()` passes the array `p`.
+- The VBA library qualifiers resolve to built-ins: `VBA.Len`, `VBA.Left$`, `VBA.Strings.Mid`, `Strings.UCase`, `Math.Sqr`, `Interaction.MsgBox`, `DateTime.Now`, `Conversion.CLng`, `VBA.vbCrLf`.
+- `[A1]`, `[A1:B2]` and `[Name]` are `Evaluate("…")`. They compile to a host global or procedure named Evaluate, else to `Application.Evaluate`. `[A1] = 10` assigns through the result's default member.
+
+### Hosts
+
+- `Values.HostSignals.requestYield ()` ends the current `Session.Step` slice at the next statement boundary. Hosts call it from members like `DoEvents` or `Application.Wait`; the built-in `DoEvents` calls it too.
+- `Values.single` and `Values.toSingle` build Singles that are rounded the same way on .NET and under Fable.
+
+### Migrating from 0.4.0 (hosts)
+
+1. Return Longs as `VLong`: `Row`, `Column`, `Count`, `Index`, `ColorIndex`, `HorizontalAlignment` and other enumerations, `Err`-style numbers, and constants such as `xlUp`. A `VInteger` outside -32768..32767 still behaves as a Long, but `TypeName` of a small `VInteger` is "Integer".
+2. Return VBA's Double properties (`Interior.Color`, `Font.Color`, `Font.Size`, `ColumnWidth`, `RowHeight`) as `VDouble`.
+3. Matches over `Value` get incomplete-match warnings for `VLong`, `VSingle` and `VByte`. This matters most where values written by scripts are read, for example a cell store. With `| VInteger i -> ... | VDouble d -> ...`, a Long or Single written to a cell falls through to the fallback branch. Handle the new cases, or convert with `ValueSemantics.toNumber`, `toInteger` and `toString`.
+4. `Ast.Literal` has the new cases `Long`, `Single` and `Currency`. `Ast.Statement.IndexedAssignment` has a fourth field, `isSet`, and there is a new `StatementGroup` case. The parser flattens statement groups, so a parsed `Program` never contains one. `TokenKind` has `BracketText`.
+5. Behaviour changes that scripts may notice:
+   - Integer arithmetic on declared types overflows (error 6) where 0.4.0 widened.
+   - `CStr` of small Doubles is fixed-point.
+   - Like is case-sensitive.
+   - `TypeName` reports Long, Single and Byte.
+   - `Rnd` and `Timer` are Singles.
+   - Declarations after the first procedure no longer compile.
+
+### Bytecode
+
+Format version 5 adds:
+- constant tags for Long, Single and Byte;
+- the opcodes `AddChecked`, `SubtractChecked`, `MultiplyChecked`, `DivideChecked`, `IntDivideChecked`, `ModulusChecked` and `NegateChecked` for arithmetic on typed operands;
+- the opcode `CoerceParams` for typed parameters.
+
+Version 4 blobs are rejected.
+
+### Benchmarks
+
+Each figure is the minimum of 9 interleaved runs of the 0.4.0 CLI and the 0.5.0 CLI on the same scripts. The runs were pinned to two cores on a shared machine with load 6–8, and the noise is about ±10%.
+
+| Benchmark | 0.4.0 | 0.5.0 |
+| --- | ---: | ---: |
+| bench_matrix (50×50 multiply) | 0.204 s | 0.218 s |
+| bench_objects (500 particles × 100 steps) | 0.190 s | 0.189 s |
+| bench_recursive Fib(28) | 0.381 s | 0.412 s |
+| bench_recursive Ack(3,7) | 0.218 s | 0.222 s |
+| bench_recursive Hanoi(20) | 0.699 s | 0.709 s |
+| bench_recursive QuickSort 5000 | 0.061 s | 0.063 s |
+| bench_sieve (100000) | 0.218 s | 0.225 s |
+| bench_strings | 0.031 s | 0.028 s |
+
+Typed arithmetic chooses its opcode at compile time, so the VM does no extra work to tell typed operands from Variant ones. Long arithmetic and the `\`/`Mod` fast paths are on par with 0.4.0's Integer paths. Parameter conversion happens inside `Call` rather than as a dispatched instruction. Fib is up to 8% slower: that is the cost of converting the Long parameter on each call.
+
+### Verification
+
+- Native: `dotnet run --project tests/Rbt.Vb.Tests.fsproj -c Release` passes the public-API, value-semantics, 0.3.0, 0.4.0 and 0.5.0 suites (17 new 0.5.0 groups, among them the 832 Excel probes), persistence and the fixtures.
+- Fable 5.27.0 / Node: the same shared suites pass, including the Excel probes.
+
+### Not in this release
+
+- `Len` of a typed variable is the length of its text, not its size in bytes (`Len(s)` with `s As Single` is 4 in VBA).
+- Decimal is still a Double (`TypeName(CDec(1))` is "Double"), and LongLong is a Long or a Double.
+- Arrays do not keep their element type when passed through a Variant parameter: `arr(1) = 99` in `Sub F(arr)` does not convert to the caller's `As Long`.
+- `Abs` of a Variant Integer -32768 raises error 6. Excel raises it for typed operands; a Variant may widen instead.
+
 ## 0.4.0 — 2026-11-17
 
 This release adds the language features and built-ins that kept real Excel and Word macros from running: dates, Format, Collection and Dictionary, class events and interfaces, and the remaining statements. See [docs/embedding.md](docs/embedding.md) for the host-visible parts.

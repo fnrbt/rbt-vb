@@ -16,8 +16,26 @@ There are two levels:
 
 ## Values
 
-`Values.Value` is the VB Variant. Besides Integer/Long (`VInteger`), Double
-(`VDouble`), String, Boolean, Empty, Null, Nothing, arrays and objects it has:
+`Values.Value` is the VB Variant. A Variant's subtype is what `TypeName` and
+`VarType` report, and it decides how arithmetic overflows, so a host returns
+the subtype VBA would:
+
+| Case | VBA type | VarType | Typical host values |
+| --- | --- | ---: | --- |
+| `VInteger n` | Integer, −32768..32767 | 2 | Integer-typed properties (few in the Office object models) |
+| `VLong n` | Long, 32-bit | 3 | `Row`, `Column`, `Count`, `Index`, Excel constants (`xlUp`), `MsgBox` results |
+| `VSingle f` | Single (`float32`) | 4 | rarely; `Values.single x` rounds a Double |
+| `VDouble d` | Double | 5 | cell numbers, `Interior.Color`, `ColumnWidth` |
+| `VByte b` | Byte, 0..255 | 17 | rarely |
+| `VString`, `VBoolean`, `VEmpty`, `VNull`, `VNothing`, `VArray`, `VObject`, `VHostObject` | | | |
+
+A `VInteger` outside −32768..32767 is read as a Long (as in 0.4.0), but
+return `VLong` for Longs: `TypeName(ws.Cells(1, 1).Row)` is "Long" in VBA.
+Under Fable a `float32` is a JavaScript number; build Singles with
+`Values.single` (or `Values.toSingle`), which rounds to Single precision on
+both runtimes.
+
+It also has:
 
 - `VDate serial`, a **Date**: an OLE Automation date, the number of days
   since 1899-12-30 with the time of day as the fraction. These are Excel's
@@ -49,9 +67,31 @@ then get VBA's behaviour: `Range("A1") + 7` is a Date, `Format(Range("A1"),
 Text conversions use invariant **en-US** conventions: CStr and Format write
 "." decimals, "," thousands, "$" currency, `m/d/yyyy` dates and 12-hour
 times with AM/PM; CDate and date literals read m/d/y (and ISO yyyy-mm-dd)
-and English month and day names. Doubles print with 15 significant digits,
-as VBA does (`CStr(0.1 + 0.2)` is "0.3"). Decimal (`CDec`, `As Decimal`) is
-a Double.
+and English month and day names. Doubles print with 15 significant digits
+and Singles with 7, as VBA does (`CStr(0.1 + 0.2)` is "0.3", `CStr(Rnd)` is
+"0.9078093"); fixed notation is used while at most 15 (7) digits follow the
+decimal point (`CStr(0.000001)` is "0.000001", `CStr(1E-16)` "1E-16").
+Decimal (`CDec`, `As Decimal`) is a Double.
+
+### Arithmetic types
+
+Operators give their result the type of the most precise operand (Byte <
+Integer < Long < Single < Double < Currency; Boolean counts as Integer, a
+numeric String as Double), with VBA's exceptions (Single with Long is Double,
+`/` is Double or Single, `\` and `Mod` are Byte, Integer or Long). When the
+result does not fit:
+
+- if both operands have declared types – literals, typed variables and
+  functions, constants, Enum members and the built-ins VBA declares with a
+  type (`Len`, `InStr`, `UBound`, `CInt`, `CLng`, `Err.Number`, …) – the
+  operation raises error 6, so `30000 + 30000` and `Len(s) * 70000 * 70000`
+  overflow as in VBA;
+- otherwise (a Variant operand: a variable without `As`, a host property, an
+  array element) the result widens, Integer to Long to Double, as VBA's
+  Variant arithmetic does.
+
+A host value therefore never overflows by itself: `ws.Cells(r, c).Row * 100000`
+is a Variant expression and widens.
 
 ## Host objects
 
@@ -129,7 +169,7 @@ type CellRange(sheet: Sheet, address: string) =
 Pass constants as host globals whose value is a plain `Value`:
 
 ```fsharp
-let excelConstants = Map.ofList [ "xlUp", VInteger -4162; "xlCenter", VInteger -4108; ... ]
+let excelConstants = Map.ofList [ "xlUp", VLong -4162; "xlCenter", VLong -4108; ... ]
 ProjectOptions.vba |> ProjectOptions.withHostGlobals (Map.fold (fun m k v -> Map.add k v m) objects excelConstants)
 ```
 
@@ -138,6 +178,23 @@ any variable. Script code can assign to them, as it can to any VBA variable.
 The built-in `vb*` constants (`vbCrLf`, `vbYesNo`, `vbObjectError`, `vbString`, …)
 are compiled in. A host global or script declaration with the same name
 takes precedence.
+
+### Ending a Step slice from a host call
+
+A host member that should give the browser a chance to run – `DoEvents`,
+`Application.Wait`, a progress update – calls `Values.HostSignals.requestYield ()`.
+The VM finishes the current statement's host call and returns `Running` from
+`Session.Step` at the next statement boundary; the next `Step` continues.
+`RunToEnd` and the single-source entry points keep running. The built-in
+`DoEvents` requests a yield itself.
+
+### Bracket evaluation
+
+`[A1]`, `[A1:B2]` and `[Name]` compile to `Evaluate("A1")`: a host global or
+procedure named `Evaluate` when there is one, else `Application.Evaluate`. A
+host returns a Range object for references, so `[A1] = 10` assigns through its
+default member and `[A1].Value` reads it. Without either name `[A1]` raises
+error 424.
 
 ## Runtime hooks
 

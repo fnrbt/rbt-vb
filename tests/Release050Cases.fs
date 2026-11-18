@@ -203,7 +203,14 @@ let private groups : (string * (unit -> unit)) list = [
             printed [ ModuleSource.standard "M"
                         ("Function Retried()\n    Dim tries\n    On Error GoTo h\n    If tries < 3 Then Err.Raise 5\n    Retried = \"tries:\" & tries\n    Exit Function\n" +
                          "h:\n    tries = tries + 1\n    If tries < 5 Then Resume\n    Retried = \"looped \" & tries\nEnd Function\nSub Main()\n    Debug.Print Retried()\nEnd Sub\n") ] "Main"
-        if lines <> [ "looped 5" ] then fail "Resume" [ "looped 5" ] lines)
+        if lines <> [ "looped 5" ] then fail "Resume" [ "looped 5" ] lines
+        // With an unconditional Resume the If is not re-evaluated: VBA loops forever.
+        match Project.compile ProjectOptions.vba [ ModuleSource.standard "M" "Function Retried()\n    Dim tries\n    On Error GoTo h\n    If tries < 3 Then Err.Raise 5\n    Retried = tries\n    Exit Function\nh:\n    tries = tries + 1\n    Resume\nEnd Function\nSub Main()\n    Debug.Print Retried()\nEnd Sub\n" ] with
+        | Ok p ->
+            match Session.Create p with
+            | Ok s -> (match s.Run("Main", [], 200000) with Running -> () | other -> fail "endless Resume" Running other)
+            | Error f -> failwithf "%A" f
+        | Error e -> failwithf "%A" e)
 
     "A declaration after the first procedure is a compile error", (fun () ->
         let f = compileFailure [ ModuleSource.standard "M" "Sub Main()\nEnd Sub\nPrivate afterwards As Long\n" ]
