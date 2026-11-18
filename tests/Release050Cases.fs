@@ -281,6 +281,19 @@ let private groups : (string * (unit -> unit)) list = [
                 | Finished _ when s.TryGetGlobal "n" = Some (VLong 2) -> ()
                 | other -> fail "third slice" "Finished" other)
 
+    // 0.5.1: from the showcase macros.
+    "Rem comments, on their own line and after a colon", (fun () ->
+        let out = printed [ ModuleSource.standard "M" "Sub Main()\n    Dim r As Long\n    Rem Reset it: r = 5\n    r = 1 : Rem trailing\n    REM shouting\n    Debug.Print r\nEnd Sub\n" ] "Main"
+        if out <> [ " 1 " ] then fail "Rem" [ " 1 " ] out)
+
+    "a class module's Private Const is seen by its methods, per module", (fun () ->
+        let cls name value =
+            ModuleSource.classModule name (sprintf "Option Explicit\nPrivate mX As Long\nPrivate Const LIMIT As Integer = %d\nConst OTHER = \"o\"\n\nPublic Function Get_() As String\n    Get_ = LIMIT & OTHER\nEnd Function\n" value)
+        let out =
+            printed [ cls "C1" 18; cls "C2" 7
+                      ModuleSource.standard "M" "Option Explicit\nSub Main()\n    Dim a As New C1, b As New C2\n    Debug.Print a.Get_; b.Get_\nEnd Sub\n" ] "Main"
+        if out <> [ "18o7o" ] then fail "class Const" [ "18o7o" ] out)
+
 ]
 
 let runAll () =

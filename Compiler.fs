@@ -2141,11 +2141,22 @@ let private moduleTopLevels (m: CompileModule) =
     match m.Kind with
     | ClassModule ->
         // A class module's body is one class named after the module.
+        // Its constants are the module's own (always Private in a class), not fields of each instance.
+        let isConst = function
+            | TopLevelStatement (LocatedStmt (_, Declaration (_, Const _)))
+            | TopLevelStatement (Declaration (_, Const _)) -> true
+            | _ -> false
+        let privateConst = function
+            | TopLevelStatement (LocatedStmt (loc, Declaration (_, (Const _ as c)))) -> TopLevelStatement (LocatedStmt (loc, Declaration (Some Private, c)))
+            | TopLevelStatement (Declaration (_, (Const _ as c))) -> TopLevelStatement (Declaration (Some Private, c))
+            | other -> other
         let classMembers, rest =
-            m.Program.TopLevels |> List.partition (function
+            m.Program.TopLevels |> List.partition (fun t ->
+                match t with
+                | _ when isConst t -> false
                 | FunctionDef _ | TopLevelStatement _ | EventDecl _ | WithEventsDecl _ | ImplementsDecl _ -> true
                 | _ -> false)
-        rest @ [ ClassDecl (Some Public, m.Name, classMembers) ]
+        (rest |> List.map privateConst) @ [ ClassDecl (Some Public, m.Name, classMembers) ]
     | _ -> m.Program.TopLevels
 
 /// Fixed-size array fields (`Private items(10)`) are created by the class's

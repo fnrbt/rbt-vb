@@ -193,7 +193,11 @@ let tokenize (source: string) =
             precedingNewline <- false
         | c when isAlpha c ->
             let (lexeme, isKeyword, newState) = lexIdentifier state
-            if lexeme = "_" && not isKeyword then
+            if lexeme.ToLowerInvariant() = "rem" then
+                // `Rem text`: a comment, as `'`, to the end of the line.
+                state <- skipLineComment newState
+                precedingNewline <- true
+            elif lexeme = "_" && not isKeyword then
                 let hasLeadingSpace =
                     state.Position > 0 && (state.Source.[state.Position - 1] = ' ' || state.Source.[state.Position - 1] = '\t')
                 let afterMarker = newState.Position

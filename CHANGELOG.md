@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.1 — 2026-11-18
+
+Two gaps found by macros from the web:
+
+- `Rem` starts a comment, as `'` does, at the start of a line or after a `:`.
+- A class module's `Const` belongs to the module (Private, as VBA makes it), and the class's methods see it. Before, it was taken for an instance field and the method saw an undeclared name ("Variable not defined" under Option Explicit). Two class modules can each have a constant of the same name.
+
 ## 0.5.0 — 2026-11-18
 
 This release makes values carry VBA's numeric subtypes. The same macros were run in Microsoft Excel 2019 and in Rbt.Vb, and the differences in types, overflow, number formatting, Like, Erl and parsing are fixed. The comparison runs as a test (832 probes in 18 modules). It changes the `Value` type, so it is 0.5.0 rather than 0.4.1. See [docs/embedding.md](docs/embedding.md).
