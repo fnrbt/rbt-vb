@@ -373,14 +373,18 @@ type ProjectOptions = {
     /// Err.Source for engine errors.
     ProjectName: string
     Validate: bool
+    /// The host's types (its type libraries), for early binding: a member a declared type does not have
+    /// is a compile error, as VBA's. None: every member is found when it runs.
+    HostTypes: TypeCheck.HostTypes option
 }
 
 module ProjectOptions =
-    let vba = { Dialect = VBA; HostGlobals = Map.empty; Hooks = defaultHooks; ProjectName = "VBAProject"; Validate = true }
+    let vba = { Dialect = VBA; HostGlobals = Map.empty; Hooks = defaultHooks; ProjectName = "VBAProject"; Validate = true; HostTypes = None }
     let vbScript = { vba with Dialect = VBScript }
     let withHostGlobals globals (options: ProjectOptions) = { options with HostGlobals = globals }
     let withHooks hooks (options: ProjectOptions) = { options with Hooks = hooks }
     let withProjectName name (options: ProjectOptions) = { options with ProjectName = name }
+    let withHostTypes (types: TypeCheck.HostTypes) (options: ProjectOptions) = { options with HostTypes = Some types }
 
 type Project = {
     Options: ProjectOptions
@@ -574,6 +578,21 @@ module Project =
         if not errors.IsEmpty then Error errors
         else
             let programs = parsed |> List.map (fun (m, r) -> match r with Ok p -> m, p | Error _ -> failwith "unreachable")
+            // Early binding: members of declared types, before anything runs.
+            let typeProblems =
+                match options.HostTypes with
+                | Some host when options.Dialect = VBA ->
+                    let checkedModules =
+                        programs |> List.map (fun (m, p) ->
+                            ({ Name = m.Name; IsClass = (m.Kind = Class)
+                               MeType = (if m.Kind = Document then host.Globals |> Map.tryFind (m.Name.ToLowerInvariant()) else None)
+                               Program = p } : TypeCheck.CheckedModule))
+                    TypeCheck.check host checkedModules
+                    |> List.map (fun p ->
+                        { Kind = Compile; Number = 0; Description = p.Description; Source = options.ProjectName
+                          Line = p.Line; Column = 0; Procedure = p.Procedure; Module = p.Module; Detail = p.Detail })
+                | _ -> []
+            if not typeProblems.IsEmpty then Error typeProblems else
             match ProjectInternals.compilePrograms options programs with
             | Error failure -> Error [ failure ]
             | Ok (bytecode, _) ->

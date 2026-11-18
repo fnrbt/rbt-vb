@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.0 — 2026-11-18
+
+### Early binding (TypeCheck)
+
+A host can give its project the types of its object model (`ProjectOptions.withHostTypes`), as TSV made from its type libraries (`TypeCheck.Library.parse`; rbt-office's `tools/vba-parity/typelib.ps1` writes Excel's and Word's). Members of declared types (`Dim r As Range`, parameters, function results, `With`, typed globals such as `Range(...)`, document modules' `Me`, VBA classes) are then checked when the project compiles, as VBA's compiler checks them. The rules come from Microsoft Excel 2019 compiling the same cases:
+
+- A member a **non-extensible** interface does not have (Excel's Worksheet, Word's Range and most of Word's, a VBA class's private or missing member) is "Method or data member not found". An **extensible** interface (Excel's Range, Font, Application) may have members its library does not list: they are found when they run (error 438 then).
+- A known member called with more arguments than it has parameters is "Wrong number of arguments or invalid property assignment"; with a name it has no parameter of, "Named argument not found". A member without parameters that returns an object passes its arguments to that object's default member (`r.Cells(1, 1)`).
+- A property without Let written is "Wrong number of arguments or invalid property assignment", unless it returns an object (the value goes to its default member, `ws.UsedRange = 1`); one without Set given `Set` is "Invalid use of property".
+- Object, Variant and types no library describes are bound late, as before.
+
+The errors are compile failures (`VbFailure`, Kind Compile) with the member in `Detail`. `TypeCheck.Library` also carries the libraries' enum constants. `ProjectOptions` has a new field (`HostTypes`), so this is 0.8.0.
+
 ## 0.7.0 — 2026-11-18
 
 Late-bound calls on host objects raise what VB raises, as Microsoft Excel 2019 answers them (a case of rbt-office's VBA parity run). `VbErrorInfo`, `RuntimeFailure` and `VbFailure` have a new field, so this is 0.7.0.

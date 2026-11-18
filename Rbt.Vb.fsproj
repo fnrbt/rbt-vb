@@ -20,6 +20,7 @@
     <Compile Include="Bytecode.fs" />
     <Compile Include="BytecodeIO.fs" />
     <Compile Include="Compiler.fs" />
+    <Compile Include="TypeCheck.fs" />
     <Compile Include="StackVm.fs" />
     <Compile Include="FsVb.fs" />
   </ItemGroup>

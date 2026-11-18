@@ -143,6 +143,66 @@ let private groups : (string * (unit -> unit)) list = [
         // (Three places in the code name X: the read in the loop, the write, the print.)
         if c.Resolved > 3 then fail "lookups" "at most 3" c.Resolved)
 
+    // Early binding (TypeCheck): a library shaped as Excel's.
+    "early binding: members of declared types are checked when the project compiles", (fun () ->
+        let tsv =
+            String.concat "\n"
+                [ "member\tRange\tValue\tget\tRangeValueDataType?\tVariant"
+                  "member\tRange\tValue\tlet\tRangeValueDataType?\t"
+                  "member\tRange\tRow\tget\t\tLong"
+                  "member\tRange\tOffset\tget\tRowOffset?;ColumnOffset?\tRange"
+                  "member\tRange\tFont\tget\t\tFont"
+                  "member\tRange\tCells\tget\t\tRange"
+                  "member\tRange\t_Default\tget\tRowIndex?;ColumnIndex?\tVariant"
+                  "member\tFont\tBold\tget\t\tVariant"
+                  "member\tFont\tBold\tlet\t\t"
+                  "member\t_Global\tRange\tget\tCell1;Cell2?\tRange"
+                  "member\t_Global\tActiveSheet\tget\t\tObject"
+                  "member\t_Worksheet\tUsedRange\tget\t\tRange"
+                  "coclass\tWorksheet\t_Worksheet"
+                  "interface\tRange\textensible"
+                  "interface\tFont\textensible"
+                  "interface\t_Worksheet\tnonextensible"
+                  "interface\t_Global\tnonextensible"
+                  "enum\tXlDirection\txlUp\t-4162" ]
+        let library = TypeCheck.Library.parse tsv
+        if library.Constants <> [ "xlUp", VLong -4162 ] then fail "constants" [ "xlUp", VLong -4162 ] library.Constants
+        let host : TypeCheck.HostTypes = { Library = library; GlobalInterface = Some "_Global"; Globals = Map.ofList [ "sheet1", "Worksheet" ] }
+        let options = ProjectOptions.vba |> ProjectOptions.withHostTypes host
+        let problems (modules: ModuleSource list) =
+            match Project.compile options modules with
+            | Ok _ -> []
+            | Error failures -> failures |> List.map (fun f -> f.Description, f.Detail, f.Line)
+        let one body = problems [ ModuleSource.standard "M" ("Sub Main()\n" + body + "\nEnd Sub\n") ]
+        // (As Excel 2019 compiled the same: tests/vba-parity/compile-cases in rbt-office.)
+        let cases =
+            [ "    Dim r As Range\n    r.Vlaue = 1", []
+              "    Dim r As Object\n    r.Vlaue = 1", []
+              "    Dim r\n    x = r.Vlaue", []
+              "    x = Range(\"A1\").Nope", []
+              "    x = ActiveSheet.Nope", []
+              "    Dim r As Excel.Range\n    r.Font.Bolt = True", []
+              "    Dim r As Range\n    r.Row = 5", [ "Wrong number of arguments or invalid property assignment", "Range.Row", 3 ]
+              "    Dim w As Worksheet\n    w.UsedRange = 1", []
+              "    Dim w As Worksheet\n    Set w.UsedRange = Nothing", [ "Invalid use of property", "_Worksheet.UsedRange", 3 ]
+              "    Dim r As Range\n    x = r.Row(1)", [ "Wrong number of arguments or invalid property assignment", "Range.Row", 3 ]
+              "    Dim r As Range\n    x = r.Offset(1, 2, 3)", [ "Wrong number of arguments or invalid property assignment", "Range.Offset", 3 ]
+              "    Dim r As Range\n    x = r.Offset(Bogus:=1)", [ "Named argument not found", "Range.Offset Bogus", 3 ]
+              "    Dim r As Range\n    x = r.Offset(ColumnOffset:=1).Value + r.Cells(1, 1).Value", []
+              "    Dim r As Range\n    With r\n        .Nope = 1\n    End With", []
+              "    x = Sheet1.UsedRange.Nope", []
+              "    Dim a(3) As Range\n    x = a(1).Nope", []
+              "    Dim w As Worksheet\n    x = w.Nope", [ "Method or data member not found", "_Worksheet.Nope", 3 ]
+              "    Dim w As Worksheet\n    x = w.UsedRange.Nope", [] ]
+        for body, expected in cases do
+            let got = one body
+            if got <> expected then fail body expected got
+        // VBA classes are types; a function's result is typed.
+        let cls = ModuleSource.classModule "Class1" "Public Sub Pub()\nEnd Sub\nPrivate Sub Hidden()\nEnd Sub\n"
+        let got = problems [ cls; ModuleSource.standard "M" "Function F() As Range\nEnd Function\nSub Main()\n    Dim c As Class1\n    c.Pub\n    c.Hidden\n    x = F().Nope\nEnd Sub\n" ]
+        let expected = [ "Method or data member not found", "Class1.Hidden", 6 ]
+        if got <> expected then fail "classes and functions" expected got)
+
     "TryState finds the state of the table's own objects", (fun () ->
         let b = { Left = 1.0; Text = "a"; Items = ResizeArray() }
         match boxType.TryState (boxType.Wrap b) with
