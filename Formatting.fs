@@ -289,8 +289,8 @@ let private tokenizeDate (section: string) =
     for k in 0 .. tokens.Length - 1 do
         match tokens.[k] with
         | DT ("m" | "mm" as m) ->
-            let previous = [ k - 1 .. -1 .. 0 ] |> List.tryFind (fun j -> isDateTimeToken tokens.[j]) |> Option.map (fun j -> tokens.[j])
-            let next = [ k + 1 .. tokens.Length - 1 ] |> List.tryFind (fun j -> isDateTimeToken tokens.[j]) |> Option.map (fun j -> tokens.[j])
+            let previous = tokens.[.. k - 1] |> Array.tryFindBack isDateTimeToken
+            let next = tokens.[k + 1 ..] |> Array.tryFind isDateTimeToken
             if (previous |> Option.exists isHour) || (next |> Option.exists isSecond) then
                 tokens.[k] <- DT (if m = "m" then "n" else "nn")
         | _ -> ()

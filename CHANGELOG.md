@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.0 — 2026-11-18
+
+- Faster under Fable (rbt-office's browser runs) and a little on .NET, with the same results: the hot paths (the VM's dispatch, operators, array subscripts, calls) follow the idioms in `Portable.fs`, which compile to plain code on both backends: countdown loops are `downto` (a stepped range is an enumerator under Fable 4), Integer and Long arithmetic and subscripts stay in 32 bits with exact overflow tests (`int64` is a BigInt in JavaScript; a wider intermediate is a `Wide`, a Double), the VM's own arrays are read and written without Fable's checked `item`/`setItem` (`Portable.at`/`setAt`), shared `VEmpty`/Booleans (`Values.Shared`), and rare cases out of the inline helpers. `tests/bench` (7 programs, on .NET and under Fable): median sums under Fable 4.28 about 3.3x faster, Fable 5.27 about 2.8x, .NET about 1.2x.
+- The package depends on Fable.Core 4.3.0 (for `Emit`; unused on .NET), as Rbt.Markdown does.
+
 ## 0.8.3 — 2026-11-18
 
 - A variable declared As a class starts as Nothing, as in VBA: the project's own classes, VBA's (Collection, Dictionary ...) and, with `ProjectOptions.withHostTypes`, the host's (Range, Shape, Document ...), for locals, module variables, class fields and array elements. It started as Empty, so `If s Is Nothing Then` after a failed `Set s = Shapes("x")` under On Error Resume Next was False. A variable As an enum (the project's, or the host's: XlDirection) starts as a Long 0. Unknown type names still start as Empty. (`Compiler.compileModulesWith` takes the host's object and enum type names.)

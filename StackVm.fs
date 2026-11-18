@@ -2,6 +2,8 @@ module Rbt.Vb.StackVm
 
 open Bytecode
 open Values
+open Values.Shared
+open Portable
 open System.Collections.Generic
 
 let private equalsIgnoreCase (left: string) (right: string) =
@@ -317,42 +319,58 @@ let emptyStateWithHooks (hooks: RuntimeHooks) (constants: Value array) (program:
 let emptyState (constants: Value array) (program: BytecodeProgram) : VmState =
     emptyStateWithHooks Builtins.consoleHooks constants program
 
+/// Double the value stack (push's rare case, kept out of line).
+let growStack (state: VmState) =
+    if state.Sp >= 1048576 then raiseVbError 28
+    let grown = Array.create (state.Stack.Length * 2) vEmpty
+    System.Array.Copy(state.Stack, grown, state.Stack.Length)
+    state.Stack <- grown
+
+let stackUnderflow () : 'a = raiseVbErrorWith 51 "Stack underflow"
+
 let inline push (state: VmState) (value: Value) =
-    if state.Sp >= state.Stack.Length then
-        if state.Sp >= 1048576 then raiseVbError 28
-        let grown = Array.create (state.Stack.Length * 2) VEmpty
-        System.Array.Copy(state.Stack, grown, state.Stack.Length)
-        state.Stack <- grown
-    state.Stack.[state.Sp] <- value
+    if state.Sp >= state.Stack.Length then growStack state
+    setAt state.Stack state.Sp value
     state.Sp <- state.Sp + 1
 
 let inline pop (state: VmState) : Value =
-    if state.Sp <= 0 then raiseVbErrorWith 51 "Stack underflow"
+    if state.Sp <= 0 then stackUnderflow ()
     state.Sp <- state.Sp - 1
-    let value = state.Stack.[state.Sp]
-    state.Stack.[state.Sp] <- VEmpty
+    let value = at state.Stack state.Sp
+    setAt state.Stack state.Sp vEmpty
     value
 
 let inline peek (state: VmState) : Value =
-    if state.Sp <= 0 then raiseVbErrorWith 51 "Stack underflow"
-    state.Stack.[state.Sp - 1]
+    if state.Sp <= 0 then stackUnderflow ()
+    at state.Stack (state.Sp - 1)
 
-let inline pushFrameFor (state: VmState) (returnAddress: int) (localsCount: int) (functionIndex: int) =
-    if state.Csp >= state.CallStack.Length then
-        if state.Csp >= 4096 then raiseVbError 28
-        let grown = Array.zeroCreate (state.CallStack.Length * 2)
-        System.Array.Copy(state.CallStack, grown, state.CallStack.Length)
-        state.CallStack <- grown
+/// Pop everything above `sp` (which must be <= Sp).
+let inline dropTo (state: VmState) (sp: int) =
+    for k in sp .. state.Sp - 1 do setAt state.Stack k vEmpty
+    state.Sp <- sp
+
+/// The frame of the running procedure (there is always one while code runs).
+let inline currentFrame (state: VmState) = at state.CallStack (state.Csp - 1)
+
+/// Double the call stack (pushFrameFor's rare case).
+let growCallStack (state: VmState) =
+    if state.Csp >= 4096 then raiseVbError 28
+    let grown = Array.zeroCreate (state.CallStack.Length * 2)
+    System.Array.Copy(state.CallStack, grown, state.CallStack.Length)
+    state.CallStack <- grown
+
+let pushFrameFor (state: VmState) (returnAddress: int) (localsCount: int) (functionIndex: int) =
+    if state.Csp >= state.CallStack.Length then growCallStack state
     let locals =
         if functionIndex >= 0 then
-            let template = state.Program.Functions.[functionIndex].InitialLocals
+            let template = (at state.Program.Functions functionIndex).InitialLocals
             if template.Length > 0 then
                 let locals = Array.zeroCreate template.Length
                 Array.blit template 0 locals 0 template.Length
                 locals
-            else Array.create (max localsCount 1) VEmpty
-        else Array.create (max localsCount 1) VEmpty
-    state.CallStack.[state.Csp] <- newFrameWith returnAddress locals state.Sp state.GoSubSp functionIndex
+            else Array.create (max localsCount 1) vEmpty
+        else Array.create (max localsCount 1) vEmpty
+    setAt state.CallStack state.Csp (newFrameWith returnAddress locals state.Sp state.GoSubSp functionIndex)
     state.Csp <- state.Csp + 1
 
 let inline pushFrame (state: VmState) (returnAddress: int) (localsCount: int) =
@@ -361,8 +379,8 @@ let inline pushFrame (state: VmState) (returnAddress: int) (localsCount: int) =
 let inline popFrame (state: VmState) : StackFrame =
     if state.Csp <= 0 then raiseVbErrorWith 51 "Call stack underflow"
     state.Csp <- state.Csp - 1
-    let frame = state.CallStack.[state.Csp]
-    state.CallStack.[state.Csp] <- Unchecked.defaultof<StackFrame>
+    let frame = at state.CallStack state.Csp
+    setAt state.CallStack state.Csp Unchecked.defaultof<StackFrame>
     state.GoSubSp <- frame.GoSubBase
     frame
 
@@ -422,13 +440,19 @@ let private objectError value : 'a =
     | VEmpty | VNothing -> raiseVbError 91
     | _ -> raiseVbError 424
 
+/// The 0-based position of subscript `value` in a dimension (lower bound
+/// `lower`, `length` elements), or error 9. `lower + length - 1` is the upper
+/// bound, an Int32, so nothing here leaves 32 bits.
+let inline private boundedIndex (value: Value) (lower: int) (length: int) =
+    let index = match value with VInteger n | VLong n -> n | other -> valueToInt other
+    if index < lower || index > lower + (length - 1) then raiseVbError 9
+    index - lower
+
 let private indexArray (a: VBArray) (args: Value array) =
     if args.Length <> a.Lengths.Length then raiseVbError 9
     let mutable offset = 0
     for i in 0 .. args.Length - 1 do
-        let index = int64 (valueToInt args.[i]) - int64 a.LowerBounds.[i]
-        if index < 0L || index >= int64 a.Lengths.[i] then raiseVbError 9
-        offset <- offset * a.Lengths.[i] + int index
+        offset <- offset * at a.Lengths i + boundedIndex (at args i) (at a.LowerBounds i) (at a.Lengths i)
     offset
 
 let private hostArgs (args: Value array) =
@@ -603,24 +627,25 @@ let rec private callMethod (state: VmState) (name: string) (argCount: int) =
             let funcDef = state.Program.Functions.[funcIdx]
             if argCount > funcDef.ParamsCount then raiseVbError 450
             pushFrameFor state (state.Pc + 1) funcDef.LocalsCount funcIdx
-            let frame = state.CallStack.[state.Csp - 1]
-            for i in argCount - 1 .. -1 .. 0 do
-                frame.Locals.[i + 1] <-
+            let frame = currentFrame state
+            // (argCount <= ParamsCount < LocalsCount.)
+            for i = argCount - 1 downto 0 do
+                setAt frame.Locals (i + 1) (
                     match pop state with
-                    | VRef (cells, index) when not funcDef.ByRefParams.[i] -> cells.[index]
-                    | VFieldRef (obj, field) when not funcDef.ByRefParams.[i] -> obj.Fields.[field]
-                    | value -> value
+                    | VRef (cells, index) when not (at funcDef.ByRefParams i) -> at cells index
+                    | VFieldRef (obj, field) when not (at funcDef.ByRefParams i) -> obj.Fields.[field]
+                    | value -> value)
             ignore (pop state)
-            frame.Locals.[0] <- receiver
+            setAt frame.Locals 0 receiver
             frame.StatementSp <- state.Sp
             for i in argCount .. funcDef.ParamsCount - 1 do
-                frame.Locals.[i + 1] <- VUndefined
+                setAt frame.Locals (i + 1) vUndefined
             state.Pc <- funcDef.StartPC
         | None ->
             match vbObj.Fields.TryGetValue key with
             | true, field ->
                 let args = Array.zeroCreate argCount
-                for i in argCount - 1 .. -1 .. 0 do args.[i] <- ValueSemantics.dereference (pop state)
+                for i = argCount - 1 downto 0 do args.[i] <- ValueSemantics.dereference (pop state)
                 ignore (pop state)
                 match field with
                 | VObject inner when argCount > 0 && (classOf state inner).DefaultMember <> "" ->
@@ -634,7 +659,7 @@ let rec private callMethod (state: VmState) (name: string) (argCount: int) =
             | false, _ -> raiseVbErrorAbout 438 name
     | VHostObject hostObj ->
         let args = Array.zeroCreate argCount
-        for i in argCount - 1 .. -1 .. 0 do
+        for i = argCount - 1 downto 0 do
             args.[i] <- ValueSemantics.dereference (pop state)
         ignore (pop state)
         let byNumber =
@@ -724,9 +749,9 @@ let private frameHoldsTerminable (state: VmState) (frame: StackFrame) =
 let private coerceParams (locals: Value array) (pairs: int array) =
     let mutable k = 0
     while k < pairs.Length do
-        let slot = pairs.[k]
-        let code = pairs.[k + 1]
-        match locals.[slot] with
+        let slot = at pairs k
+        let code = at pairs (k + 1)
+        match at locals slot with
         | VRef _ | VFieldRef _ | VUndefined -> ()
         | VLong _ when code = 2 -> ()
         | VDouble _ when code = 4 -> ()
@@ -740,13 +765,14 @@ let private coerceParams (locals: Value array) (pairs: int array) =
 /// `Call`: a new frame with the arguments; typed parameters convert here
 /// rather than in a dispatched CoerceParams instruction.
 let private callProcedure (state: VmState) (funcIndex: int) (argCount: int) =
-    let funcDef = state.Program.Functions.[funcIndex]
+    let funcDef = at state.Program.Functions funcIndex
     pushFrameFor state (state.Pc + 1) funcDef.LocalsCount funcIndex
-    let frame = state.CallStack.[state.Csp - 1]
-    for i in argCount - 1 .. -1 .. 0 do
-        frame.Locals.[i] <- pop state
+    let frame = currentFrame state
+    // (Validated: argCount <= ParamsCount < LocalsCount.)
+    for i = argCount - 1 downto 0 do
+        setAt frame.Locals i (pop state)
     frame.StatementSp <- state.Sp
-    match state.Program.Code.[funcDef.StartPC].Opcode with
+    match (at state.Program.Code funcDef.StartPC).Opcode with
     | CoerceParams pairs ->
         coerceParams frame.Locals pairs
         state.Pc <- funcDef.StartPC + 1
@@ -810,19 +836,19 @@ let private executeCold (state: VmState) (instr: Instruction) =
     | (ArrayNew rank | ReDimPreserve rank) as opcode ->
         let bounds = Array.zeroCreate rank
         let lengths = Array.zeroCreate rank
-        for i in rank - 1 .. -1 .. 0 do
+        for i = rank - 1 downto 0 do
             let hi = valueToInt (pop state)
             let lo = valueToInt (pop state)
-            let length = int64 hi - int64 lo + 1L
-            if length < 0L then raiseVbError 9
-            if length > 16777216L then raiseVbError 7
+            let length = wide hi - wide lo + 1.0
+            if length < 0.0 then raiseVbError 9
+            if length > 16777216.0 then raiseVbError 7
             bounds.[i] <- lo
             lengths.[i] <- int length
-        let mutable count = 1L
+        let mutable count = 1.0
         for length in lengths do
-            count <- count * int64 length
-            if count > 16777216L then raiseVbError 7
-        let data = Array.create (int count) VEmpty
+            count <- count * wide length
+            if count > 16777216.0 then raiseVbError 7
+        let data = Array.create (int count) vEmpty
         match opcode with
         | ReDimPreserve _ ->
             match pop state with
@@ -866,7 +892,7 @@ let private executeCold (state: VmState) (instr: Instruction) =
         | VArray a ->
             let fill = state.Constants.[constIdx]
             for i in 0 .. a.Data.Length - 1 do
-                if a.Data.[i] = VEmpty then a.Data.[i] <- fill
+                match at a.Data i with VEmpty -> setAt a.Data i fill | _ -> ()
         | _ -> ()
         state.Pc <- state.Pc + 1
 
@@ -874,7 +900,7 @@ let private executeCold (state: VmState) (instr: Instruction) =
         match peek state with
         | VArray a ->
             for i in 0 .. a.Data.Length - 1 do
-                if a.Data.[i] = VEmpty then a.Data.[i] <- newInstance state classIdx
+                match at a.Data i with VEmpty -> setAt a.Data i (newInstance state classIdx) | _ -> ()
         | _ -> ()
         state.Pc <- state.Pc + 1
 
@@ -908,7 +934,7 @@ let private executeCold (state: VmState) (instr: Instruction) =
     | SetMemberIndexed (name, argCount) ->
         let value = pop state
         let args = Array.zeroCreate argCount
-        for i in argCount - 1 .. -1 .. 0 do args.[i] <- pop state
+        for i = argCount - 1 downto 0 do args.[i] <- pop state
         let receiver = pop state
         setMemberIndexed state receiver name args value
 
@@ -932,7 +958,7 @@ let private executeCold (state: VmState) (instr: Instruction) =
     | CallMethodNamed (name, names) ->
         let argCount = names.Length
         let args = Array.zeroCreate argCount
-        for i in argCount - 1 .. -1 .. 0 do args.[i] <- pop state
+        for i = argCount - 1 downto 0 do args.[i] <- pop state
         let receiver = pop state
         match receiver with
         | VObject vbObj ->
@@ -1101,7 +1127,7 @@ let private executeCold (state: VmState) (instr: Instruction) =
 
     | CallHandler argCount ->
         let args = Array.zeroCreate argCount
-        for i in argCount - 1 .. -1 .. 0 do args.[i] <- pop state
+        for i = argCount - 1 downto 0 do args.[i] <- pop state
         match pop state with
         | VArray { Data = [| VInteger funcIdx; sink |] } ->
             let funcDef = state.Program.Functions.[funcIdx]
@@ -1148,7 +1174,7 @@ let private executeCold (state: VmState) (instr: Instruction) =
 
     | CallByNameOp argCount ->
         let args = Array.zeroCreate argCount
-        for i in argCount - 1 .. -1 .. 0 do args.[i] <- ValueSemantics.dereference (pop state)
+        for i = argCount - 1 downto 0 do args.[i] <- ValueSemantics.dereference (pop state)
         let callType = valueToInt (pop state)
         let name = valueToString (pop state)
         let target = ValueSemantics.dereference (pop state)
@@ -1185,75 +1211,100 @@ let private executeCold (state: VmState) (instr: Instruction) =
         state.Pc <- hostReturnAddress
     | _ -> raiseVbErrorWith 51 "Unknown opcode"
 
+/// ArrayGet / ArraySet / MakeRefArray on something other than an array: a
+/// host object's or class's default member (kept out of the dispatch loop).
+let private indexNonArray (state: VmState) (opcode: Opcode) (rank: int) (value: Value) =
+    let indices = Array.zeroCreate rank
+    for i = rank - 1 downto 0 do setAt indices i (pop state)
+    match pop state with
+    | VHostObject hostObj ->
+        match opcode with
+        | ArraySet _ -> hostIndexedAssign hostObj "" (hostArgs indices) value
+        | _ -> push state (hostDefaultCall hostObj (hostArgs indices))
+        state.Pc <- state.Pc + 1
+    | VObject o as target ->
+        match opcode with
+        | ArraySet _ -> indexedAssign state target (hostArgs indices) value
+        | _ ->
+            let dm = (classOf state o).DefaultMember
+            if dm = "" then raiseVbError 438
+            push state target
+            for index in indices do push state (ValueSemantics.dereference index)
+            callMethod state dm rank
+    | other ->
+        match opcode with
+        | ArraySet _ -> objectError other
+        | _ -> raiseVbError 13
+
 let executeOneInstruction (state: VmState) =
-    let instr = state.Program.Code.[state.Pc]
+    let instr = at state.Program.Code state.Pc
 
     match instr.Opcode with
     | Statement target ->
         // A host call asked to end the Step slice (HostSignals.requestYield).
         if HostSignals.yieldRequested && state.NestedDepth = 0 then raise YieldSignal
-        let frame = state.CallStack.[state.Csp - 1]
+        let frame = currentFrame state
         frame.StatementStart <- state.Pc
         frame.StatementEnd <- target
         frame.StatementSp <- state.Sp
         state.Pc <- state.Pc + 1
 
     | LoadConst idx ->
-        push state state.Constants.[idx]
+        push state (at state.Constants idx)
         state.Pc <- state.Pc + 1
 
     | LoadEmpty ->
-        push state VEmpty
+        push state vEmpty
         state.Pc <- state.Pc + 1
 
     | LoadTrue ->
-        push state (VBoolean true)
+        push state vTrue
         state.Pc <- state.Pc + 1
 
     | LoadFalse ->
-        push state (VBoolean false)
+        push state vFalse
         state.Pc <- state.Pc + 1
 
     | LoadLocal slot ->
-        let frame = state.CallStack.[state.Csp - 1]
-        match frame.Locals.[slot] with
-        | VRef (arr, idx) -> push state arr.[idx]  // deref ByRef
+        let frame = currentFrame state
+        match at frame.Locals slot with
+        | VRef (arr, idx) -> push state (at arr idx)  // deref ByRef
         | VFieldRef (obj, name) -> push state obj.Fields.[name]
         | v -> push state v
         state.Pc <- state.Pc + 1
 
     | StoreLocal slot ->
         let value = pop state
-        let frame = state.CallStack.[state.Csp - 1]
-        match frame.Locals.[slot] with
-        | VRef (arr, idx) -> arr.[idx] <- value  // write-through ByRef
+        let frame = currentFrame state
+        match at frame.Locals slot with
+        | VRef (arr, idx) -> setAt arr idx value  // write-through ByRef
         | VFieldRef (obj, name) -> obj.Fields.[name] <- value
-        | _ -> frame.Locals.[slot] <- value
+        | _ -> setAt frame.Locals slot value
         state.Pc <- state.Pc + 1
 
     | LetLocal slot ->
         let value = pop state
-        let frame = state.CallStack.[state.Csp - 1]
-        match frame.Locals.[slot] with
+        let frame = currentFrame state
+        match at frame.Locals slot with
         | VRef (arr, idx) ->
-            match arr.[idx] with
-            | (VHostObject _ | VObject _) as current -> letStore state current value (fun v -> arr.[idx] <- v)
-            | _ -> arr.[idx] <- value; state.Pc <- state.Pc + 1
+            match at arr idx with
+            | (VHostObject _ | VObject _) as current -> letStore state current value (fun v -> setAt arr idx v)
+            | _ -> setAt arr idx value; state.Pc <- state.Pc + 1
         | VFieldRef (obj, name) ->
             match obj.Fields.[name] with
             | (VHostObject _ | VObject _) as current -> letStore state current value (fun v -> obj.Fields.[name] <- v)
             | _ -> obj.Fields.[name] <- value; state.Pc <- state.Pc + 1
-        | (VHostObject _ | VObject _) as current -> letStore state current value (fun v -> frame.Locals.[slot] <- v)
+        | (VHostObject _ | VObject _) as current -> letStore state current value (fun v -> setAt frame.Locals slot v)
         | _ ->
-            frame.Locals.[slot] <- value
+            setAt frame.Locals slot value
             state.Pc <- state.Pc + 1
 
     | LoadGlobal slot ->
-        push state state.Globals.[slot]
+        push state (at state.Globals slot)
         state.Pc <- state.Pc + 1
 
     | StoreGlobal slot ->
-        state.Globals.[slot] <- pop state
+        setAt state.Globals slot (pop state)
         state.Pc <- state.Pc + 1
 
     | Pop ->
@@ -1299,7 +1350,7 @@ let executeOneInstruction (state: VmState) =
         let right = ValueSemantics.scalar right
         let left = ValueSemantics.scalar left
         match left, right with
-        | VNull, VNull -> push state VNull
+        | VNull, VNull -> push state vNull
         | VNull, r -> push state (VString (valueToString r))
         | l, VNull -> push state (VString (valueToString l))
         | l, r -> push state (VString (valueToString l + valueToString r))
@@ -1311,22 +1362,22 @@ let executeOneInstruction (state: VmState) =
         let result =
             match left, right with
             | (VInteger l | VLong l), (VInteger r | VLong r) ->
-                VBoolean (match opcode with
+                vBool (match opcode with
                           | Equal -> l = r | NotEqual -> l <> r
                           | LessThan -> l < r | LessEqual -> l <= r
                           | GreaterThan -> l > r | _ -> l >= r)
             | (VDouble _ | VInteger _ | VLong _), (VDouble _ | VInteger _ | VLong _) ->
                 let l = match left with VDouble d -> d | VInteger i | VLong i -> float i | _ -> 0.0
                 let r = match right with VDouble d -> d | VInteger i | VLong i -> float i | _ -> 0.0
-                VBoolean (match opcode with
+                vBool (match opcode with
                           | Equal -> l = r | NotEqual -> l <> r
                           | LessThan -> l < r | LessEqual -> l <= r
                           | GreaterThan -> l > r | _ -> l >= r)
             | _ ->
             match ValueSemantics.compareValues state.Program.TextCompare left right with
-            | VNull -> VNull
+            | VNull -> vNull
             | VInteger cmp ->
-                VBoolean (match opcode with
+                vBool (match opcode with
                           | Equal -> cmp = 0 | NotEqual -> cmp <> 0
                           | LessThan -> cmp < 0 | LessEqual -> cmp <= 0
                           | GreaterThan -> cmp > 0 | _ -> cmp >= 0)
@@ -1335,43 +1386,26 @@ let executeOneInstruction (state: VmState) =
         state.Pc <- state.Pc + 1
 
     | (ArrayGet rank | ArraySet rank | MakeRefArray rank) as opcode ->
-        let value = match opcode with ArraySet _ -> pop state | _ -> VEmpty
-        let indices = Array.zeroCreate rank
-        for i in rank - 1 .. -1 .. 0 do indices.[i] <- pop state
-        match pop state with
+        let value = match opcode with ArraySet _ -> pop state | _ -> vEmpty
+        if state.Sp < rank + 1 then stackUnderflow ()
+        // The subscripts are on the stack above the array: read them in place.
+        let first = state.Sp - rank
+        match at state.Stack (first - 1) with
         | VArray a ->
             if rank <> a.Lengths.Length then raiseVbError 9
             let mutable offset = 0
             for i in 0 .. rank - 1 do
-                let index = int64 (valueToInt indices.[i]) - int64 a.LowerBounds.[i]
-                if index < 0L || index >= int64 a.Lengths.[i] then raiseVbError 9
-                offset <- offset * a.Lengths.[i] + int index
+                offset <- offset * at a.Lengths i + boundedIndex (at state.Stack (first + i)) (at a.LowerBounds i) (at a.Lengths i)
+            dropTo state (first - 1)
             match opcode with
-            | ArraySet _ -> a.Data.[offset] <- value
+            | ArraySet _ -> setAt a.Data offset value
             | MakeRefArray _ -> push state (VRef (a.Data, offset))
-            | _ -> push state a.Data.[offset]
+            | _ -> push state (at a.Data offset)
             state.Pc <- state.Pc + 1
-        | VHostObject hostObj ->
-            match opcode with
-            | ArraySet _ -> hostIndexedAssign hostObj "" (hostArgs indices) value
-            | _ -> push state (hostDefaultCall hostObj (hostArgs indices))
-            state.Pc <- state.Pc + 1
-        | VObject o as target ->
-            match opcode with
-            | ArraySet _ -> indexedAssign state target (hostArgs indices) value
-            | _ ->
-                let dm = (classOf state o).DefaultMember
-                if dm = "" then raiseVbError 438
-                push state target
-                for index in indices do push state (ValueSemantics.dereference index)
-                callMethod state dm rank
-        | other ->
-            match opcode with
-            | ArraySet _ -> objectError other
-            | _ -> raiseVbError 13
+        | _ -> indexNonArray state opcode rank value
 
     | Coerce code ->
-        match state.Stack.[state.Sp - 1] with
+        match at state.Stack (state.Sp - 1) with
         | VLong _ when code = 2 -> ()
         | VDouble _ when code = 4 -> ()
         | VInteger i when code = 1 && i >= -32768 && i <= 32767 -> ()
@@ -1393,7 +1427,7 @@ let executeOneInstruction (state: VmState) =
                 state.Pc <- state.Pc + 1
             | false, _ ->
                 let key = lowerName state name
-                let classDef = state.Program.Classes.[vbObj.ClassIndex]
+                let classDef = at state.Program.Classes vbObj.ClassIndex
                 match Map.tryFind key classDef.PropertyGetters with
                 | Some funcIdx -> ignore (enterFunction state funcIdx obj (state.Pc + 1))
                 | None ->
@@ -1432,8 +1466,8 @@ let executeOneInstruction (state: VmState) =
 
     | CallBuiltin (name, argCount) ->
         let args = Array.zeroCreate argCount
-        for i in argCount - 1 .. -1 .. 0 do
-            args.[i] <- pop state
+        for i = argCount - 1 downto 0 do
+            setAt args i (pop state)
 
         // `name` is already lowercased by the compiler (CallBuiltin emission),
         // so no per-call ToLowerInvariant allocation here.
@@ -1449,18 +1483,18 @@ let executeOneInstruction (state: VmState) =
         match value with
         | VBoolean b -> if b then state.Pc <- state.Pc + 1 else state.Pc <- target
         | _ ->
-            let value = ValueSemantics.scalar value
-            if value = VNull || not (valueToBool value) then state.Pc <- target
-            else state.Pc <- state.Pc + 1
+            match ValueSemantics.scalar value with
+            | VNull -> state.Pc <- target
+            | value -> if valueToBool value then state.Pc <- state.Pc + 1 else state.Pc <- target
 
     | JumpIfTrue target ->
         let value = pop state
         match value with
         | VBoolean b -> if b then state.Pc <- target else state.Pc <- state.Pc + 1
         | _ ->
-            let value = ValueSemantics.scalar value
-            if value <> VNull && valueToBool value then state.Pc <- target
-            else state.Pc <- state.Pc + 1
+            match ValueSemantics.scalar value with
+            | VNull -> state.Pc <- state.Pc + 1
+            | value -> if valueToBool value then state.Pc <- target else state.Pc <- state.Pc + 1
 
     | Call (funcIndex, argCount) -> callProcedure state funcIndex argCount
 
@@ -1473,8 +1507,8 @@ let executeOneInstruction (state: VmState) =
         if state.Terminable.Count > 0 && frameHoldsTerminable state frame then collectHook state
 
     | MakeRefLocal slot ->
-        let frame = state.CallStack.[state.Csp - 1]
-        match frame.Locals.[slot] with
+        let frame = currentFrame state
+        match at frame.Locals slot with
         | (VRef _ | VFieldRef _) as r -> push state r  // forward existing ref
         | _ -> push state (VRef (frame.Locals, slot))
         state.Pc <- state.Pc + 1
@@ -1498,7 +1532,7 @@ let executeOneInstruction (state: VmState) =
         let right = pop state
         let left = pop state
         match left, right with
-        | VBoolean l, VBoolean r -> push state (VBoolean (l && r))
+        | VBoolean l, VBoolean r -> push state (vBool (l && r))
         | _ -> push state (ValueSemantics.logicalWith ValueSemantics.LAnd left right)
         state.Pc <- state.Pc + 1
 
@@ -1506,28 +1540,28 @@ let executeOneInstruction (state: VmState) =
         let right = pop state
         let left = pop state
         match left, right with
-        | VBoolean l, VBoolean r -> push state (VBoolean (l || r))
+        | VBoolean l, VBoolean r -> push state (vBool (l || r))
         | _ -> push state (ValueSemantics.logicalWith ValueSemantics.LOr left right)
         state.Pc <- state.Pc + 1
 
     | Not ->
         match pop state with
-        | VBoolean b -> push state (VBoolean (not b))
+        | VBoolean b -> push state (vBool (not b))
         | value -> push state (ValueSemantics.notValue value)
         state.Pc <- state.Pc + 1
 
     | Negate | NegateChecked ->
-        match state.Stack.[state.Sp - 1] with
-        | VDouble d -> state.Stack.[state.Sp - 1] <- VDouble (-d)
-        | VInteger i when i > -32768 && i <= 32767 -> state.Stack.[state.Sp - 1] <- VInteger (-i)
-        | VLong i when i <> System.Int32.MinValue -> state.Stack.[state.Sp - 1] <- VLong (-i)
+        match at state.Stack (state.Sp - 1) with
+        | VDouble d -> setAt state.Stack (state.Sp - 1) (VDouble (-d))
+        | VInteger i when i > -32768 && i <= 32767 -> setAt state.Stack (state.Sp - 1) (VInteger (0 - i))
+        | VLong i when i <> System.Int32.MinValue -> setAt state.Stack (state.Sp - 1) (VLong (0 - i))
         | _ -> push state (ValueSemantics.negateWith (match instr.Opcode with NegateChecked -> true | _ -> false) (pop state))
         state.Pc <- state.Pc + 1
 
     | ArrayGetFlat ->
         let index = valueToInt (pop state)
         match pop state with
-        | VArray a when index >= 0 && index < a.Data.Length -> push state a.Data.[index]
+        | VArray a when index >= 0 && index < a.Data.Length -> push state (at a.Data index)
         | _ -> raiseVbError 9
         state.Pc <- state.Pc + 1
 
@@ -1572,22 +1606,22 @@ let executeOneInstruction (state: VmState) =
                 state.Pc <- state.Pc + 1
         | _ -> state.Pc <- state.Pc + 1
 
-    | CallDefault 1 when (match state.Stack.[state.Sp - 2], state.Stack.[state.Sp - 1] with
+    | CallDefault 1 when (match at state.Stack (state.Sp - 2), at state.Stack (state.Sp - 1) with
                           | VArray a, VInteger _ -> a.Lengths.Length = 1
                           | _ -> false) ->
         let index = match pop state with VInteger i -> i | _ -> 0
         match pop state with
         | VArray a ->
-            let offset = index - a.LowerBounds.[0]
-            if offset < 0 || offset >= a.Lengths.[0] then raiseVbError 9
-            push state a.Data.[offset]
+            let offset = index - at a.LowerBounds 0
+            if offset < 0 || offset >= at a.Lengths 0 then raiseVbError 9
+            push state (at a.Data offset)
         | _ -> ()
         state.Pc <- state.Pc + 1
 
     | CallDefault argCount ->
         let args = Array.zeroCreate argCount
-        for i in argCount - 1 .. -1 .. 0 do
-            args.[i] <- ValueSemantics.dereference (pop state)
+        for i = argCount - 1 downto 0 do
+            setAt args i (ValueSemantics.dereference (pop state))
         let target = ValueSemantics.dereference (pop state)
         match target with
         | VObject o when (classOf state o).DefaultMember <> "" ->

@@ -210,7 +210,8 @@ let validate (program: BytecodeProgram) =
         match instruction.Opcode with
         | CoerceParams pairs ->
             check (not (isNull pairs) && pairs.Length % 2 = 0) "parameter conversions"
-            for k in 0 .. 2 .. pairs.Length - 1 do
+            for p in 0 .. pairs.Length / 2 - 1 do
+                let k = 2 * p
                 check (pairs.[k] >= 0 && pairs.[k] < 1000000 && pairs.[k + 1] >= 1 && pairs.[k + 1] <= 11) "parameter conversion"
         | LoadConst i -> check (i >= 0 && i < program.Constants.Length) "constant slot"
         | LoadGlobal i | StoreGlobal i | MakeRefGlobal i -> check (i >= 0 && i < program.Globals) "global slot"
@@ -256,7 +257,7 @@ let validate (program: BytecodeProgram) =
         | Some f, (LoadLocal slot | StoreLocal slot | MakeRefLocal slot | LetLocal slot) ->
             check (slot < f.LocalsCount) "function local slot"
         | Some f, CoerceParams pairs ->
-            for k in 0 .. 2 .. pairs.Length - 1 do check (pairs.[k] < f.LocalsCount) "function local slot"
+            for p in 0 .. pairs.Length / 2 - 1 do check (pairs.[2 * p] < f.LocalsCount) "function local slot"
         | None, CoerceParams _ -> check false "parameter conversion outside a procedure"
         | _ -> ()
 

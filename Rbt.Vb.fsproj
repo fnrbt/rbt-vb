@@ -5,6 +5,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="Portable.fs" />
     <Compile Include="Ast.fs" />
     <Compile Include="DateCore.fs" />
     <Compile Include="NumberText.fs" />
@@ -23,6 +24,11 @@
     <Compile Include="TypeCheck.fs" />
     <Compile Include="StackVm.fs" />
     <Compile Include="Api.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Emit for unchecked array access under Fable (Portable.fs); unused on .NET. -->
+    <PackageReference Include="Fable.Core" Version="4.3.0" />
   </ItemGroup>
 
   <!-- Ship the F# sources under fable/ so Fable can compile this library from

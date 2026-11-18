@@ -2,9 +2,10 @@ module Rbt.Vb.ValueSemantics
 
 open System
 open Values
+open Portable
 
 let rec dereference = function
-    | VRef (values, index) -> dereference values.[index]
+    | VRef (values, index) -> dereference (at values index)
     | VFieldRef (instance, name) -> dereference instance.Fields.[name]
     | value -> value
 
@@ -244,8 +245,7 @@ let toDate value =
         serial
 
 let inline private fitsInt (number: float) = number >= -2147483648.0 && number <= 2147483647.0
-let inline private fits16 (n: int64) = n >= -32768L && n <= 32767L
-let inline private fits32 (n: int64) = n >= -2147483648L && n <= 2147483647L
+let inline private in16 (n: int) = n >= -32768 && n <= 32767
 
 /// The largest finite Single.
 let maxSingle = 3.4028234663852886E38
@@ -315,34 +315,35 @@ let private rankOf (value: Value) =
     | VNothing -> raiseVbError 91
     | _ -> typeMismatch ()
 
-/// The whole-number value of a Byte, Integer, Long, Boolean or Empty operand.
-let private wholeOf (value: Value) =
+/// The whole-number value of a Byte, Integer, Long, Boolean or Empty operand
+/// (a Wide: + - * of two of them is exact, Portable.fs rule 2).
+let private wholeOf (value: Value) : Wide =
     match value with
-    | VByte b -> int64 b
-    | VInteger n | VLong n -> int64 n
-    | VBoolean b -> if b then -1L else 0L
-    | VEmpty -> 0L
-    | other -> int64 (toInteger other)
+    | VByte b -> wide (int b)
+    | VInteger n | VLong n -> wide n
+    | VBoolean b -> if b then -1.0 else 0.0
+    | VEmpty -> 0.0
+    | other -> wide (toInteger other)
 
-let private fitsRank rank (n: int64) =
+let private fitsRank rank (n: Wide) =
     match rank with
-    | RByte -> n >= 0L && n <= 255L
-    | RInteger -> fits16 n
-    | _ -> fits32 n
+    | RByte -> n >= 0.0 && n <= 255.0
+    | RInteger -> fitsInt16 n
+    | _ -> fitsInt32 n
 
-let private wholeOfRank rank (n: int64) =
+let private wholeOfRank rank (n: Wide) =
     match rank with
     | RByte -> VByte (byte n)
     | RInteger -> VInteger (int n)
     | _ -> VLong (int n)
 
 /// A whole-number result of type `rank` (Byte, Integer or Long).
-let private wholeResult strict rank (n: int64) =
+let private wholeResult strict rank (n: Wide) =
     if fitsRank rank n then wholeOfRank rank n
     elif strict then raiseVbError 6
-    elif rank < RInteger && fits16 n then VInteger (int n)
-    elif fits32 n then VLong (int n)
-    else VDouble (float n)
+    elif rank < RInteger && fitsInt16 n then VInteger (int n)
+    elif fitsInt32 n then VLong (int n)
+    else VDouble n
 
 let private doubleResult (x: float) =
     if Double.IsInfinity x || Double.IsNaN x then raiseVbError 6
@@ -411,15 +412,34 @@ let private arithmeticOf strict (op: ArithmeticOp) (l: Value) (r: Value) =
                 VCurrency (a * int64 n)
             | _ -> currencyProduct (toCurrencyUnits l) (toCurrencyUnits r)
 
-let private integerSum strict (left: Value) (right: Value) (l: int) (r: int) =
-    let n = int64 l + int64 r
-    if fits16 n && l >= -32768 && l <= 32767 && r >= -32768 && r <= 32767 then VInteger (int n)
-    else wholeResult strict (max (rankOf left) (rankOf right)) n
+/// A Long result that did not fit: error 6, or a Double for Variants.
+let private longOverflow strict (n: Wide) =
+    if strict then raiseVbError 6 else VDouble n
 
-let private longResult strict (n: int64) =
-    if fits32 n then VLong (int n)
-    elif strict then raiseVbError 6
-    else VDouble (float n)
+/// `l + r` of two VIntegers (a VInteger outside -32768..32767 is a Long).
+let private integerSum strict (l: int) (r: int) =
+    if in16 l && in16 r then
+        let n = l + r
+        if in16 n then VInteger n else wholeResult strict RInteger (wide n)
+    else wholeResult strict RLong (wide l + wide r)
+
+let private integerDifference strict (l: int) (r: int) =
+    if in16 l && in16 r then
+        let n = l - r
+        if in16 n then VInteger n else wholeResult strict RInteger (wide n)
+    else wholeResult strict RLong (wide l - wide r)
+
+let private longSum strict (l: int) (r: int) =
+    let n = l + r
+    if addOverflows l r n then longOverflow strict (wide l + wide r) else VLong n
+
+let private longDifference strict (l: int) (r: int) =
+    let n = l - r
+    if subtractOverflows l r n then longOverflow strict (wide l - wide r) else VLong n
+
+let private longProduct strict (l: int) (r: int) =
+    let n = wide l * wide r
+    if fitsInt32 n then VLong (int n) else longOverflow strict n
 
 let private addSlow strict left right =
     match scalar left, scalar right with
@@ -432,19 +452,19 @@ let private addSlow strict left right =
 /// `+` (strict: both operands have declared types, overflow is error 6).
 let addWith strict left right =
     match left, right with
-    | VInteger l, VInteger r -> integerSum strict left right l r
-    | VLong l, VLong r -> longResult strict (int64 l + int64 r)
+    | VInteger l, VInteger r -> integerSum strict l r
+    | VLong l, VLong r -> longSum strict l r
     | VDouble l, VDouble r -> doubleResult (l + r)
-    | VLong l, VInteger r | VInteger l, VLong r -> longResult strict (int64 l + int64 r)
+    | VLong l, VInteger r | VInteger l, VLong r -> longSum strict l r
     | VDouble l, (VInteger r | VLong r) | (VInteger r | VLong r), VDouble l -> doubleResult (l + float r)
     | _ -> addSlow strict left right
 
 let subtractWith strict left right =
     match left, right with
-    | VInteger l, VInteger r -> integerSum strict left right l (-r)
-    | VLong l, VLong r -> longResult strict (int64 l - int64 r)
+    | VInteger l, VInteger r -> integerDifference strict l r
+    | VLong l, VLong r -> longDifference strict l r
     | VDouble l, VDouble r -> doubleResult (l - r)
-    | VLong l, VInteger r | VInteger l, VLong r -> longResult strict (int64 l - int64 r)
+    | VLong l, VInteger r | VInteger l, VLong r -> longDifference strict l r
     | VDouble l, (VInteger r | VLong r) -> doubleResult (l - float r)
     | (VInteger l | VLong l), VDouble r -> doubleResult (float l - r)
     | _ ->
@@ -459,7 +479,8 @@ let multiplyWith strict left right =
         if n >= -32768 && n <= 32767 then VInteger n
         elif strict then raiseVbError 6
         else VLong n
-    | VLong l, VLong r -> longResult strict (int64 l * int64 r)
+    | VLong l, VLong r -> longProduct strict l r
+    | VLong l, VInteger r | VInteger l, VLong r -> longProduct strict l r
     | VDouble l, VDouble r -> doubleResult (l * r)
     | VDouble l, (VInteger r | VLong r) | (VInteger r | VLong r), VDouble l -> doubleResult (l * float r)
     | _ ->
@@ -511,12 +532,16 @@ let integerDivideWith strict modulus left right =
         let lr = rank l
         let rr = rank r
         let resultRank = if lr = RByte && rr = RByte then RByte elif lr <= RInteger && rr <= RInteger then RInteger else RLong
-        let a = int64 (toInteger l)
-        let b = int64 (toInteger r)
-        if b = 0L then raiseVbError 11
-        let n = if modulus then a % b else a / b
+        let a = toInteger l
+        let b = toInteger r
+        if b = 0 then raiseVbError 11
+        // Only MinValue \ -1 leaves 32 bits (its Mod is 0).
+        let n : Wide =
+            if b = -1 then (if modulus then 0.0 else -(wide a))
+            elif modulus then wide (a % b)
+            else wide (a / b)
         // Variant Integer results widen to Long; a Long that overflows is error 6.
-        if resultRank = RLong && not (fits32 n) then raiseVbError 6
+        if resultRank = RLong && not (fitsInt32 n) then raiseVbError 6
         wholeResult strict resultRank n
 
 /// Unary minus.
@@ -531,8 +556,8 @@ let negateWith strict value =
     | VEmpty -> VInteger 0
     | VByte b -> VInteger (-(int b))
     | VBoolean b -> VInteger (if b then 1 else 0)
-    | VInteger n as v -> wholeResult strict (rankOf v) (-(int64 n))
-    | VLong n -> wholeResult strict RLong (-(int64 n))
+    | VInteger n as v -> wholeResult strict (rankOf v) (-(wide n))
+    | VLong n -> wholeResult strict RLong (-(wide n))
     | VSingle f -> VSingle (-f)
     | VDouble d -> VDouble (-d)
     | VCurrency c -> if c = Int64.MinValue then raiseVbError 6 else VCurrency (-c)
@@ -561,9 +586,9 @@ let logicalWith (op: LogicalOp) left right =
     let truth (v: Value) = toBool v
     match l, r with
     | VBoolean a, VBoolean b ->
-        VBoolean (match op with
-                  | LAnd -> a && b | LOr -> a || b | LXor -> a <> b
-                  | LEqv -> a = b | LImp -> not a || b)
+        Shared.vBool (match op with
+                         | LAnd -> a && b | LOr -> a || b | LXor -> a <> b
+                         | LEqv -> a = b | LImp -> not a || b)
     | VNull, VNull -> VNull
     | VNull, other | other, VNull ->
         let nullOnLeft = (match l with VNull -> true | _ -> false)

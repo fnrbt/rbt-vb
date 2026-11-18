@@ -67,3 +67,41 @@ let run () =
     expectRuntimeError "InStr invalid start" "InStr(0, \"abc\", \"a\")"
     expect "Array upper bound" "UBound(Array(1, 2))" (VLong 1)
     expect "Split then Join" "Join(Split(\"a,b\", \",\"), \"-\")" (VString "a-b")
+    // 32-bit edges of Integer / Long arithmetic and subscripts (computed without
+    // int64 since Portable.fs; a widened Variant result is the exact Double).
+    let after setup expression = "0\n" + setup + "\nx = " + expression
+    let vba label source =
+        match Api.runSource Api.RunOptions.vba ("Dim x\n" + source) with
+        | Ok execution -> Api.tryGetGlobal "x" execution.State |> Option.defaultValue VUndefined |> Ok
+        | Error (Api.RuntimeError message) -> Error message
+        | Error other -> failwithf "%s: %A" label other
+    let expectVba label source expected =
+        match vba label source with
+        | Ok actual when actual = expected -> ()
+        | other -> failwithf "%s: expected %A, got %A" label expected other
+    let expectVbaError label source (number: int) =
+        match vba label source with
+        | Error message when message.Contains(sprintf "'%d'" number) -> ()
+        | other -> failwithf "%s: expected error %d, got %A" label number other
+    expect "Variant Long + widens" (after "a = 2147483647" "a + 1") (VDouble 2147483648.0)
+    expect "Variant Long - widens" (after "a = CLng(-2147483647) - 1" "a - 1") (VDouble -2147483649.0)
+    expect "most negative Long" (after "" "CLng(-2147483647) - CLng(1)") (VLong System.Int32.MinValue)
+    expect "Variant Long * fits" (after "a = 46340" "a * a") (VLong 2147395600)
+    expect "Variant Long * widens" (after "a = 46341" "a * a") (VDouble 2147488281.0)
+    expect "Variant Long * widens exactly" (after "a = 2147483647" "a * a") (VDouble (2147483647.0 * 2147483647.0))
+    expect "Long * Integer" (after "a = 2147483647" "a * -1") (VLong -2147483647)
+    expect "Long Mod -1" (after "a = CLng(-2147483647) - 1" "a Mod -1") (VLong 0)
+    expectRuntimeError "Long \\ -1 overflows" (after "a = CLng(-2147483647) - 1" "a \\ -1")
+    expectRuntimeError "typed Long + overflows" "CLng(2147483647) + CLng(1)"
+    expectRuntimeError "typed Long * overflows" "CLng(65536) * CLng(65536)"
+    expect "Variant Integer + widens to Long" (after "a = CInt(32767)" "a + 1") (VLong 32768)
+    expect "Variant Integer - widens to Long" (after "a = CInt(-32768)" "a - 1") (VLong -32769)
+    expect "Variant Byte + widens to Integer" (after "a = CByte(200)" "a + a") (VInteger 400)
+    expectVbaError "subscript at Long's top" "Dim arr(-2 To 2)\nx = arr(2147483647)" 9
+    expectVbaError "subscript at Long's bottom" "Dim arr(-2 To 2)\nx = arr(-2147483647 - 1)" 9
+    expectVbaError "subscript below the lower bound" "Dim arr(-2147483647 To -2147483640)\nx = arr(2147483647)" 9
+    expectVba "subscript at the lower bound" "Dim arr(-2 To 2)\narr(-2) = 7\nx = arr(-2)" (VInteger 7)
+    expectVba "subscript at the upper bound" "Dim arr(-2 To 2, 1 To 3)\narr(2, 3) = 9\nx = arr(2, 3)" (VInteger 9)
+    expectVbaError "subscript past the upper bound" "Dim arr(-2 To 2, 1 To 3)\nx = arr(2, 4)" 9
+    expectVbaError "Long overflow is error 6" "Dim a As Long\na = 2147483647\na = a + 1" 6
+    expectVba "Long arithmetic at the edges" "Dim a As Long, b As Long\na = 2147483647\nb = -a - 1\nx = (a + b) * 3 - (b \\ 2)" (VLong 1073741821)

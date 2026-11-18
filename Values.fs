@@ -76,6 +76,17 @@ and IHostObject =
     /// `For Each x In obj`; `None` when the object is not a collection.
     abstract Enumerate: unit -> Value seq option
 
+/// Shared instances for hot paths (Portable.fs, rule 4): Fable 4 allocates a
+/// case without fields on every use, and both backends allocate a Boolean.
+module Shared =
+    let vEmpty = VEmpty
+    let vNull = VNull
+    let vNothing = VNothing
+    let vUndefined = VUndefined
+    let vTrue = VBoolean true
+    let vFalse = VBoolean false
+    let inline vBool (b: bool) = if b then vTrue else vFalse
+
 /// A convenience base for host objects: override what the object supports.
 /// Unknown members report `None`/`false` (error 438); `CallNamed` ignores the
 /// names and calls `CallMethod` positionally; `Enumerate` reports `None`.
