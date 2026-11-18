@@ -11,6 +11,7 @@
     <Compile Include="Release040Cases.fs" />
     <Compile Include="ParityData.fs" />
     <Compile Include="Release050Cases.fs" />
+    <Compile Include="Release060Cases.fs" />
     <Compile Include="PersistenceCases.fs" />
     <Compile Include="FixtureCases.fs" />
     <Compile Include="Program.fs" />

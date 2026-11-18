@@ -13,6 +13,7 @@
     <Compile Include="Validator.fs" />
     <Compile Include="Values.fs" />
     <Compile Include="ValueSemantics.fs" />
+    <Compile Include="HostMembers.fs" />
     <Compile Include="Formatting.fs" />
     <Compile Include="Collections.fs" />
     <Compile Include="Builtins.fs" />

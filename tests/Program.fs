@@ -8,6 +8,7 @@ let main _ =
         "0.3.0 release", ReleaseCases.runAll
         "0.4.0 release", Release040Cases.runAll
         "0.5.0 release", Release050Cases.runAll
+        "0.6.0 release", Release060Cases.runAll
 #if !FABLE_COMPILER
         "persistence", PersistenceCases.run
         "existing fixtures", FixtureCases.run

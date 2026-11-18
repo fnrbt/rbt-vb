@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.0 — 2026-11-18
+
+### HostMembers: an object model as tables
+
+`Rbt.Vb.HostMembers` builds a host's object model from tables. Each type of object (a Range, a Shape, a Document) is a `Table<'T>` of members, built once; an object is the table with one instance's state (`table.Wrap state`). A member is found by name in any case with one dictionary lookup, so an object model no longer has to compare a name against each member it knows on every access.
+
+- Members: `get` (read only), `prop` (read and write), `set` (write only), `method` (with its parameters' names), `indexed` (a property that takes arguments, as `Cells(r, c)`), `accepted` (a setting with no effect that reads as a fixed value), `alias`.
+- Named arguments are put in their places from the method's parameter names; an unknown name is error 448.
+- A name the table does not have is error 438, naming the type and the member: "Object doesn't support this property or method (Shape.Nope)".
+- `defaultMember` serves `obj(...)`, `obj = x` and the object read as a value; `items` makes the object a collection for For Each; `dynamic` handles names that are not in the table (a WorksheetFunction object that takes any function's name); `typeNameOf` gives a TypeName that depends on the instance.
+- `table.TryState value` gives the state of an object of that table (None for any other value), and `table.Names` lists the members, for an editor's completion or documentation.
+
 ## 0.5.1 — 2026-11-18
 
 Two gaps found by macros from the web:
